@@ -1,0 +1,24 @@
+# Kalshi official Python SDK
+kalshi-python>=2.1.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# BTC price data (yfinance for spot price)
+yfinance>=0.2.36
+
+# RSA signing for Kalshi API auth
+cryptography>=41.0.0
+
+# Numeric & data utilities
+numpy>=1.26.0
+pandas>=2.1.0
+
+# Scheduling
+schedule>=1.2.0
+
+# Logging
+colorlog>=6.8.0

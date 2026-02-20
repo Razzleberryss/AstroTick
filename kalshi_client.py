@@ -1,16 +1,14 @@
 """
-kalshi_client.py  -  Thin wrapper around the Kalshi REST API v2.
-
+kalshi_client.py - Thin wrapper around the Kalshi REST API v2.
 Handles:
-  - RSA-PSS request signing (required by Kalshi)
-  - get_balance()
-  - get_active_btc_market()   → finds the live 15-min BTC market
-  - get_orderbook(ticker)
-  - get_positions()
-  - place_order(ticker, side, count, price_cents, dry_run)
-  - cancel_order(order_id)
+ - RSA-PSS request signing (required by Kalshi)
+ - get_balance()
+ - get_active_btc_market() -> finds the live 15-min BTC market
+ - get_orderbook(ticker)
+ - get_positions()
+ - place_order(ticker, side, count, price_cents, dry_run)
+ - cancel_order(order_id)
 """
-
 import base64
 import datetime
 import logging
@@ -35,7 +33,7 @@ class KalshiClient:
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
 
-    # ── Auth helpers ────────────────────────────────────────────────────────────────
+    # ── Auth helpers ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _load_private_key(path: str):
@@ -43,7 +41,11 @@ class KalshiClient:
             return serialization.load_pem_private_key(f.read(), password=None)
 
     def _sign(self, timestamp_ms: str, method: str, path: str) -> str:
-        """Return base64-encoded RSA-PSS signature for Kalshi auth header."""
+        """
+        Return base64-encoded RSA-PSS signature.
+        Kalshi signs: timestamp_ms + METHOD + /trade-api/v2/path
+        The path passed in is already the full path e.g. /trade-api/v2/portfolio/balance
+        """
         message = (timestamp_ms + method.upper() + path).encode("utf-8")
         signature = self._private_key.sign(
             message,
@@ -56,6 +58,10 @@ class KalshiClient:
         return base64.b64encode(signature).decode("utf-8")
 
     def _auth_headers(self, method: str, path: str) -> dict:
+        """
+        path must be the full API path including /trade-api/v2 prefix,
+        e.g. /trade-api/v2/portfolio/balance
+        """
         ts = str(int(datetime.datetime.now().timestamp() * 1000))
         return {
             "KALSHI-ACCESS-KEY": self.api_key_id,
@@ -63,18 +69,28 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": self._sign(ts, method, path),
         }
 
-    # ── Generic request ────────────────────────────────────────────────────────────
+    # ── Generic request ───────────────────────────────────────────────────────
 
     def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> dict:
-        url = self.base_url + path
-        headers = self._auth_headers(method, path)
-        resp = self.session.request(method, url, headers=headers, params=params, json=json, timeout=10)
+        """
+        path is the short path, e.g. /portfolio/balance
+        We prepend /trade-api/v2 for the signature and the full URL.
+        """
+        full_path = "/trade-api/v2" + path
+        url = "https://demo-api.kalshi.co" + full_path if "demo" in self.base_url else "https://trading-api.kalshi.com" + full_path
+        headers = self._auth_headers(method, full_path)
+        resp = self.session.request(
+            method, url, headers=headers, params=params, json=json, timeout=10
+        )
         if not resp.ok:
-            log.error("Kalshi API error %s %s -> %s: %s", method, path, resp.status_code, resp.text)
+            log.error(
+                "Kalshi API error %s %s -> %s: %s",
+                method, path, resp.status_code, resp.text
+            )
             resp.raise_for_status()
         return resp.json()
 
-    # ── Public API methods ─────────────────────────────────────────────────────────
+    # ── Public API methods ────────────────────────────────────────────────────
 
     def get_balance(self) -> float:
         """Return available balance in dollars."""
@@ -96,7 +112,6 @@ class KalshiClient:
         if not markets:
             log.warning("No open BTC 15-min markets found for series %s", config.BTC_SERIES_TICKER)
             return None
-        # Prefer earliest expiry (most liquid / most recently opened)
         markets.sort(key=lambda m: m.get("close_time", ""))
         return markets[0]
 
@@ -116,9 +131,9 @@ class KalshiClient:
     def place_order(
         self,
         ticker: str,
-        side: str,          # 'yes' or 'no'
-        count: int,         # number of contracts
-        price_cents: int,   # limit price in cents (1-99)
+        side: str,
+        count: int,
+        price_cents: int,
         dry_run: bool = True,
     ) -> Optional[dict]:
         """
@@ -131,15 +146,17 @@ class KalshiClient:
                 side.upper(), ticker, count, price_cents, ticker
             )
             return None
-
         payload = {
             "ticker": ticker,
             "action": "buy",
             "type": "limit",
             "side": side,
             "count": count,
-            "yes_price" if side == "yes" else "no_price": price_cents,
         }
+        if side == "yes":
+            payload["yes_price"] = price_cents
+        else:
+            payload["no_price"] = price_cents
         log.info("Placing order: %s", payload)
         return self._request("POST", "/portfolio/orders", json=payload)
 

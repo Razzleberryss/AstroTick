@@ -1,10 +1,9 @@
 """
-config.py  -  Central configuration loader.
+config.py – Central configuration loader.
 
 Loads all settings from .env and exposes them as typed constants.
 Import this module everywhere instead of calling os.getenv() directly.
 """
-
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -41,7 +40,10 @@ MAX_CONTRACT_PRICE_CENTS: int = int(os.getenv("MAX_CONTRACT_PRICE_CENTS", "90"))
 # =============================================================================
 # Strategy / Signal
 # =============================================================================
-BTC_SERIES_TICKER: str = os.getenv("BTC_SERIES_TICKER", "KXBTC")
+# BTC_SERIES_TICKER: Kalshi 15-min BTC Up/Down series.
+# The live series ticker is BTCZ (e.g. BTCZ-25DEC3100-T3PM).
+# Override in .env if Kalshi changes the series name.
+BTC_SERIES_TICKER: str = os.getenv("BTC_SERIES_TICKER", "BTCZ")
 BTC_TICKER: str = os.getenv("BTC_TICKER", "BTC-USD")  # yfinance symbol
 MOMENTUM_LOOKBACK_BARS: int = int(os.getenv("MOMENTUM_LOOKBACK_BARS", "5"))
 MIN_EDGE: float = float(os.getenv("MIN_EDGE", "0.05"))
@@ -99,3 +101,23 @@ def validate() -> None:
         raise EnvironmentError(
             "Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         )
+
+
+if __name__ == "__main__":
+    # Quick sanity check: print all resolved config values
+    print(f"KALSHI_ENV            : {KALSHI_ENV}")
+    print(f"BASE_URL              : {BASE_URL}")
+    print(f"KALSHI_API_KEY_ID     : {'SET' if KALSHI_API_KEY_ID else 'NOT SET'}")
+    print(f"KALSHI_PRIVATE_KEY    : {KALSHI_PRIVATE_KEY_PATH}")
+    print(f"BTC_SERIES_TICKER     : {BTC_SERIES_TICKER}")
+    print(f"DRY_RUN               : {DRY_RUN}")
+    print(f"MAX_TRADE_DOLLARS     : ${MAX_TRADE_DOLLARS}")
+    print(f"MAX_OPEN_POSITIONS    : {MAX_OPEN_POSITIONS}")
+    print(f"MAX_TOTAL_EXPOSURE    : ${MAX_TOTAL_EXPOSURE}")
+    print(f"LOOP_INTERVAL_SECONDS : {LOOP_INTERVAL_SECONDS}s")
+    print(f"TRADE_LOG_FILE        : {TRADE_LOG_FILE}")
+    try:
+        validate()
+        print("\nConfig validation: PASSED")
+    except EnvironmentError as e:
+        print(f"\nConfig validation: FAILED\n{e}")

@@ -38,6 +38,23 @@ MIN_CONTRACT_PRICE_CENTS: int = int(os.getenv("MIN_CONTRACT_PRICE_CENTS", "10"))
 MAX_CONTRACT_PRICE_CENTS: int = int(os.getenv("MAX_CONTRACT_PRICE_CENTS", "90"))
 
 # =============================================================================
+# Exit / Position Management
+# =============================================================================
+# Stop-loss: sell if current contract price drops this many cents below entry
+# Example: entry=55c, STOP_LOSS_CENTS=20 -> sell if price falls to 35c
+# Set to 0 to disable stop-loss
+STOP_LOSS_CENTS: int = int(os.getenv("STOP_LOSS_CENTS", "20"))
+
+# Take-profit: sell if current contract price rises this many cents above entry
+# Example: entry=55c, TAKE_PROFIT_CENTS=30 -> sell if price hits 85c
+# Set to 0 to disable take-profit
+TAKE_PROFIT_CENTS: int = int(os.getenv("TAKE_PROFIT_CENTS", "30"))
+
+# Signal reversal exit: if True, sell open position when signal flips against it
+# Example: holding YES contracts but momentum + skew now strongly favor NO -> sell
+SIGNAL_REVERSAL_EXIT: bool = os.getenv("SIGNAL_REVERSAL_EXIT", "true").lower() == "true"
+
+# =============================================================================
 # Strategy / Signal
 # =============================================================================
 # BTC_SERIES_TICKER: Kalshi 15-min BTC Up/Down series.
@@ -71,7 +88,6 @@ def validate() -> None:
     Called once at bot startup before any API requests are made.
     """
     errors: list[str] = []
-
     if not KALSHI_API_KEY_ID:
         errors.append("KALSHI_API_KEY_ID is not set")
     if not KALSHI_PRIVATE_KEY_PATH or not Path(KALSHI_PRIVATE_KEY_PATH).exists():
@@ -96,12 +112,14 @@ def validate() -> None:
         errors.append("MOMENTUM_LOOKBACK_BARS must be >= 1")
     if not (0.0 < MIN_EDGE_THRESHOLD < 1.0):
         errors.append("MIN_EDGE_THRESHOLD must be between 0 and 1")
-
+    if STOP_LOSS_CENTS < 0:
+        errors.append("STOP_LOSS_CENTS must be >= 0")
+    if TAKE_PROFIT_CENTS < 0:
+        errors.append("TAKE_PROFIT_CENTS must be >= 0")
     if errors:
         raise EnvironmentError(
             "Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
         )
-
 
 if __name__ == "__main__":
     # Quick sanity check: print all resolved config values
@@ -114,6 +132,9 @@ if __name__ == "__main__":
     print(f"MAX_TRADE_DOLLARS     : ${MAX_TRADE_DOLLARS}")
     print(f"MAX_OPEN_POSITIONS    : {MAX_OPEN_POSITIONS}")
     print(f"MAX_TOTAL_EXPOSURE    : ${MAX_TOTAL_EXPOSURE}")
+    print(f"STOP_LOSS_CENTS       : {STOP_LOSS_CENTS}c")
+    print(f"TAKE_PROFIT_CENTS     : {TAKE_PROFIT_CENTS}c")
+    print(f"SIGNAL_REVERSAL_EXIT  : {SIGNAL_REVERSAL_EXIT}")
     print(f"LOOP_INTERVAL_SECONDS : {LOOP_INTERVAL_SECONDS}s")
     print(f"TRADE_LOG_FILE        : {TRADE_LOG_FILE}")
     try:

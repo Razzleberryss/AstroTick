@@ -1,9 +1,9 @@
 """
-bot.py  -  Main entry point for the Kalshi 15-minute BTC trader.
+bot.py – Main entry point for the Kalshi 15-minute BTC trader.
 
 Usage:
-    python bot.py              # runs live (DRY_RUN=true by default in .env)
-    DRY_RUN=false python bot.py  # real trading
+    python bot.py               # runs with DRY_RUN setting from .env (default: true)
+    DRY_RUN=false python bot.py # real trading
 
 Loop logic (every LOOP_INTERVAL_SECONDS):
     1. Validate config
@@ -14,7 +14,6 @@ Loop logic (every LOOP_INTERVAL_SECONDS):
     6. Place order (or log as dry run)
     7. Sleep and repeat
 """
-
 import logging
 import signal
 import sys
@@ -27,7 +26,7 @@ from kalshi_client import KalshiClient
 from risk_manager import RiskManager
 from strategy import generate_signal
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging setup ──────────────────────────────────────────────────────────────────────────────
 def setup_logging():
     handler = colorlog.StreamHandler()
     handler.setFormatter(colorlog.ColoredFormatter(
@@ -47,7 +46,7 @@ def setup_logging():
 
 log = logging.getLogger("bot")
 
-# ── Graceful shutdown ─────────────────────────────────────────────────────────
+# ── Graceful shutdown ─────────────────────────────────────────────────────────────────────────────
 _running = True
 
 def _handle_signal(sig, frame):
@@ -58,7 +57,7 @@ def _handle_signal(sig, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-# ── Core bot loop ─────────────────────────────────────────────────────────────
+# ── Core bot loop ─────────────────────────────────────────────────────────────────────────────
 def run_once(client: KalshiClient, risk: RiskManager):
     """
     Execute one complete bot cycle.
@@ -110,13 +109,15 @@ def run_once(client: KalshiClient, risk: RiskManager):
         contracts * sig.price_cents / 100, config.DRY_RUN,
     )
 
-    # 6. Execute  (DRY_RUN is handled inside KalshiClient.place_order)
+    # 6. Execute — pass dry_run explicitly so config.DRY_RUN is respected
     order = client.place_order(
         ticker=ticker,
         side=sig.side,
         count=contracts,
         price_cents=sig.price_cents,
+        dry_run=config.DRY_RUN,
     )
+
     order_id = order.get("order", {}).get("order_id") if order else None
 
     # 7. Log to CSV
@@ -154,6 +155,7 @@ def main():
     risk   = RiskManager()
 
     log.info("Bot started. Press Ctrl+C to stop.")
+
     while _running:
         try:
             run_once(client, risk)

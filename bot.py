@@ -195,7 +195,9 @@ def run_once(client: KalshiClient, risk: RiskManager):
         return False
 
     # 5. Risk check for NEW trade
-    if sig is None:
+    # sig.size == 0 means decide_trade blocked the entry (fee/band filters) but
+    # still returned a directional Signal for reversal-exit purposes; skip entry.
+    if sig is None or sig.size == 0:
         return False
         
     approved, reason = risk.approve_trade(sig, balance, positions, ticker)

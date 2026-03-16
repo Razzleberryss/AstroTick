@@ -235,6 +235,11 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     The composite score is mapped to a model_p_yes probability and passed
     through decide_trade(), which enforces fee-aware entry filters and
     dynamic sizing before a Signal is emitted.
+
+    A Signal with size=0 is returned when decide_trade blocks the entry but
+    a clear directional preference exists; manage_positions can still use
+    this for SIGNAL_REVERSAL_EXIT even though no new contract will be opened.
+    Returns None only when momentum data is unavailable (no directional view).
     """
     momentum = get_btc_momentum()
     if momentum is None:
@@ -252,38 +257,65 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
         composite, momentum, skew, confidence,
     )
 
-    # Derive market-implied YES price from the market dict (mid of bid/ask, in dollars)
+    # Determine directional preference from composite.  This is set early so it
+    # is available for the NO_TRADE path (reversal signal with size=0).
+    side = "yes" if composite > 0 else "no"
+
+    # Market mid is used solely to anchor model_p_yes (independent of spread).
     yes_bid = market.get("yes_bid", 50)
     yes_ask = market.get("yes_ask", 50)
     if "yes_bid" not in market or "yes_ask" not in market:
         log.warning(
-            "Market data missing yes_bid/yes_ask — defaulting to 50c mid price, "
-            "which falls inside the forbidden price band and will prevent new entries"
+            "Market data missing yes_bid/yes_ask — defaulting to 50c mid price; "
+            "decide_trade will apply configured price-band filters to this default"
         )
-    market_price = float(np.clip((yes_bid + yes_ask) / 2 / 100.0, 0.01, 0.99))
+    market_mid = float(np.clip((yes_bid + yes_ask) / 2 / 100.0, 0.01, 0.99))
 
     # Map composite score to a model probability estimate.
     # A composite of ±1.0 shifts the market price by up to ±0.50,
     # so at MIN_EDGE_PCT=0.10 a composite of 0.20 is the minimum qualifying signal.
-    model_p_yes = float(np.clip(market_price + composite * 0.5, 0.01, 0.99))
+    model_p_yes = float(np.clip(market_mid + composite * 0.5, 0.01, 0.99))
+
+    # Use the side-specific suggested entry price (what the bot actually pays)
+    # rather than the mid, so that decide_trade's mispricing and fee/EV checks
+    # reflect the real cost of entry and are not overstated.
+    entry_price_cents = suggest_limit_price(market, side)
+    if side == "yes":
+        # YES contracts: cost = entry_price_cents / 100 dollars
+        entry_p = float(np.clip(entry_price_cents / 100.0, 0.01, 0.99))
+    else:
+        # NO contracts: a NO contract at X cents ≡ YES price of (100-X) cents.
+        # Expressing cost in YES-equivalent terms lets decide_trade use its
+        # standard formulas: mispricing = model_p_yes - entry_p (<0 for NO edge),
+        # and fee ∝ entry_p * (1 - entry_p) = no_price * (1 - no_price).
+        entry_p = float(np.clip(1.0 - entry_price_cents / 100.0, 0.01, 0.99))
 
     # Fee-aware entry decision (handles edge threshold, forbidden bands, sizing)
-    action, size = decide_trade(market_price, model_p_yes)
+    action, size = decide_trade(entry_p, model_p_yes)
 
     if action == "NO_TRADE":
+        # Entry is blocked by fee/band filters.  Return a Signal with size=0 so
+        # that SIGNAL_REVERSAL_EXIT in manage_positions can still trigger when the
+        # composite direction opposes an open position, even though no new entry
+        # will be opened (bot.py skips entry logic when sig.size == 0).
         log.info(
-            "decide_trade returned NO_TRADE (composite=%.3f market_price=%.2f "
-            "model_p_yes=%.2f) — no trade this cycle",
-            composite, market_price, model_p_yes,
+            "decide_trade returned NO_TRADE (composite=%.3f entry_p=%.2f "
+            "model_p_yes=%.2f) — no new entry this cycle",
+            composite, entry_p, model_p_yes,
         )
-        return None
+        return Signal(
+            side=side,
+            confidence=confidence,
+            price_cents=entry_price_cents,
+            reason=f"NO_TRADE: composite={composite:+.3f}",
+            size=0,
+        )
 
+    # Confirm side from the action (should match composite-derived side in normal cases)
     side = "yes" if action == "BUY_YES" else "no"
-    price = suggest_limit_price(market, side)
-
     reason = (
         f"momentum={momentum:+.3f} skew={skew:+.3f} composite={composite:+.3f} → "
-        f"{side.upper()} @ {price}c (confidence={confidence:.2%} size={size})"
+        f"{side.upper()} @ {entry_price_cents}c (confidence={confidence:.2%} size={size})"
     )
 
-    return Signal(side=side, confidence=confidence, price_cents=price, reason=reason, size=size)
+    return Signal(side=side, confidence=confidence, price_cents=entry_price_cents, reason=reason, size=size)

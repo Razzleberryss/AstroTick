@@ -198,10 +198,10 @@ class TestKalshiClientRetries(unittest.TestCase):
             config.REQUEST_TIMEOUT_SECONDS = orig_timeout
 
     def test_url_uses_demo_host_when_env_is_demo(self):
-        """URL must target demo-api.kalshi.co when KALSHI_ENV='demo'."""
+        """URL must target demo-api.kalshi.co when BASE_URL is the demo endpoint."""
         client = self._make_client()
-        orig_env = config.KALSHI_ENV
-        config.KALSHI_ENV = "demo"
+        orig_base_url = config.BASE_URL
+        config.BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
         try:
             client.session.request.return_value = self._ok_response()
 
@@ -211,13 +211,13 @@ class TestKalshiClientRetries(unittest.TestCase):
             url = pos_args[1]
             self.assertIn("demo-api.kalshi.co", url)
         finally:
-            config.KALSHI_ENV = orig_env
+            config.BASE_URL = orig_base_url
 
     def test_url_uses_prod_host_when_env_is_prod(self):
-        """URL must target trading-api.kalshi.com when KALSHI_ENV='prod'."""
+        """URL must target trading-api.kalshi.com when BASE_URL is the prod endpoint."""
         client = self._make_client()
-        orig_env = config.KALSHI_ENV
-        config.KALSHI_ENV = "prod"
+        orig_base_url = config.BASE_URL
+        config.BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
         try:
             client.session.request.return_value = self._ok_response()
 
@@ -227,7 +227,7 @@ class TestKalshiClientRetries(unittest.TestCase):
             url = pos_args[1]
             self.assertIn("trading-api.kalshi.com", url)
         finally:
-            config.KALSHI_ENV = orig_env
+            config.BASE_URL = orig_base_url
 
 
 # ── Daily limit boundary tests ─────────────────────────────────────────────────
@@ -292,9 +292,10 @@ class TestDailyLimitBoundaries(unittest.TestCase):
         config.MAX_DAILY_TRADES = 1
         risk = RiskManager()
         risk.log_entry_trade("BTCZ-T1", "yes", 1, 50)
-        # Simulate a new day by backdating _today
-        from datetime import date, timedelta
-        risk._today = date.today() - timedelta(days=1)
+        # Simulate a new day by backdating _today using the same UTC clock that
+        # RiskManager itself uses (datetime.now(timezone.utc).date()), so this
+        # test stays correct on systems where local time differs from UTC.
+        risk._today = datetime.datetime.now(datetime.timezone.utc).date() - datetime.timedelta(days=1)
         # After reset, trade count should be 0 so a new trade is allowed
         approved, _ = risk.approve_trade(self._signal(), balance=100, positions=[], market_ticker="BTCZ-NEW")
         self.assertTrue(approved)

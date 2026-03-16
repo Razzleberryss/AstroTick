@@ -98,7 +98,7 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
         if current_signal.side != side and current_signal.confidence >= config.MIN_EDGE_THRESHOLD:
             exit_reason = "reversal"
 
-    # 4. Expiry: exit when less than 2 minutes remain before contract close
+    # 4. Expiry: exit when fewer than EXPIRY_EXIT_SECONDS remain before contract close
     if not exit_reason:
         close_time_str = market.get("close_time")
         if close_time_str:
@@ -173,6 +173,7 @@ def run_once(client: KalshiClient, risk: RiskManager):
     sig = generate_signal(market, orderbook)
     
     # 4. Manage existing positions first
+    exit_error = False
     try:
         for closed in manage_positions(client, market, risk, current_signal=sig) or []:
             risk.record_closed_position(closed["market"])
@@ -186,6 +187,12 @@ def run_once(client: KalshiClient, risk: RiskManager):
             )
     except Exception as exc:
         log.error("Error while managing positions: %s", exc, exc_info=True)
+        exit_error = True
+
+    # If position management failed, skip new entries to avoid trading with
+    # unrecorded/un-exited positions.
+    if exit_error:
+        return False
 
     # 5. Risk check for NEW trade
     if sig is None:

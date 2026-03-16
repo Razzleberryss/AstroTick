@@ -74,18 +74,15 @@ class KalshiClient:
     def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> dict:
         """
         path is the short path, e.g. /portfolio/balance
-        We prepend /trade-api/v2 for the signature and the full URL.
+        We prepend /trade-api/v2 for the signature; the full URL is built from
+        config.BASE_URL (which already contains the /trade-api/v2 prefix) to
+        avoid duplicating host-selection logic.
         Retries up to REQUEST_MAX_RETRIES times on transient errors (timeout,
         connection error, 5xx) with exponential backoff. 4xx errors are raised
         immediately without retrying.
         """
-        full_path = "/trade-api/v2" + path
-        host = (
-            "https://demo-api.kalshi.co"
-            if config.KALSHI_ENV == "demo"
-            else "https://trading-api.kalshi.com"
-        )
-        url = host + full_path
+        full_path = "/trade-api/v2" + path   # for signing only; path must NOT include this prefix
+        url = config.BASE_URL + path          # BASE_URL ends with /trade-api/v2, path starts with /
         headers = self._auth_headers(method, full_path)
 
         last_exc: Exception = RuntimeError("No attempts made")
@@ -97,16 +94,17 @@ class KalshiClient:
                     timeout=config.REQUEST_TIMEOUT_SECONDS,
                 )
                 if not resp.ok:
-                    log.error(
-                        "Kalshi API error %s %s -> %s: %s",
-                        method, path, resp.status_code, resp.text,
-                    )
                     resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.HTTPError as exc:
                 # Do not retry client errors (4xx); always retry server errors (5xx)
                 status = exc.response.status_code if exc.response is not None else 0
                 if status < 500:
+                    log.error(
+                        "Kalshi API client error %s %s -> %s: %s",
+                        method, path, status,
+                        exc.response.text if exc.response is not None else exc,
+                    )
                     raise
                 last_exc = exc
                 log.warning(
@@ -125,6 +123,10 @@ class KalshiClient:
                 log.info("Retrying in %ds...", backoff)
                 time.sleep(backoff)
 
+        log.error(
+            "Kalshi API %s %s failed after %d attempt(s): %s",
+            method, path, max_attempts, last_exc,
+        )
         raise last_exc
 
     # ── Public API methods ────────────────────────────────────────────────────────────────────────

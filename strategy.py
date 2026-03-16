@@ -271,12 +271,25 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     action, size = decide_trade(market_price, model_p_yes)
 
     if action == "NO_TRADE":
+        # No new entry allowed (forbidden band, edge filter, etc.), but we still
+        # emit a zero-size Signal so downstream logic (e.g. reversal exits) can
+        # see the current strategy direction.
         log.info(
             "decide_trade returned NO_TRADE (composite=%.3f market_price=%.2f "
-            "model_p_yes=%.2f) — no trade this cycle",
+            "model_p_yes=%.2f) — blocking new entries this cycle",
             composite, market_price, model_p_yes,
         )
-        return None
+        # Derive directional side from the composite signal; tie-break towards YES
+        # when composite is very close to 0 so callers still see a consistent side.
+        side = "yes" if composite >= 0 else "no"
+        price = suggest_limit_price(market, side)
+        reason = (
+            "NO_TRADE from decide_trade (entry filters) — emitting zero-size signal "
+            f"for direction only: momentum={momentum:+.3f} skew={skew:+.3f} "
+            f"composite={composite:+.3f} → {side.upper()} @ {price}c "
+            f"(confidence={confidence:.2%} size=0)"
+        )
+        return Signal(side=side, confidence=confidence, price_cents=price, reason=reason, size=0)
 
     side = "yes" if action == "BUY_YES" else "no"
     price = suggest_limit_price(market, side)

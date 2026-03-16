@@ -13,6 +13,7 @@ Handles:
 import base64
 import datetime
 import logging
+import time
 from typing import Optional
 
 import requests
@@ -74,20 +75,57 @@ class KalshiClient:
         """
         path is the short path, e.g. /portfolio/balance
         We prepend /trade-api/v2 for the signature and the full URL.
+        Retries up to REQUEST_MAX_RETRIES times on transient errors (timeout,
+        connection error, 5xx) with exponential backoff. 4xx errors are raised
+        immediately without retrying.
         """
         full_path = "/trade-api/v2" + path
-        url = "https://demo-api.kalshi.co" + full_path if "demo" in self.base_url else "https://trading-api.kalshi.com" + full_path
-        headers = self._auth_headers(method, full_path)
-        resp = self.session.request(
-            method, url, headers=headers, params=params, json=json, timeout=10
+        host = (
+            "https://demo-api.kalshi.co"
+            if config.KALSHI_ENV == "demo"
+            else "https://trading-api.kalshi.com"
         )
-        if not resp.ok:
-            log.error(
-                "Kalshi API error %s %s -> %s: %s",
-                method, path, resp.status_code, resp.text
-            )
-            resp.raise_for_status()
-        return resp.json()
+        url = host + full_path
+        headers = self._auth_headers(method, full_path)
+
+        last_exc: Exception = RuntimeError("No attempts made")
+        max_attempts = 1 + max(0, config.REQUEST_MAX_RETRIES)
+        for attempt in range(max_attempts):
+            try:
+                resp = self.session.request(
+                    method, url, headers=headers, params=params, json=json,
+                    timeout=config.REQUEST_TIMEOUT_SECONDS,
+                )
+                if not resp.ok:
+                    log.error(
+                        "Kalshi API error %s %s -> %s: %s",
+                        method, path, resp.status_code, resp.text,
+                    )
+                    resp.raise_for_status()
+                return resp.json()
+            except requests.exceptions.HTTPError as exc:
+                # Do not retry client errors (4xx); always retry server errors (5xx)
+                status = exc.response.status_code if exc.response is not None else 0
+                if status < 500:
+                    raise
+                last_exc = exc
+                log.warning(
+                    "Server error %s %s status=%s (attempt %d/%d)",
+                    method, path, status, attempt + 1, max_attempts,
+                )
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+                last_exc = exc
+                log.warning(
+                    "Transient error %s %s (attempt %d/%d): %s",
+                    method, path, attempt + 1, max_attempts, exc,
+                )
+
+            if attempt < max_attempts - 1:
+                backoff = 2 ** attempt
+                log.info("Retrying in %ds...", backoff)
+                time.sleep(backoff)
+
+        raise last_exc
 
     # ── Public API methods ────────────────────────────────────────────────────────────────────────
     def get_balance(self) -> float:

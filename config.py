@@ -66,8 +66,15 @@ SIGNAL_REVERSAL_EXIT: bool = os.getenv("SIGNAL_REVERSAL_EXIT", "true").lower() =
 BTC_SERIES_TICKER: str = os.getenv("BTC_SERIES_TICKER", "BTCZ")
 BTC_TICKER: str = os.getenv("BTC_TICKER", "BTC-USD")  # yfinance symbol
 MOMENTUM_LOOKBACK_BARS: int = int(os.getenv("MOMENTUM_LOOKBACK_BARS", "5"))
-MIN_EDGE: float = float(os.getenv("MIN_EDGE", "0.05"))
 MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.05"))
+
+# =============================================================================
+# API Client
+# =============================================================================
+# Per-request timeout in seconds
+REQUEST_TIMEOUT_SECONDS: int = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "10"))
+# Maximum number of retry attempts for transient API errors (0 = no retries)
+REQUEST_MAX_RETRIES: int = int(os.getenv("REQUEST_MAX_RETRIES", "3"))
 
 # =============================================================================
 # Bot Loop
@@ -75,6 +82,9 @@ MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.05"))
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
 POLL_INTERVAL_SECONDS: int = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 LOOP_INTERVAL_SECONDS: int = POLL_INTERVAL_SECONDS  # alias used in bot.py
+
+# How many seconds before contract close_time to trigger the expiry exit
+EXPIRY_EXIT_SECONDS: int = int(os.getenv("EXPIRY_EXIT_SECONDS", "120"))
 
 # =============================================================================
 # Logging & Output
@@ -119,6 +129,12 @@ def validate() -> None:
         errors.append("MOMENTUM_LOOKBACK_BARS must be >= 1")
     if not (0.0 < MIN_EDGE_THRESHOLD < 1.0):
         errors.append("MIN_EDGE_THRESHOLD must be between 0 and 1")
+    if REQUEST_TIMEOUT_SECONDS < 1:
+        errors.append("REQUEST_TIMEOUT_SECONDS must be >= 1")
+    if REQUEST_MAX_RETRIES < 0:
+        errors.append("REQUEST_MAX_RETRIES must be >= 0")
+    if EXPIRY_EXIT_SECONDS < 0:
+        errors.append("EXPIRY_EXIT_SECONDS must be >= 0")
     if STOP_LOSS_CENTS < 0:
         errors.append("STOP_LOSS_CENTS must be >= 0")
     if TAKE_PROFIT_CENTS < 0:
@@ -146,6 +162,9 @@ if __name__ == "__main__":
     log.info("TAKE_PROFIT_CENTS     : %sc", TAKE_PROFIT_CENTS)
     log.info("SIGNAL_REVERSAL_EXIT  : %s", SIGNAL_REVERSAL_EXIT)
     log.info("LOOP_INTERVAL_SECONDS : %ss", LOOP_INTERVAL_SECONDS)
+    log.info("EXPIRY_EXIT_SECONDS   : %ss", EXPIRY_EXIT_SECONDS)
+    log.info("REQUEST_TIMEOUT_SECS  : %ss", REQUEST_TIMEOUT_SECONDS)
+    log.info("REQUEST_MAX_RETRIES   : %s", REQUEST_MAX_RETRIES)
     log.info("TRADE_LOG_FILE        : %s", TRADE_LOG_FILE)
     try:
         validate()

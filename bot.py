@@ -107,7 +107,7 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
                     close_time_str.replace("Z", "+00:00")
                 )
                 now = datetime.datetime.now(datetime.timezone.utc)
-                if (close_time - now).total_seconds() <= 120:
+                if (close_time - now).total_seconds() <= config.EXPIRY_EXIT_SECONDS:
                     exit_reason = "expiry"
             except (ValueError, TypeError):
                 pass
@@ -173,16 +173,19 @@ def run_once(client: KalshiClient, risk: RiskManager):
     sig = generate_signal(market, orderbook)
     
     # 4. Manage existing positions first
-    for closed in manage_positions(client, market, risk, current_signal=sig) or []:
-        risk.record_closed_position(closed["market"])
-        risk.log_exit_trade(
-            market=closed["market"],
-            side=closed["side"],
-            size=closed["size"],
-            entry_price=closed["entry_price"],
-            exit_price=closed["exit_price"],
-            exit_reason=closed["exit_reason"],
-        )
+    try:
+        for closed in manage_positions(client, market, risk, current_signal=sig) or []:
+            risk.record_closed_position(closed["market"])
+            risk.log_exit_trade(
+                market=closed["market"],
+                side=closed["side"],
+                size=closed["size"],
+                entry_price=closed["entry_price"],
+                exit_price=closed["exit_price"],
+                exit_reason=closed["exit_reason"],
+            )
+    except Exception as exc:
+        log.error("Error while managing positions: %s", exc, exc_info=True)
 
     # 5. Risk check for NEW trade
     if sig is None:
@@ -239,6 +242,7 @@ def main():
     log.info(" Stop Loss   : %sc", config.STOP_LOSS_CENTS)
     log.info(" Take Profit : %sc", config.TAKE_PROFIT_CENTS)
     log.info(" Reversal Ex : %s", config.SIGNAL_REVERSAL_EXIT)
+    log.info(" Expiry Exit : %ss before close", config.EXPIRY_EXIT_SECONDS)
     log.info(" Max Daily Loss : %sc", config.MAX_DAILY_LOSS_CENTS)
     log.info(" Max Daily Trades: %s", config.MAX_DAILY_TRADES)
     log.info("=" * 60)

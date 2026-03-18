@@ -166,9 +166,20 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
     entry_price = pos["entry_price"]
 
     # Current best bid for our side — what we can sell for right now
-    # Support both old (yes_bid) and new (best_yes_bid) field names
-    bid_field = f"best_{side}_bid" if f"best_{side}_bid" in market else f"{side}_bid"
-    current_price = market.get(bid_field, entry_price)
+    # Support both old (yes_bid) and new (best_yes_bid) field names.
+    best_bid_field = f"best_{side}_bid"
+    legacy_bid_field = f"{side}_bid"
+
+    # Prefer best_<side>_bid when present and non-None; otherwise fall back to <side>_bid;
+    # if both are missing or None, fall back to entry_price to avoid TypeError.
+    current_price = entry_price
+    best_bid_value = market.get(best_bid_field)
+    if best_bid_value is not None:
+        current_price = best_bid_value
+    else:
+        legacy_bid_value = market.get(legacy_bid_field)
+        if legacy_bid_value is not None:
+            current_price = legacy_bid_value
 
     exit_reason = None
 

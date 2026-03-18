@@ -254,5 +254,43 @@ class TestLiquidityFilters(unittest.TestCase):
         self.assertEqual(signal.size, 5)
 
 
+class TestEmptyWebSocketOrderbook(unittest.TestCase):
+    """Test that empty WebSocket orderbooks are handled gracefully."""
+
+    @patch('strategy.get_btc_momentum')
+    @patch('strategy.get_orderbook_skew')
+    def test_empty_websocket_orderbook_returns_no_trade(self, mock_skew, mock_momentum):
+        """Test that empty WebSocket orderbook results in NO_TRADE, not an exception."""
+        # Set up mocks for a bullish signal
+        mock_momentum.return_value = 0.5
+        mock_skew.return_value = 0.3
+
+        # Market data with all None values (as would happen with empty orderbook)
+        market = {
+            "best_yes_bid": None,
+            "best_yes_ask": None,
+            "best_no_bid": None,
+            "best_no_ask": None,
+            "mid_price": None,
+            "spread": None,
+            "yes_depth_near_mid": 0,
+            "no_depth_near_mid": 0,
+        }
+
+        # Empty orderbook structure (as returned by WebSocket with no data)
+        orderbook = {
+            "orderbook": {
+                "yes": [],
+                "no": []
+            }
+        }
+
+        # This should NOT raise an exception, but should return None (NO_TRADE)
+        signal = generate_signal(market, orderbook)
+
+        # Verify no exception was raised and NO_TRADE was returned
+        self.assertIsNone(signal)
+
+
 if __name__ == "__main__":
     unittest.main()

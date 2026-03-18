@@ -166,7 +166,20 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
     entry_price = pos["entry_price"]
 
     # Current best bid for our side — what we can sell for right now
-    current_price = market.get(f"{side}_bid", entry_price)
+    # Support both old (yes_bid) and new (best_yes_bid) field names.
+    best_bid_field = f"best_{side}_bid"
+    legacy_bid_field = f"{side}_bid"
+
+    # Prefer best_<side>_bid when present and non-None; otherwise fall back to <side>_bid;
+    # if both are missing or None, fall back to entry_price to avoid TypeError.
+    current_price = entry_price
+    best_bid_value = market.get(best_bid_field)
+    if best_bid_value is not None:
+        current_price = best_bid_value
+    else:
+        legacy_bid_value = market.get(legacy_bid_field)
+        if legacy_bid_value is not None:
+            current_price = legacy_bid_value
 
     exit_reason = None
 
@@ -226,6 +239,68 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
         }
 
 # ── Core bot loop ─────────────────────────────────────────────────────────────────────────────
+def _quotes_from_orderbook(orderbook: dict) -> dict:
+    """
+    Derive best bid/ask quotes and a mid price from a Kalshi orderbook dict.
+
+    This avoids making a second /orderbook (or equivalent) API call when we
+    already have the raw orderbook data.
+    """
+    # Default structure in case the orderbook is missing or empty
+    result = {
+        "best_yes_bid": None,
+        "best_yes_ask": None,
+        "best_no_bid": None,
+        "best_no_ask": None,
+        "mid_price": None,
+    }
+
+    if not isinstance(orderbook, dict):
+        return result
+
+    try:
+        yes_book = orderbook.get("yes", {}) or {}
+        no_book = orderbook.get("no", {}) or {}
+
+        yes_bids = yes_book.get("bids") or []
+        yes_asks = yes_book.get("asks") or []
+        no_bids = no_book.get("bids") or []
+        no_asks = no_book.get("asks") or []
+
+        def _best_price(entries):
+            if not entries:
+                return None
+            top = entries[0]
+            # Entries are expected to be dicts with a "price" field
+            return top.get("price") if isinstance(top, dict) else None
+
+        result["best_yes_bid"] = _best_price(yes_bids)
+        result["best_yes_ask"] = _best_price(yes_asks)
+        result["best_no_bid"] = _best_price(no_bids)
+        result["best_no_ask"] = _best_price(no_asks)
+
+        prices = [
+            p
+            for p in (
+                result["best_yes_bid"],
+                result["best_yes_ask"],
+                result["best_no_bid"],
+                result["best_no_ask"],
+            )
+            if p is not None
+        ]
+        if prices:
+            # Use a simple average of available best prices as a robust mid.
+            avg = sum(prices) / len(prices)
+            # Keep type consistent with existing prices (typically integer cents)
+            result["mid_price"] = round(avg)
+    except Exception:
+        # On any unexpected structure, fall back to defaults (all None)
+        return result
+
+    return result
+
+
 def run_once(client: KalshiClient, risk: RiskManager):
     """
     Execute one complete bot cycle.
@@ -245,10 +320,6 @@ def run_once(client: KalshiClient, risk: RiskManager):
         log.error("Refusing non-BTC-series market: %s", ticker)
         risk._clear_datetime_cache()
         return False
-    log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",
-             ticker, market.get("last_price"),
-             market.get("yes_bid"), market.get("yes_ask"),
-             market.get("no_bid"), market.get("no_ask"))
 
     # 2. Fetch supporting data
     try:
@@ -259,6 +330,34 @@ def run_once(client: KalshiClient, risk: RiskManager):
         log.error("API fetch error: %s", exc)
         risk._clear_datetime_cache()
         return False
+
+    # 2b. Populate market dict with orderbook-based quotes if enabled
+    if config.USE_ORDERBOOK_PRICES:
+        # Derive quotes directly from the already-fetched orderbook to avoid
+        # an extra network call and potential rate-limit pressure.
+        quotes = _quotes_from_orderbook(orderbook)
+        # Merge quotes into market dict, using new field names (best_yes_bid, etc.)
+        market.update(quotes)
+
+        # Log with orderbook-based prices
+        yes_bid = quotes.get("best_yes_bid")
+        yes_ask = quotes.get("best_yes_ask")
+        no_bid = quotes.get("best_no_bid")
+        no_ask = quotes.get("best_no_ask")
+        mid = quotes.get("mid_price")
+
+        if yes_bid is not None and yes_ask is not None:
+            log.info("Active market: %s | last=%sc yes=%dc/%dc no=%dc/%dc mid=%dc (from orderbook)",
+                     ticker, market.get("last_price"),
+                     yes_bid, yes_ask, no_bid, no_ask, mid)
+        else:
+            log.warning("Active market: %s | orderbook empty (no quotes available)", ticker)
+    else:
+        # Use old market data fields
+        log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",
+                 ticker, market.get("last_price"),
+                 market.get("yes_bid"), market.get("yes_ask"),
+                 market.get("no_bid"), market.get("no_ask"))
 
     # ── reddit_time_delay strategy path ───────────────────────────────────────
     if config.STRATEGY_MODE == "reddit_time_delay":
@@ -403,11 +502,12 @@ def _run_once_time_delay(
 
     # Derive entry prices from ask (realistic cost to open a position)
     # and exit prices from bid (the price we can realistically sell at).
+    # Support both old field names (yes_ask, yes_bid) and new (best_yes_ask, best_yes_bid)
     # Consolidate market data lookups to avoid redundant dictionary access
-    yes_ask_cents = market.get("yes_ask", 50)
-    no_ask_cents = market.get("no_ask", 50)
-    yes_bid_cents = market.get("yes_bid", 50)
-    no_bid_cents = market.get("no_bid", 50)
+    yes_ask_cents = market.get("best_yes_ask") or market.get("yes_ask", 50)
+    no_ask_cents = market.get("best_no_ask") or market.get("no_ask", 50)
+    yes_bid_cents = market.get("best_yes_bid") or market.get("yes_bid", 50)
+    no_bid_cents = market.get("best_no_bid") or market.get("no_bid", 50)
     up_price = float(yes_ask_cents) / 100.0   # ask — used for entry trigger
     down_price = float(no_ask_cents) / 100.0  # ask — used for entry trigger
     up_bid = float(yes_bid_cents) / 100.0     # bid — used for stop-loss exit

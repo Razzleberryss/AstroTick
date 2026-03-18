@@ -20,3 +20,6 @@ numpy>=1.26.0
 
 # Logging with colors
 colorlog>=6.8.0
+
+# WebSocket client for real-time orderbook streaming
+websocket-client>=1.6.0

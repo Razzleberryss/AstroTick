@@ -7,6 +7,7 @@ Import this module everywhere instead of calling os.getenv() directly.
 import os
 import logging
 from pathlib import Path
+from typing import Optional
 from dotenv import load_dotenv
 
 # -- Load .env file from project root ----------------------------------------
@@ -91,11 +92,30 @@ MOMENTUM_LOOKBACK_BARS: int = int(os.getenv("MOMENTUM_LOOKBACK_BARS", "5"))
 # based on the /markets API prices.
 USE_ORDERBOOK_PRICES: bool = os.getenv("USE_ORDERBOOK_PRICES", "true").lower() == "true"
 
+# USE_WEBSOCKET_ORDERBOOK: When True, use WebSocket streaming for orderbook data
+# instead of REST API polling. Falls back to REST if WebSocket is unavailable.
+USE_WEBSOCKET_ORDERBOOK: bool = os.getenv("USE_WEBSOCKET_ORDERBOOK", "false").lower() == "true"
+
 # Trading threshold parameters - tunable for more/less aggressive trading
 MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.02"))
 MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.003"))
 MAX_PRICE_DEVIATION: float = float(os.getenv("MAX_PRICE_DEVIATION", "0.12"))
 MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.08"))
+
+# =============================================================================
+# Liquidity Filters
+# =============================================================================
+# Maximum allowed spread (in probability terms, 0.0-1.0) before skipping trade
+# Example: 0.12 means 12 cents or 12 percentage points spread
+MAX_SPREAD: float = float(os.getenv("MAX_SPREAD", "0.12"))
+
+# Minimum orderbook depth near mid (total contracts within DEPTH_BAND of mid)
+MIN_YES_DEPTH: int = int(os.getenv("MIN_YES_DEPTH", "50"))
+MIN_NO_DEPTH: int = int(os.getenv("MIN_NO_DEPTH", "50"))
+
+# Depth band: how many cents/probability points around mid to count depth
+# Example: 0.05 means ±5 cents or ±5 percentage points around mid
+DEPTH_BAND: float = float(os.getenv("DEPTH_BAND", "0.05"))
 
 # =============================================================================
 # Fee-Aware Entry Parameters
@@ -121,6 +141,17 @@ MAX_SIZE: int = int(os.getenv("MAX_SIZE", "10"))
 
 # At this mispricing level (and above) the sizer uses MAX_SIZE contracts.
 MAX_EDGE_PCT: float = float(os.getenv("MAX_EDGE_PCT", "0.30"))
+
+# Optional fractional position sizing (in fixed-point contract counts)
+# If set, overrides BASE_SIZE/MAX_SIZE for position sizing
+# Example: ORDER_SIZE_FP=5 means always trade 5 contracts
+ORDER_SIZE_FP: Optional[int] = None
+_order_size_fp_str = os.getenv("ORDER_SIZE_FP", "")
+if _order_size_fp_str:
+    try:
+        ORDER_SIZE_FP = int(_order_size_fp_str)
+    except ValueError:
+        pass
 
 # =============================================================================
 # API Client
@@ -229,6 +260,17 @@ def validate() -> None:
         errors.append("TRIGGER_MINUTE_REMAINING must be >= 0")
     if MAX_TRADES_PER_WINDOW < 1:
         errors.append("MAX_TRADES_PER_WINDOW must be >= 1")
+    # Liquidity filter validations
+    if not (0.0 <= MAX_SPREAD <= 1.0):
+        errors.append("MAX_SPREAD must be between 0 and 1")
+    if MIN_YES_DEPTH < 0:
+        errors.append("MIN_YES_DEPTH must be >= 0")
+    if MIN_NO_DEPTH < 0:
+        errors.append("MIN_NO_DEPTH must be >= 0")
+    if not (0.0 <= DEPTH_BAND <= 1.0):
+        errors.append("DEPTH_BAND must be between 0 and 1")
+    if ORDER_SIZE_FP is not None and ORDER_SIZE_FP < 1:
+        errors.append("ORDER_SIZE_FP must be >= 1 when set")
     if errors:
         raise EnvironmentError(
             "Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors)

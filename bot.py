@@ -301,10 +301,15 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
     return result
 
 
-def run_once(client: KalshiClient, risk: RiskManager):
+def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
     """
     Execute one complete bot cycle.
     Returns True if an action was taken, False otherwise.
+
+    Args:
+        client: KalshiClient instance for REST API calls
+        risk: RiskManager instance for risk checks
+        ws_client: Optional WebSocket client for streaming orderbook data
     """
     global _last_trade_window_id
 
@@ -323,7 +328,29 @@ def run_once(client: KalshiClient, risk: RiskManager):
 
     # 2. Fetch supporting data
     try:
-        orderbook = client.get_orderbook(ticker)
+        # Try to get orderbook from WebSocket if available and connected
+        orderbook = None
+        if ws_client and ws_client.is_connected():
+            # Subscribe to this market if we haven't already
+            ws_client.subscribe_to_market(ticker)
+
+            # Try to get orderbook from WebSocket
+            ws_orderbook = ws_client.get_latest_orderbook(ticker)
+            if ws_orderbook:
+                # Ensure the WebSocket orderbook has valid structure (not empty)
+                if ws_orderbook.get("yes") or ws_orderbook.get("no"):
+                    # Wrap in same format as REST API response
+                    orderbook = {"orderbook": ws_orderbook}
+                    log.debug("Using WebSocket orderbook for %s", ticker)
+                else:
+                    log.debug("WebSocket orderbook for %s is empty, falling back to REST", ticker)
+
+        # Fall back to REST if WebSocket data not available
+        if orderbook is None:
+            orderbook = client.get_orderbook(ticker)
+            if ws_client and ws_client.is_connected():
+                log.debug("WebSocket orderbook not available, using REST for %s", ticker)
+
         balance = client.get_balance()
         positions = client.get_positions()
     except Exception as exc:
@@ -361,7 +388,7 @@ def run_once(client: KalshiClient, risk: RiskManager):
 
     # ── reddit_time_delay strategy path ───────────────────────────────────────
     if config.STRATEGY_MODE == "reddit_time_delay":
-        return _run_once_time_delay(client, risk, market, ticker, balance, positions)
+        return _run_once_time_delay(client, risk, market, ticker, balance, positions, orderbook)
 
     # ── fee_aware_model strategy path (default) ────────────────────────────────
 
@@ -457,6 +484,7 @@ def _run_once_time_delay(
     ticker: str,
     balance: float,
     positions: list,
+    orderbook: dict,
 ) -> bool:
     """
     One bot cycle for the ``reddit_time_delay`` strategy mode.
@@ -650,6 +678,7 @@ def main():
     log.info(" Expiry Exit : %ss before close", config.EXPIRY_EXIT_SECONDS)
     log.info(" Max Daily Loss : %sc", config.MAX_DAILY_LOSS_CENTS)
     log.info(" Max Daily Trades: %s", config.MAX_DAILY_TRADES)
+    log.info(" Use WebSocket: %s", config.USE_WEBSOCKET_ORDERBOOK)
     log.info("=" * 60)
     if config.KALSHI_ENV == "prod" and not config.DRY_RUN:
         log.warning("!" * 60)
@@ -666,20 +695,38 @@ def main():
     client = KalshiClient()
     risk = RiskManager()
 
+    # Initialize WebSocket client if enabled
+    ws_client = None
+    if config.USE_WEBSOCKET_ORDERBOOK:
+        try:
+            from websocket_client import KalshiWebSocketClient
+            ws_client = KalshiWebSocketClient()
+            ws_client.start()
+            log.info("WebSocket client started")
+        except Exception as exc:
+            log.warning("Failed to start WebSocket client: %s (falling back to REST)", exc)
+            ws_client = None
+
     log.info("Bot started. Press Ctrl+C to stop.")
 
-    while _running:
-        try:
-            run_once(client, risk)
-        except KeyboardInterrupt:
-            break
-        except Exception as exc:
-            log.error("Unexpected error in main loop: %s", exc, exc_info=True)
-            if not _running:
+    try:
+        while _running:
+            try:
+                run_once(client, risk, ws_client=ws_client)
+            except KeyboardInterrupt:
                 break
+            except Exception as exc:
+                log.error("Unexpected error in main loop: %s", exc, exc_info=True)
+                if not _running:
+                    break
 
-        log.debug("Sleeping %ds...", config.LOOP_INTERVAL_SECONDS)
-        time.sleep(config.LOOP_INTERVAL_SECONDS)
+            log.debug("Sleeping %ds...", config.LOOP_INTERVAL_SECONDS)
+            time.sleep(config.LOOP_INTERVAL_SECONDS)
+    finally:
+        # Clean shutdown of WebSocket client
+        if ws_client:
+            log.info("Shutting down WebSocket client...")
+            ws_client.stop()
 
     log.info("Bot stopped cleanly.")
 

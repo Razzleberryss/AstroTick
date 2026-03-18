@@ -485,6 +485,34 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
         )
         return None
 
+    # Apply liquidity filters: check spread and depth
+    # Get spread and depth metrics from market dict (populated by get_market_quotes)
+    market_spread = market.get("spread")
+    yes_depth = market.get("yes_depth_near_mid", 0)
+    no_depth = market.get("no_depth_near_mid", 0)
+
+    if market_spread is not None and market_spread > config.MAX_SPREAD:
+        log.info(
+            "Skipping trade: spread %.2fc (%.1f%%) > MAX_SPREAD %.2fc (%.1f%%)",
+            market_spread * 100, market_spread * 100,
+            config.MAX_SPREAD * 100, config.MAX_SPREAD * 100
+        )
+        return None
+
+    if yes_depth < config.MIN_YES_DEPTH:
+        log.info(
+            "Skipping trade: YES depth %d < MIN_YES_DEPTH %d",
+            yes_depth, config.MIN_YES_DEPTH
+        )
+        return None
+
+    if no_depth < config.MIN_NO_DEPTH:
+        log.info(
+            "Skipping trade: NO depth %d < MIN_NO_DEPTH %d",
+            no_depth, config.MIN_NO_DEPTH
+        )
+        return None
+
     # Map composite score to a model probability estimate.
     # A composite of ±1.0 shifts the market price by up to ±0.50,
     # so at MIN_EDGE_PCT=0.10 a composite of 0.20 is the minimum qualifying signal.

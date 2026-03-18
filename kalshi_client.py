@@ -109,18 +109,28 @@ class KalshiClient:
                     method, url, headers=headers, params=params, json=json,
                     timeout=config.REQUEST_TIMEOUT_SECONDS,
                 )
+
+                # Log full response for non-2xx status codes
                 if not resp.ok:
+                    try:
+                        error_data = resp.json()
+                        error_code = error_data.get("error", {}).get("code", "unknown")
+                        error_msg = error_data.get("error", {}).get("message", resp.text)
+                        log.error(
+                            "Kalshi API error %s %s -> HTTP %s: code=%s message=%s",
+                            method, path, resp.status_code, error_code, error_msg
+                        )
+                    except Exception:
+                        log.error(
+                            "Kalshi API error %s %s -> HTTP %s: %s",
+                            method, path, resp.status_code, resp.text
+                        )
                     resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.HTTPError as exc:
                 # Do not retry client errors (4xx); always retry server errors (5xx)
                 status = exc.response.status_code if exc.response is not None else 0
                 if status < 500:
-                    log.error(
-                        "Kalshi API client error %s %s -> %s: %s",
-                        method, path, status,
-                        exc.response.text if exc.response is not None else exc,
-                    )
                     raise
                 last_exc = exc
                 log.warning(
@@ -191,6 +201,9 @@ class KalshiClient:
             best_no_bid: int | None - highest NO bid in cents (best buy price for NO)
             best_no_ask: int | None - lowest NO ask in cents (best sell price for NO)
             mid_price: int | None - midpoint of yes bid/ask in cents, or None if no quotes
+            spread: float | None - spread in probability terms (0.0-1.0), or None if no quotes
+            yes_depth_near_mid: int - total YES contracts within DEPTH_BAND of mid
+            no_depth_near_mid: int - total NO contracts within DEPTH_BAND of mid
 
         All prices are in cents (1-99 range). Returns None values if orderbook is empty.
 
@@ -220,12 +233,40 @@ class KalshiClient:
             else:
                 mid_price = None
 
+            # Compute spread in probability terms (0.0-1.0)
+            if best_yes_bid is not None and best_yes_ask is not None:
+                spread = (best_yes_ask - best_yes_bid) / 100.0
+            else:
+                spread = None
+
+            # Compute depth near mid (within DEPTH_BAND)
+            yes_depth_near_mid = 0
+            no_depth_near_mid = 0
+
+            if mid_price is not None:
+                depth_band_cents = int(config.DEPTH_BAND * 100)
+                lower_bound = mid_price - depth_band_cents
+                upper_bound = mid_price + depth_band_cents
+
+                # Sum YES contract sizes within band
+                for price_cents, size in yes_bids:
+                    if lower_bound <= price_cents <= upper_bound:
+                        yes_depth_near_mid += size
+
+                # Sum NO contract sizes within band
+                for price_cents, size in no_bids:
+                    if lower_bound <= price_cents <= upper_bound:
+                        no_depth_near_mid += size
+
             return {
                 "best_yes_bid": best_yes_bid,
                 "best_yes_ask": best_yes_ask,
                 "best_no_bid": best_no_bid,
                 "best_no_ask": best_no_ask,
                 "mid_price": mid_price,
+                "spread": spread,
+                "yes_depth_near_mid": yes_depth_near_mid,
+                "no_depth_near_mid": no_depth_near_mid,
             }
         except Exception as exc:
             log.warning("Error fetching market quotes from orderbook for %s: %s", ticker, exc)
@@ -235,6 +276,9 @@ class KalshiClient:
                 "best_no_bid": None,
                 "best_no_ask": None,
                 "mid_price": None,
+                "spread": None,
+                "yes_depth_near_mid": 0,
+                "no_depth_near_mid": 0,
             }
 
     def get_positions(self) -> list:
@@ -262,19 +306,42 @@ class KalshiClient:
                 side.upper(), market_id, quantity, price
             )
             return None
+
+        # Generate unique client_order_id (timestamp + side + market)
+        client_order_id = f"{int(time.time() * 1000)}_{side}_{market_id}"
+
         payload = {
             "ticker": market_id,
             "action": "buy",
             "type": "limit",
             "side": side,
             "count": quantity,
+            "client_order_id": client_order_id,
         }
         if side == "yes":
             payload["yes_price"] = price
         else:
             payload["no_price"] = price
         log.info("Placing BUY order: %s", payload)
-        return self._request("POST", "/portfolio/orders", json=payload)
+
+        try:
+            response = self._request("POST", "/portfolio/orders", json=payload)
+
+            # Validate order status
+            order = response.get("order", {})
+            status = order.get("status")
+
+            if status not in ("resting", "pending", "queued"):
+                log.warning(
+                    "Order placed but status is '%s' (expected resting/pending/queued): %s",
+                    status, order
+                )
+
+            log.info("Order placed successfully: order_id=%s status=%s", order.get("order_id"), status)
+            return response
+        except Exception as exc:
+            log.error("Failed to place order: %s", exc)
+            raise
 
     def sell_position(
         self,
@@ -297,19 +364,42 @@ class KalshiClient:
                 side.upper(), market_id, quantity, price
             )
             return None
+
+        # Generate unique client_order_id (timestamp + side + market)
+        client_order_id = f"{int(time.time() * 1000)}_sell_{side}_{market_id}"
+
         payload = {
             "ticker": market_id,
             "action": "sell",
             "type": "limit",
             "side": side,
             "count": quantity,
+            "client_order_id": client_order_id,
         }
         if side == "yes":
             payload["yes_price"] = price
         else:
             payload["no_price"] = price
         log.info("Placing SELL order: %s", payload)
-        return self._request("POST", "/portfolio/orders", json=payload)
+
+        try:
+            response = self._request("POST", "/portfolio/orders", json=payload)
+
+            # Validate order status
+            order = response.get("order", {})
+            status = order.get("status")
+
+            if status not in ("resting", "pending", "queued"):
+                log.warning(
+                    "Sell order placed but status is '%s' (expected resting/pending/queued): %s",
+                    status, order
+                )
+
+            log.info("Sell order placed successfully: order_id=%s status=%s", order.get("order_id"), status)
+            return response
+        except Exception as exc:
+            log.error("Failed to place sell order: %s", exc)
+            raise
 
     def place_order(
         self,

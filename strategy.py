@@ -503,7 +503,13 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
         if yes_bid is None and yes_ask is None:
             log.warning(
                 "Market data missing YES bid/ask quotes — skipping cycle "
-                "(best_yes_bid and best_yes_ask are both None)"
+                "(best_yes_bid and best_yes_ask are both None) | "
+                "prices: best_yes_bid=%s best_yes_ask=%s yes_bid=%s yes_ask=%s mid=%s",
+                market.get("best_yes_bid"),
+                market.get("best_yes_ask"),
+                market.get("yes_bid"),
+                market.get("yes_ask"),
+                market.get("mid_price"),
             )
         else:
             log.debug(

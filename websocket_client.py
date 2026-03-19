@@ -42,7 +42,7 @@ class KalshiWebSocketClient:
 
         # Determine WebSocket URL based on environment
         if config.KALSHI_ENV == "prod":
-            self.ws_url = "wss://trading-api.kalshi.com/trade-api/ws/v2"
+            self.ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
         else:
             self.ws_url = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 
@@ -58,6 +58,7 @@ class KalshiWebSocketClient:
 
         # Track subscribed markets
         self._subscribed_markets = set()
+        self._message_id = 1
 
     @staticmethod
     def _load_private_key(path: str):
@@ -113,8 +114,16 @@ class KalshiWebSocketClient:
         """Main WebSocket event loop (runs in background thread)."""
         while self._running:
             try:
+                ts = str(int(datetime.datetime.now().timestamp() * 1000))
+                signature = self._sign(ts, "GET", "/trade-api/ws/v2")
+                headers = [
+                    f"KALSHI-ACCESS-KEY: {self.api_key_id}",
+                    f"KALSHI-ACCESS-SIGNATURE: {signature}",
+                    f"KALSHI-ACCESS-TIMESTAMP: {ts}",
+                ]
                 self.ws = websocket.WebSocketApp(
                     self.ws_url,
+                    header=headers,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
@@ -134,27 +143,6 @@ class KalshiWebSocketClient:
     def _on_open(self, ws):
         """Called when WebSocket connection is opened."""
         log.info("WebSocket connection opened")
-
-        # Authenticate using the documented WebSocket auth method
-        # For Kalshi WebSocket v2, authentication is typically done via initial message
-        ts = str(int(datetime.datetime.now().timestamp() * 1000))
-        signature = self._sign(ts, "GET", "/trade-api/ws/v2")
-
-        auth_msg = {
-            "id": 1,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_delta"],
-                "market_tickers": []  # Will subscribe to specific markets after auth
-            },
-            "headers": {
-                "Authorization": f"KALSHI-ACCESS-KEY={self.api_key_id}",
-                "KALSHI-ACCESS-TIMESTAMP": ts,
-                "KALSHI-ACCESS-SIGNATURE": signature,
-            }
-        }
-
-        ws.send(json.dumps(auth_msg))
         self._connected = True
 
     def _on_message(self, ws, message):
@@ -166,7 +154,8 @@ class KalshiWebSocketClient:
             if data.get("type") == "orderbook_snapshot" or data.get("type") == "orderbook_delta":
                 self._handle_orderbook_update(data)
             elif data.get("type") == "subscribed":
-                log.info("Successfully subscribed to channel: %s", data.get("channel"))
+                channel = data.get("msg", {}).get("channel")
+                log.info("Successfully subscribed to channel: %s", channel)
             elif data.get("type") == "error":
                 log.error("WebSocket error message: %s", data.get("msg"))
         except json.JSONDecodeError as exc:
@@ -177,31 +166,31 @@ class KalshiWebSocketClient:
     def _handle_orderbook_update(self, data):
         """Process an orderbook update and update the internal snapshot."""
         try:
-            ticker = data.get("market_ticker")
+            payload = data.get("msg", {})
+            ticker = payload.get("market_ticker")
             if not ticker:
                 return
 
             # For snapshot messages, replace the entire orderbook
             if data.get("type") == "orderbook_snapshot":
-                orderbook_data = data.get("orderbook", {})
+                orderbook_data = payload
                 with self._lock:
-                    self._orderbooks[ticker] = orderbook_data
+                    self._orderbooks[ticker] = self._normalize_orderbook(orderbook_data)
                 log.debug("Received orderbook snapshot for %s", ticker)
 
             # For delta messages, apply the incremental update
             elif data.get("type") == "orderbook_delta":
-                delta = data.get("delta", {})
+                delta = payload
                 with self._lock:
                     if ticker not in self._orderbooks:
-                        # Request snapshot if we don't have initial state
-                        log.warning("Received delta without snapshot for %s, requesting snapshot", ticker)
+                        log.warning(
+                            "Received delta without snapshot for %s; waiting for orderbook_snapshot",
+                            ticker,
+                        )
                         return
 
-                    # Apply delta updates (simplified - full implementation would handle adds/removes/updates)
                     current = self._orderbooks[ticker]
-                    # In production, you'd merge the delta properly
-                    # For now, treat delta as a full update for simplicity
-                    self._orderbooks[ticker] = delta
+                    self._orderbooks[ticker] = self._apply_delta(current, delta)
                     log.debug("Applied orderbook delta for %s", ticker)
 
         except Exception as exc:
@@ -233,11 +222,11 @@ class KalshiWebSocketClient:
 
         try:
             subscribe_msg = {
-                "id": int(time.time()),
+                "id": self._next_message_id(),
                 "cmd": "subscribe",
                 "params": {
                     "channels": ["orderbook_delta"],
-                    "market_tickers": [ticker]
+                    "market_ticker": ticker,
                 }
             }
 
@@ -267,6 +256,173 @@ class KalshiWebSocketClient:
                     "no": orderbook.get("no", []).copy() if orderbook.get("no") else []
                 }
             return None
+
+    @staticmethod
+    def _normalize_price(price) -> Optional[int]:
+        """Normalize a price into integer cents."""
+        if price is None:
+            return None
+        try:
+            if isinstance(price, str):
+                return int(float(price) * 100) if "." in price else int(price)
+            if isinstance(price, float) and 0 <= price <= 1:
+                return int(round(price * 100))
+            return int(price)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _normalize_levels(cls, levels) -> list[list[int]]:
+        """Normalize a side of the book into [[price_cents, size], ...]."""
+        if not levels:
+            return []
+
+        if isinstance(levels, dict):
+            levels = levels.get("bids") or levels.get("levels") or []
+
+        normalized = []
+        for level in levels:
+            price = None
+            size = None
+
+            if isinstance(level, dict):
+                price = level.get("price")
+                if price is None:
+                    price = level.get("price_dollars")
+                size = (
+                    level.get("size")
+                    if level.get("size") is not None
+                    else level.get("count")
+                )
+            elif isinstance(level, (list, tuple)) and len(level) >= 2:
+                price, size = level[0], level[1]
+
+            price_cents = cls._normalize_price(price)
+            if price_cents is None:
+                continue
+
+            try:
+                size_int = int(size)
+            except (TypeError, ValueError):
+                continue
+
+            if size_int > 0:
+                normalized.append([price_cents, size_int])
+
+        normalized.sort(key=lambda item: item[0], reverse=True)
+        return normalized
+
+    @classmethod
+    def _normalize_orderbook(cls, orderbook) -> dict:
+        """Normalize orderbook payloads into a consistent yes/no list format."""
+        if not isinstance(orderbook, dict):
+            return {"yes": [], "no": []}
+
+        yes_levels = (
+            orderbook.get("yes")
+            or orderbook.get("yes_dollars")
+            or orderbook.get("yes_dollars_fp")
+            or []
+        )
+        no_levels = (
+            orderbook.get("no")
+            or orderbook.get("no_dollars")
+            or orderbook.get("no_dollars_fp")
+            or []
+        )
+
+        return {
+            "yes": cls._normalize_levels(yes_levels),
+            "no": cls._normalize_levels(no_levels),
+        }
+
+    @classmethod
+    def _apply_side_delta(cls, current_levels, side_delta) -> list[list[int]]:
+        """Apply a delta payload to a single orderbook side."""
+        current_map = {price: size for price, size in cls._normalize_levels(current_levels)}
+
+        # Full replacement delta: {"yes": [[55, 10], ...]} or side list payload
+        if isinstance(side_delta, (list, tuple)):
+            return cls._normalize_levels(side_delta)
+        if isinstance(side_delta, dict) and (
+            side_delta.get("bids") is not None or side_delta.get("levels") is not None
+        ):
+            return cls._normalize_levels(side_delta)
+
+        updates = side_delta if isinstance(side_delta, list) else [side_delta]
+        for update in updates:
+            if not isinstance(update, dict):
+                continue
+            price_cents = cls._normalize_price(update.get("price"))
+            if price_cents is None:
+                price_cents = cls._normalize_price(update.get("price_dollars"))
+            if price_cents is None:
+                continue
+
+            raw_size = update.get("size")
+            if raw_size is None:
+                raw_size = update.get("count")
+            if raw_size is None:
+                raw_size = update.get("quantity")
+            if raw_size is None and update.get("delta_fp") is not None:
+                raw_size = None
+
+            if raw_size is not None:
+                try:
+                    size_int = int(raw_size)
+                except (TypeError, ValueError):
+                    continue
+                if size_int <= 0:
+                    current_map.pop(price_cents, None)
+                else:
+                    current_map[price_cents] = size_int
+                continue
+
+            raw_delta = update.get("delta")
+            if raw_delta is None:
+                raw_delta = update.get("delta_fp")
+            if raw_delta is not None:
+                try:
+                    delta_int = int(float(raw_delta))
+                except (TypeError, ValueError):
+                    continue
+                new_size = current_map.get(price_cents, 0) + delta_int
+                if new_size <= 0:
+                    current_map.pop(price_cents, None)
+                else:
+                    current_map[price_cents] = new_size
+
+        return [[price, size] for price, size in sorted(current_map.items(), reverse=True)]
+
+    @classmethod
+    def _apply_delta(cls, current_orderbook, delta) -> dict:
+        """Apply a delta payload without discarding the existing snapshot."""
+        current = cls._normalize_orderbook(current_orderbook)
+
+        if not isinstance(delta, dict):
+            return current
+
+        # Some payloads send a full yes/no replacement inside delta.
+        if "yes" in delta or "no" in delta:
+            return {
+                "yes": cls._apply_side_delta(current.get("yes", []), delta.get("yes", [])),
+                "no": cls._apply_side_delta(current.get("no", []), delta.get("no", [])),
+            }
+
+        # Other payloads send a single side/price update.
+        side = delta.get("side")
+        if side in ("yes", "no"):
+            updated = dict(current)
+            updated[side] = cls._apply_side_delta(current.get(side, []), delta)
+            return updated
+
+        return current
+
+    def _next_message_id(self) -> int:
+        """Return the next client message id for websocket commands."""
+        message_id = self._message_id
+        self._message_id += 1
+        return message_id
 
     def is_connected(self) -> bool:
         """Check if the WebSocket is currently connected."""

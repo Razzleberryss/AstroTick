@@ -406,5 +406,114 @@ class TestOneSidedOrderbooks(unittest.TestCase):
         self.assertEqual(quotes["best_no_bid"], 65)
 
 
+class TestFixedPointMigration(unittest.TestCase):
+    """Tests for fixed-point migration: top-level _dollars and WebSocket-wrapped _dollars fields."""
+
+    def setUp(self):
+        """Create a mock KalshiClient instance."""
+        with patch.object(KalshiClient, '_load_private_key', return_value=None):
+            self.client = KalshiClient()
+
+    def test_top_level_yes_dollars_no_dollars(self):
+        """Test that top-level yes_dollars/no_dollars fields are parsed (step 3 priority)."""
+        orderbook = {
+            "yes_dollars": [["0.5500", "10"], ["0.5400", "5"]],
+            "no_dollars": [["0.4500", "8"]],
+        }
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        self.assertEqual(quotes["best_yes_bid"], 55)
+        self.assertEqual(quotes["best_no_bid"], 45)
+        self.assertEqual(quotes["best_yes_ask"], 55)   # 100 - 45
+        self.assertEqual(quotes["best_no_ask"], 45)    # 100 - 55
+        self.assertEqual(quotes["mid_price"], 55)
+
+    def test_top_level_yes_dollars_one_sided(self):
+        """Test top-level yes_dollars with only YES side present uses inference."""
+        orderbook = {
+            "yes_dollars": [["0.6500", "15"]],
+            "no_dollars": [],
+        }
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        self.assertEqual(quotes["best_yes_bid"], 65)
+        self.assertIsNone(quotes["best_no_bid"])
+        self.assertEqual(quotes["best_yes_ask"], 66)   # inferred: 65 + 1
+        self.assertEqual(quotes["best_no_ask"], 35)    # 100 - 65
+
+    def test_websocket_wrapped_yes_dollars(self):
+        """Test that WebSocket-wrapped yes_dollars/no_dollars (nested under 'orderbook') is parsed."""
+        # Simulate what bot.py does: wraps ws_orderbook in {"orderbook": ws_orderbook}
+        ws_orderbook = {
+            "yes_dollars": [["0.7000", "20"]],
+            "no_dollars": [["0.2800", "12"]],
+        }
+        orderbook = {"orderbook": ws_orderbook}
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        self.assertEqual(quotes["best_yes_bid"], 70)
+        self.assertEqual(quotes["best_no_bid"], 28)
+        self.assertEqual(quotes["best_yes_ask"], 72)   # 100 - 28
+        self.assertEqual(quotes["best_no_ask"], 30)    # 100 - 70
+
+    def test_websocket_wrapped_yes_dollars_fp(self):
+        """Test that WebSocket-wrapped yes_dollars_fp/no_dollars_fp is parsed."""
+        ws_orderbook = {
+            "yes_dollars_fp": [["0.8200", "300.00"]],
+            "no_dollars_fp": [["0.1600", "150.00"]],
+        }
+        orderbook = {"orderbook": ws_orderbook}
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        self.assertEqual(quotes["best_yes_bid"], 82)
+        self.assertEqual(quotes["best_no_bid"], 16)
+        self.assertEqual(quotes["best_yes_ask"], 84)   # 100 - 16
+        self.assertEqual(quotes["best_no_ask"], 18)    # 100 - 82
+
+    def test_orderbook_fp_preferred_over_top_level_dollars(self):
+        """Test that orderbook_fp fields take priority over top-level yes_dollars."""
+        orderbook = {
+            "orderbook_fp": {
+                "yes_dollars": [["0.6000", "10"]],
+                "no_dollars": [["0.3500", "8"]],
+            },
+            "yes_dollars": [["0.4000", "5"]],   # lower priority – should be ignored
+            "no_dollars": [["0.5500", "3"]],    # lower priority – should be ignored
+        }
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        # Should use orderbook_fp values (60, 35), not top-level values (40, 55)
+        self.assertEqual(quotes["best_yes_bid"], 60)
+        self.assertEqual(quotes["best_no_bid"], 35)
+
+    def test_websocket_wrapped_dollars_preferred_over_top_level_legacy(self):
+        """Test that _dollars inside 'orderbook' wrapper beats top-level legacy 'yes'."""
+        orderbook = {
+            "orderbook": {
+                "yes_dollars": [["0.5800", "20"]],
+                "no_dollars": [["0.4000", "15"]],
+                "yes": [[40, 5]],   # lower priority – should be ignored
+                "no": [[55, 5]],    # lower priority – should be ignored
+            },
+        }
+
+        with patch.object(self.client, 'get_orderbook', return_value=orderbook):
+            quotes = self.client.get_market_quotes("TEST-TICKER")
+
+        # Should use yes_dollars (58, 40), not legacy yes (40, 55)
+        self.assertEqual(quotes["best_yes_bid"], 58)
+        self.assertEqual(quotes["best_no_bid"], 40)
+
+
 if __name__ == "__main__":
     unittest.main()

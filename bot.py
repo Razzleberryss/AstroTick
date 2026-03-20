@@ -264,8 +264,11 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
         # Support multiple formats, in priority order:
         # 1. orderbook_fp.yes_dollars_fp / no_dollars_fp  (new fixed-point REST format)
         # 2. orderbook_fp.yes_dollars / no_dollars        (older fp variant)
-        # 3. WebSocket/REST wrapped: {"orderbook": {"yes": [...], "no": [...]}}
-        # 4. Direct format: {"yes": {...}, "no": {...}}
+        # 3. orderbook["orderbook"].yes_dollars_fp / no_dollars_fp  (WebSocket-wrapped _fp)
+        # 4. orderbook["orderbook"].yes_dollars / no_dollars        (WebSocket-wrapped _dollars)
+        # 5. top-level yes_dollars / no_dollars on the orderbook response
+        # 6. orderbook["orderbook"].yes / no  (legacy integer-cents, wrapped)
+        # 7. top-level yes / no               (legacy integer-cents, direct)
 
         orderbook_data = orderbook.get("orderbook", {})
         orderbook_fp = orderbook.get("orderbook_fp", {})
@@ -274,12 +277,18 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
         yes_array = (
             orderbook_fp.get("yes_dollars_fp")
             or orderbook_fp.get("yes_dollars")
+            or orderbook_data.get("yes_dollars_fp")
+            or orderbook_data.get("yes_dollars")
+            or orderbook.get("yes_dollars")
             or orderbook_data.get("yes")
             or orderbook.get("yes")
         )
         no_array = (
             orderbook_fp.get("no_dollars_fp")
             or orderbook_fp.get("no_dollars")
+            or orderbook_data.get("no_dollars_fp")
+            or orderbook_data.get("no_dollars")
+            or orderbook.get("no_dollars")
             or orderbook_data.get("no")
             or orderbook.get("no")
         )
@@ -402,9 +411,17 @@ def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
             ws_orderbook = ws_client.get_latest_orderbook(ticker)
             if ws_orderbook:
                 # Check if orderbook has any non-empty side (yes OR no)
-                # Support both formats: yes/no and yes_dollars/no_dollars
-                has_yes = bool(ws_orderbook.get("yes") or ws_orderbook.get("yes_dollars"))
-                has_no = bool(ws_orderbook.get("no") or ws_orderbook.get("no_dollars"))
+                # Support all formats: legacy yes/no, yes_dollars, and yes_dollars_fp
+                has_yes = bool(
+                    ws_orderbook.get("yes")
+                    or ws_orderbook.get("yes_dollars")
+                    or ws_orderbook.get("yes_dollars_fp")
+                )
+                has_no = bool(
+                    ws_orderbook.get("no")
+                    or ws_orderbook.get("no_dollars")
+                    or ws_orderbook.get("no_dollars_fp")
+                )
 
                 if has_yes or has_no:
                     # Wrap in same format as REST API response
@@ -504,6 +521,14 @@ def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
     # ── fee_aware_model strategy path (default) ────────────────────────────────
 
     # 3. Generate signal
+    log.debug(
+        "bot to strategy: best_yes_bid=%s best_yes_ask=%s best_no_bid=%s best_no_ask=%s mid=%s",
+        market.get("best_yes_bid"),
+        market.get("best_yes_ask"),
+        market.get("best_no_bid"),
+        market.get("best_no_ask"),
+        market.get("mid_price"),
+    )
     sig = generate_signal(market, orderbook)
     
     # 4. Manage existing positions first

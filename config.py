@@ -101,22 +101,22 @@ USE_WEBSOCKET_ORDERBOOK: bool = os.getenv("USE_WEBSOCKET_ORDERBOOK", "false").lo
 MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.02"))
 MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.003"))
 MAX_PRICE_DEVIATION: float = float(os.getenv("MAX_PRICE_DEVIATION", "0.12"))
-MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.08"))
+MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.20"))
 
 # =============================================================================
 # Liquidity Filters
 # =============================================================================
 # Maximum allowed spread (in probability terms, 0.0-1.0) before skipping trade
 # Example: 0.12 means 12 cents or 12 percentage points spread
-MAX_SPREAD: float = float(os.getenv("MAX_SPREAD", "0.12"))
+MAX_SPREAD: float = float(os.getenv("MAX_SPREAD", "0.55"))
 
 # Minimum orderbook depth near mid (total contracts within DEPTH_BAND of mid)
-MIN_YES_DEPTH: int = int(os.getenv("MIN_YES_DEPTH", "50"))
-MIN_NO_DEPTH: int = int(os.getenv("MIN_NO_DEPTH", "50"))
+MIN_YES_DEPTH: int = int(os.getenv("MIN_YES_DEPTH", "4"))
+MIN_NO_DEPTH: int = int(os.getenv("MIN_NO_DEPTH", "4"))
 
 # Depth band: how many cents/probability points around mid to count depth
 # Example: 0.05 means ±5 cents or ±5 percentage points around mid
-DEPTH_BAND: float = float(os.getenv("DEPTH_BAND", "0.05"))
+DEPTH_BAND: float = float(os.getenv("DEPTH_BAND", "0.20"))
 
 # =============================================================================
 # Fee-Aware Entry Parameters
@@ -126,9 +126,9 @@ DEPTH_BAND: float = float(os.getenv("DEPTH_BAND", "0.05"))
 MIN_EDGE_PCT: float = float(os.getenv("MIN_EDGE_PCT", "0.10"))
 
 # Forbidden price band: skip entry when the YES price is in this range.
-# Fees bite hardest near 0.50, so the default excludes the 0.30–0.70 region.
-FORBIDDEN_PRICE_LOW: float = float(os.getenv("FORBIDDEN_PRICE_LOW", "0.30"))
-FORBIDDEN_PRICE_HIGH: float = float(os.getenv("FORBIDDEN_PRICE_HIGH", "0.70"))
+# Fees bite hardest near 0.50, so the default excludes the 0.35–0.56 region.
+FORBIDDEN_PRICE_LOW: float = float(os.getenv("FORBIDDEN_PRICE_LOW", "0.35"))
+FORBIDDEN_PRICE_HIGH: float = float(os.getenv("FORBIDDEN_PRICE_HIGH", "0.56"))
 
 # Minimum expected net value per contract after fees (in dollars).
 # E.g. 0.02 = at least 2 cents of edge after paying open + close fees.
@@ -166,7 +166,7 @@ REQUEST_MAX_RETRIES: int = int(os.getenv("REQUEST_MAX_RETRIES", "3"))
 # Bot Loop
 # =============================================================================
 DRY_RUN: bool = os.getenv("DRY_RUN", "true").lower() == "true"
-POLL_INTERVAL_SECONDS: int = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
+POLL_INTERVAL_SECONDS: int = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 LOOP_INTERVAL_SECONDS: int = POLL_INTERVAL_SECONDS  # alias used in bot.py
 
 # How many seconds before contract close_time to trigger the expiry exit

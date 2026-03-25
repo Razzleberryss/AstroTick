@@ -537,7 +537,7 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
 
     # Apply MAX_SLIPPAGE filter: skip if spread is too wide
     log.info("DEBUG spread inputs: yes_bid=%s yes_ask=%s", yes_bid, yes_ask)
-    spread = (yes_ask - yes_bid) / 100.0
+    spread = (yes_ask - yes_bid) / 10.0
     if spread > config.MAX_SLIPPAGE:
         log.info(
             "Market spread %.4f exceeds MAX_SLIPPAGE threshold %.4f — skipping cycle",

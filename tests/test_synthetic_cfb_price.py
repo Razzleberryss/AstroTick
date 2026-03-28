@@ -9,10 +9,14 @@ Covers:
 - outlier rejection
 - fewer than 3 valid sources returns ok=False
 - confidence classification: high / medium / low
+- immature window lowers confidence
+- rolling buffer: eviction, average, sample_count
+- price_regime classification: aligned / kalshi_ahead / kalshi_behind / uncertain
 """
 
 import os
 import sys
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -20,17 +24,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from synthetic_cfb_price import (
     PriceObservation,
+    RollingSyntheticCfbBuffer,
     SyntheticCfbSnapshot,
     build_synthetic_cfb_snapshot,
+    classify_price_regime,
     extract_price_usd,
     scrape_price_source,
     utc_now_iso,
+    _apply_window_confidence_cap,
     _classify_confidence,
 )
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 def _make_obs(price: float | None, ok: bool = True, source_name: str = "TestSource") -> PriceObservation:
@@ -45,6 +52,29 @@ def _make_obs(price: float | None, ok: bool = True, source_name: str = "TestSour
     )
 
 
+def _mock_scrape(prices: list[float | None]):
+    """Return a side_effect function that yields each price in turn."""
+    iter_prices = iter(prices)
+
+    def _side_effect(api_key, source_name, source_url):
+        try:
+            p = next(iter_prices)
+        except StopIteration:
+            p = None
+        ok = p is not None
+        return PriceObservation(
+            source_name=source_name,
+            source_url=source_url,
+            price_usd=p,
+            scraped_at=utc_now_iso(),
+            ok=ok,
+            error=None if ok else "no price",
+            raw_excerpt="",
+        )
+
+    return _side_effect
+
+
 # ---------------------------------------------------------------------------
 # utc_now_iso
 # ---------------------------------------------------------------------------
@@ -53,7 +83,6 @@ class TestUtcNowIso(unittest.TestCase):
     def test_returns_iso_string(self):
         ts = utc_now_iso()
         self.assertIsInstance(ts, str)
-        # Should contain a "T" separator and a timezone marker
         self.assertIn("T", ts)
         self.assertIn("+", ts)
 
@@ -89,6 +118,7 @@ class TestExtractPriceUsd(unittest.TestCase):
         self.assertIsNone(extract_price_usd(""))
 
     def test_returns_none_for_none_input(self):
+        # extract_price_usd should handle None gracefully (callers may pass None)
         self.assertIsNone(extract_price_usd(None))  # type: ignore[arg-type]
 
     def test_large_million_dollar_btc_price(self):
@@ -113,32 +143,25 @@ class TestScrapePriceSource(unittest.TestCase):
         MockApp.return_value = mock_app
 
         with patch.dict("sys.modules", {"firecrawl": MagicMock(FirecrawlApp=MockApp)}):
-            # Import firecrawl inside the module so we can patch it
-            import importlib
-            import synthetic_cfb_price as mod
-            original = None
+            import synthetic_cfb_price as mod  # noqa: F401
             try:
                 import firecrawl
-                original = firecrawl.FirecrawlApp
                 firecrawl.FirecrawlApp = MockApp
             except ImportError:
                 pass
 
             obs = scrape_price_source("test-key", "TestSource", "https://example.com")
 
-        # If firecrawl is not installed the scrape will fail gracefully
         if obs.ok:
             self.assertAlmostEqual(obs.price_usd, 66870.79)
             self.assertIsNone(obs.error)
         else:
-            # Module not installed – still returns a valid PriceObservation
             self.assertIsNotNone(obs.error)
             self.assertIsInstance(obs, PriceObservation)
 
     def test_failure_on_exception_returns_ok_false(self):
         """If Firecrawl raises an exception the helper returns ok=False, never raises."""
         with patch("builtins.__import__", side_effect=ImportError("firecrawl not installed")):
-            # We can't reliably re-import inside the test; just call with a bad key
             obs = scrape_price_source("", "TestSource", "https://example.com")
         self.assertIsInstance(obs, PriceObservation)
         self.assertFalse(obs.ok)
@@ -154,31 +177,83 @@ class TestScrapePriceSource(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# build_synthetic_cfb_snapshot
+# RollingSyntheticCfbBuffer
 # ---------------------------------------------------------------------------
 
-def _mock_scrape(prices: list[float | None]):
-    """Return a side_effect function that yields each price in turn."""
-    iter_prices = iter(prices)
+class TestRollingSyntheticCfbBuffer(unittest.TestCase):
 
-    def _side_effect(api_key, source_name, source_url):
-        try:
-            p = next(iter_prices)
-        except StopIteration:
-            p = None
-        ok = p is not None
-        return PriceObservation(
-            source_name=source_name,
-            source_url=source_url,
-            price_usd=p,
-            scraped_at=utc_now_iso(),
-            ok=ok,
-            error=None if ok else "no price",
-            raw_excerpt="",
-        )
+    def _buf(self, window: int = 60) -> RollingSyntheticCfbBuffer:
+        return RollingSyntheticCfbBuffer(window_seconds=window)
 
-    return _side_effect
+    def test_empty_buffer_average_is_none(self):
+        buf = self._buf()
+        self.assertIsNone(buf.average())
 
+    def test_empty_buffer_sample_count_is_zero(self):
+        buf = self._buf()
+        self.assertEqual(buf.sample_count(), 0)
+
+    def test_single_sample_average_equals_price(self):
+        buf = self._buf()
+        buf.append(66800.0)
+        self.assertAlmostEqual(buf.average(), 66800.0)
+        self.assertEqual(buf.sample_count(), 1)
+
+    def test_multiple_samples_simple_mean(self):
+        buf = self._buf()
+        buf.append(66800.0)
+        buf.append(66900.0)
+        buf.append(67000.0)
+        self.assertAlmostEqual(buf.average(), 66900.0)
+        self.assertEqual(buf.sample_count(), 3)
+
+    def test_evicts_entries_older_than_window(self):
+        buf = self._buf(window=60)
+        t0 = 1_000_000.0  # arbitrary epoch start
+        buf.append(66800.0, _timestamp=t0)
+        buf.append(66900.0, _timestamp=t0 + 30)
+        buf.append(67000.0, _timestamp=t0 + 61)  # this append evicts t0 entry
+        # t0 entry is 61 s old relative to latest timestamp → evicted
+        self.assertEqual(buf.sample_count(), 2)
+
+    def test_evicts_all_stale_entries(self):
+        buf = self._buf(window=60)
+        t0 = 1_000_000.0
+        buf.append(66800.0, _timestamp=t0)
+        buf.append(66900.0, _timestamp=t0 + 1)
+        # Jump 120 s ahead; both previous entries are now stale
+        buf.append(67000.0, _timestamp=t0 + 120)
+        self.assertEqual(buf.sample_count(), 1)
+        self.assertAlmostEqual(buf.average(), 67000.0)
+
+    def test_average_only_uses_in_window_samples(self):
+        buf = self._buf(window=60)
+        t0 = 2_000_000.0
+        buf.append(50000.0, _timestamp=t0)        # stale after t0+61
+        buf.append(66800.0, _timestamp=t0 + 30)   # in window at t0+61
+        buf.append(66900.0, _timestamp=t0 + 50)   # in window at t0+61
+        buf.append(67000.0, _timestamp=t0 + 61)   # the trigger sample, evicts t0
+        expected_avg = (66800.0 + 66900.0 + 67000.0) / 3
+        self.assertAlmostEqual(buf.average(), expected_avg)
+
+    def test_window_seconds_property(self):
+        buf = self._buf(window=90)
+        self.assertEqual(buf.window_seconds, 90)
+
+    def test_sample_count_correct_after_eviction(self):
+        buf = self._buf(window=60)
+        t0 = 3_000_000.0
+        for i in range(5):
+            buf.append(66000.0 + i * 100, _timestamp=t0 + i * 10)
+        # Now append at t0+70 to evict t0 entry (70 s old)
+        buf.append(67000.0, _timestamp=t0 + 70)
+        # t0 entry (70 s old) is evicted; 4 + 1 = 5 remaining
+        self.assertEqual(buf.sample_count(), 5)
+
+
+# ---------------------------------------------------------------------------
+# build_synthetic_cfb_snapshot – rolling buffer integration
+# ---------------------------------------------------------------------------
 
 class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
 
@@ -189,6 +264,7 @@ class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
 
         self.assertTrue(snap.ok)
         self.assertIsNotNone(snap.synthetic_cfb_mid)
+        self.assertIsNotNone(snap.synthetic_cfb_spot)
         self.assertEqual(snap.source_count, 5)
         self.assertIsNotNone(snap.min_price)
         self.assertIsNotNone(snap.max_price)
@@ -198,8 +274,13 @@ class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
         self.assertEqual(len(snap.observations), 5)
         self.assertIsNone(snap.error)
 
+    def test_spot_equals_mid(self):
+        prices = [66800.0, 66820.0, 66850.0, 66870.0, 66890.0]
+        with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+            snap = build_synthetic_cfb_snapshot("test-key")
+        self.assertAlmostEqual(snap.synthetic_cfb_spot, snap.synthetic_cfb_mid)
+
     def test_outlier_rejection(self):
-        # 4 tight prices + 1 extreme outlier well beyond 40 bps
         tight = [66800.0, 66820.0, 66840.0, 66860.0]
         outlier = 70000.0  # ~4700 bps above median
         prices = tight + [outlier]
@@ -207,9 +288,7 @@ class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
             snap = build_synthetic_cfb_snapshot("test-key", outlier_threshold_bps=40.0)
 
         self.assertTrue(snap.ok)
-        # Outlier should have been removed; source_count should be 4
         self.assertEqual(snap.source_count, 4)
-        # All remaining prices should be in the tight cluster
         self.assertLess(snap.max_price, 70000.0)  # type: ignore[operator]
 
     def test_fewer_than_3_valid_returns_ok_false(self):
@@ -226,7 +305,6 @@ class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
         prices = [66800.0, 66820.0, None, None, None]
         with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
             snap = build_synthetic_cfb_snapshot("test-key")
-
         self.assertFalse(snap.ok)
 
     def test_snapshot_never_raises(self):
@@ -236,9 +314,106 @@ class TestBuildSyntheticCfbSnapshot(unittest.TestCase):
             side_effect=RuntimeError("unexpected crash"),
         ):
             snap = build_synthetic_cfb_snapshot("test-key")
-
         self.assertFalse(snap.ok)
         self.assertIsNotNone(snap.error)
+
+    def test_with_buffer_sets_avg_60s(self):
+        prices = [66800.0, 66820.0, 66850.0, 66870.0, 66890.0]
+        buf = RollingSyntheticCfbBuffer(window_seconds=60)
+        with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+            snap = build_synthetic_cfb_snapshot("test-key", buffer=buf)
+        self.assertTrue(snap.ok)
+        self.assertIsNotNone(snap.synthetic_cfb_avg_60s)
+        self.assertEqual(snap.sample_count_60s, 1)
+        self.assertEqual(snap.window_seconds, 60)
+
+    def test_without_buffer_avg_60s_falls_back_to_spot(self):
+        prices = [66800.0, 66820.0, 66850.0, 66870.0, 66890.0]
+        with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+            snap = build_synthetic_cfb_snapshot("test-key")
+        self.assertTrue(snap.ok)
+        # No buffer provided → avg_60s falls back to spot
+        self.assertAlmostEqual(snap.synthetic_cfb_avg_60s, snap.synthetic_cfb_spot)
+        self.assertEqual(snap.sample_count_60s, 1)
+
+    def test_buffer_accumulates_across_calls(self):
+        buf = RollingSyntheticCfbBuffer(window_seconds=60)
+        for price_set in [
+            [66800.0, 66810.0, 66820.0, 66830.0, 66840.0],
+            [66900.0, 66910.0, 66920.0, 66930.0, 66940.0],
+            [67000.0, 67010.0, 67020.0, 67030.0, 67040.0],
+        ]:
+            with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(price_set)):
+                snap = build_synthetic_cfb_snapshot("test-key", buffer=buf)
+        # After 3 calls, buffer should have 3 samples
+        self.assertEqual(snap.sample_count_60s, 3)
+        self.assertIsNotNone(snap.synthetic_cfb_avg_60s)
+
+    def test_price_regime_defaults_to_uncertain(self):
+        prices = [66800.0, 66820.0, 66850.0, 66870.0, 66890.0]
+        with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+            snap = build_synthetic_cfb_snapshot("test-key")
+        # price_regime is "uncertain" by default; bot.py fills it after Kalshi mid is known
+        self.assertEqual(snap.price_regime, "uncertain")
+
+
+# ---------------------------------------------------------------------------
+# Immature window confidence cap
+# ---------------------------------------------------------------------------
+
+class TestApplyWindowConfidenceCap(unittest.TestCase):
+
+    def test_three_or_more_samples_no_cap(self):
+        label, score = _apply_window_confidence_cap("high", 0.9, sample_count_60s=3)
+        self.assertEqual(label, "high")
+        self.assertAlmostEqual(score, 0.9)
+
+    def test_two_samples_caps_high_to_medium(self):
+        label, score = _apply_window_confidence_cap("high", 0.9, sample_count_60s=2)
+        self.assertEqual(label, "medium")
+        self.assertAlmostEqual(score, 0.6)
+
+    def test_two_samples_does_not_raise_medium(self):
+        # Already at medium → no change
+        label, score = _apply_window_confidence_cap("medium", 0.6, sample_count_60s=2)
+        self.assertEqual(label, "medium")
+        self.assertAlmostEqual(score, 0.6)
+
+    def test_one_sample_caps_high_to_low(self):
+        label, score = _apply_window_confidence_cap("high", 0.9, sample_count_60s=1)
+        self.assertEqual(label, "low")
+        self.assertAlmostEqual(score, 0.3)
+
+    def test_one_sample_caps_medium_to_low(self):
+        label, score = _apply_window_confidence_cap("medium", 0.6, sample_count_60s=1)
+        self.assertEqual(label, "low")
+        self.assertAlmostEqual(score, 0.3)
+
+    def test_one_sample_leaves_low_unchanged(self):
+        label, score = _apply_window_confidence_cap("low", 0.3, sample_count_60s=1)
+        self.assertEqual(label, "low")
+        self.assertAlmostEqual(score, 0.3)
+
+    def test_immature_window_in_snapshot(self):
+        """build_synthetic_cfb_snapshot confidence is capped when buffer has 1 sample."""
+        prices = [66800.0, 66800.0, 66800.0, 66800.0, 66800.0]  # tight → normally "high"
+        buf = RollingSyntheticCfbBuffer(window_seconds=60)
+        with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+            snap = build_synthetic_cfb_snapshot("test-key", buffer=buf)
+        # 1 sample in buffer → confidence must be "low"
+        self.assertEqual(snap.confidence, "low")
+        self.assertAlmostEqual(snap.confidence_score, 0.3)
+
+    def test_mature_window_allows_high_confidence(self):
+        """After 3+ samples the window cap no longer limits confidence."""
+        buf = RollingSyntheticCfbBuffer(window_seconds=60)
+        for _ in range(3):
+            prices = [66800.0, 66800.0, 66800.0, 66800.0, 66800.0]
+            with patch("synthetic_cfb_price.scrape_price_source", side_effect=_mock_scrape(prices)):
+                snap = build_synthetic_cfb_snapshot("test-key", buffer=buf)
+        # 3 samples → cap no longer applies; tight spread → "high"
+        self.assertIn(snap.confidence, ("high", "medium"))  # depends on spread
+        self.assertGreater(snap.confidence_score, 0.3)
 
 
 # ---------------------------------------------------------------------------
@@ -286,10 +461,82 @@ class TestClassifyConfidence(unittest.TestCase):
         self.assertEqual(label, "medium")
 
     def test_boundary_just_over_high_threshold_drops_to_medium(self):
-        # 4 sources, spread 11 bps → medium (not high, since spread > 10)
         label, score = _classify_confidence(source_count=4, spread_bps=11.0)
         self.assertEqual(label, "medium")
 
 
+# ---------------------------------------------------------------------------
+# classify_price_regime
+# ---------------------------------------------------------------------------
+
+class TestClassifyPriceRegime(unittest.TestCase):
+
+    def test_aligned_within_threshold(self):
+        # Kalshi reference exactly equal → aligned
+        self.assertEqual(classify_price_regime(66850.0, 66850.0, threshold_bps=10.0), "aligned")
+
+    def test_aligned_small_deviation(self):
+        # 5 bps deviation → aligned (within 10 bps threshold)
+        cfb_avg = 66850.0
+        small_delta = cfb_avg * 0.0005  # 5 bps
+        self.assertEqual(
+            classify_price_regime(cfb_avg + small_delta, cfb_avg, threshold_bps=10.0),
+            "aligned",
+        )
+
+    def test_kalshi_ahead_above_threshold(self):
+        cfb_avg = 66850.0
+        delta = cfb_avg * 0.002  # 20 bps above avg
+        self.assertEqual(
+            classify_price_regime(cfb_avg + delta, cfb_avg, threshold_bps=10.0),
+            "kalshi_ahead",
+        )
+
+    def test_kalshi_behind_below_threshold(self):
+        cfb_avg = 66850.0
+        delta = cfb_avg * 0.002  # 20 bps below avg
+        self.assertEqual(
+            classify_price_regime(cfb_avg - delta, cfb_avg, threshold_bps=10.0),
+            "kalshi_behind",
+        )
+
+    def test_uncertain_when_kalshi_reference_none(self):
+        self.assertEqual(classify_price_regime(None, 66850.0, threshold_bps=10.0), "uncertain")
+
+    def test_uncertain_when_cfb_avg_none(self):
+        self.assertEqual(classify_price_regime(66850.0, None, threshold_bps=10.0), "uncertain")
+
+    def test_uncertain_when_both_none(self):
+        self.assertEqual(classify_price_regime(None, None, threshold_bps=10.0), "uncertain")
+
+    def test_uncertain_when_cfb_avg_zero(self):
+        self.assertEqual(classify_price_regime(66850.0, 0.0, threshold_bps=10.0), "uncertain")
+
+    def test_custom_threshold_bps(self):
+        cfb_avg = 66850.0
+        delta = cfb_avg * 0.0015  # 15 bps above avg
+        # With 10 bps threshold: kalshi_ahead
+        self.assertEqual(
+            classify_price_regime(cfb_avg + delta, cfb_avg, threshold_bps=10.0),
+            "kalshi_ahead",
+        )
+        # With 20 bps threshold: aligned
+        self.assertEqual(
+            classify_price_regime(cfb_avg + delta, cfb_avg, threshold_bps=20.0),
+            "aligned",
+        )
+
+    def test_exactly_at_threshold_boundary(self):
+        # Use a delta that is unambiguously <= threshold when computed as bps
+        cfb_avg = 66850.0
+        # 9.9 bps — comfortably within the 10 bps threshold
+        delta = cfb_avg * (9.9 / 10_000.0)
+        self.assertEqual(
+            classify_price_regime(cfb_avg + delta, cfb_avg, threshold_bps=10.0),
+            "aligned",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+

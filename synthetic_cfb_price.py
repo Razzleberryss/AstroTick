@@ -1,20 +1,31 @@
 """
 synthetic_cfb_price.py – Synthetic CF Benchmarks BTC price estimator.
 
-Kalshi's BTC markets reference CF Benchmarks pricing (BRTI).  Without direct
-BRTI feed access this module builds a best-effort synthetic estimate by
-scraping several public BTC spot pages with Firecrawl, applying light outlier
-filtering, and returning a structured snapshot suitable for agent context.
+Kalshi's BTC markets reference CF Benchmarks pricing (BRTI), specifically the
+*simple average of the last 60 seconds* of the BRTI feed.  Without direct BRTI
+feed access this module builds a best-effort synthetic estimate by:
+
+  1. Scraping several public BTC spot pages with Firecrawl each cycle to
+     produce an instantaneous synthetic spot price.
+  2. Accumulating those spot samples in a ``RollingSyntheticCfbBuffer`` that
+     keeps only the last 60 seconds of observations.
+  3. Exposing the rolling simple-mean as ``synthetic_cfb_avg_60s``, which is
+     the closest proxy available to Kalshi's actual settlement reference.
 
 Public entry points
 -------------------
-build_synthetic_cfb_snapshot(api_key, outlier_threshold_bps) -> SyntheticCfbSnapshot
+build_synthetic_cfb_snapshot(api_key, buffer, outlier_threshold_bps) -> SyntheticCfbSnapshot
+classify_price_regime(kalshi_reference_usd, cfb_avg_60s, threshold_bps) -> str
 
 Helper functions (also tested individually)
 -------------------------------------------
 utc_now_iso() -> str
 extract_price_usd(markdown_text) -> float | None
 scrape_price_source(api_key, source_name, source_url) -> PriceObservation
+
+Rolling buffer
+--------------
+RollingSyntheticCfbBuffer(window_seconds=60)
 """
 
 from __future__ import annotations
@@ -22,7 +33,9 @@ from __future__ import annotations
 import re
 import statistics
 import datetime
+import time
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -57,7 +70,16 @@ class PriceObservation:
 
 @dataclass
 class SyntheticCfbSnapshot:
+    # Instantaneous multi-source median for this cycle
     synthetic_cfb_mid: Optional[float]
+    # Alias kept separate to make the rolling-vs-spot distinction explicit
+    synthetic_cfb_spot: Optional[float]
+    # Rolling 60-second simple mean – closest proxy to Kalshi's settlement ref
+    synthetic_cfb_avg_60s: Optional[float]
+    sample_count_60s: int
+    window_seconds: int
+    price_regime: str
+    # Cross-source quality metrics
     source_count: int
     min_price: Optional[float]
     max_price: Optional[float]
@@ -72,6 +94,62 @@ class SyntheticCfbSnapshot:
 
 
 # ---------------------------------------------------------------------------
+# Rolling buffer
+# ---------------------------------------------------------------------------
+
+class RollingSyntheticCfbBuffer:
+    """
+    In-memory rolling buffer of synthetic CFB spot samples for the last
+    *window_seconds* seconds (default 60).
+
+    Kalshi settles BTC markets on the simple average of the last 60 seconds
+    of the CF Benchmarks BRTI feed.  This buffer accumulates our synthetic
+    spot estimates at each bot cycle and exposes their simple mean as
+    ``average()`` — the closest proxy we can build for that settlement ref.
+
+    Thread-safety: not required (single-threaded bot loop).
+    """
+
+    def __init__(self, window_seconds: int = 60) -> None:
+        self._window_seconds = window_seconds
+        # Each entry: (price: float, timestamp: float) where timestamp is
+        # time.time() unless overridden via _timestamp in append().
+        self._samples: deque[tuple[float, float]] = deque()
+
+    @property
+    def window_seconds(self) -> int:
+        return self._window_seconds
+
+    def append(self, price: float, _timestamp: Optional[float] = None) -> None:
+        """
+        Add *price* to the buffer and evict stale entries.
+
+        ``_timestamp`` is a POSIX timestamp (``time.time()`` epoch seconds).
+        It defaults to ``time.time()`` and is exposed only for deterministic
+        unit tests – callers should never pass it in production.
+        """
+        ts = _timestamp if _timestamp is not None else time.time()
+        self._samples.append((price, ts))
+        self._evict(ts)
+
+    def _evict(self, now: float) -> None:
+        """Remove entries older than window_seconds relative to *now*."""
+        cutoff = now - self._window_seconds
+        while self._samples and self._samples[0][1] < cutoff:
+            self._samples.popleft()
+
+    def average(self) -> Optional[float]:
+        """Simple arithmetic mean of buffered prices, or None if empty."""
+        if not self._samples:
+            return None
+        return statistics.mean(p for p, _ in self._samples)
+
+    def sample_count(self) -> int:
+        """Number of samples currently in the rolling window."""
+        return len(self._samples)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -81,7 +159,7 @@ def utc_now_iso() -> str:
 
 
 # Matches dollar amounts like $66,870.79 or $66870.79 or $1,234,567.00
-_PRICE_RE = re.compile(r"\$\s*([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
+_PRICE_RE = re.compile(r"\$\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)")
 
 
 def extract_price_usd(markdown_text: str) -> Optional[float]:
@@ -167,6 +245,11 @@ def scrape_price_source(
 # Confidence classification
 # ---------------------------------------------------------------------------
 
+# Ordered rank map used to apply the immature-window cap.
+_CONFIDENCE_RANK: dict[str, int] = {"high": 3, "medium": 2, "low": 1}
+_CONFIDENCE_BY_RANK: dict[int, tuple[str, float]] = {3: ("high", 0.9), 2: ("medium", 0.6), 1: ("low", 0.3)}
+
+
 def _classify_confidence(source_count: int, spread_bps: Optional[float]) -> tuple[str, float]:
     """Return (confidence_label, confidence_score) from source_count and spread_bps."""
     if spread_bps is None:
@@ -178,17 +261,67 @@ def _classify_confidence(source_count: int, spread_bps: Optional[float]) -> tupl
     return "low", 0.3
 
 
+def _apply_window_confidence_cap(
+    confidence: str,
+    confidence_score: float,
+    sample_count_60s: int,
+) -> tuple[str, float]:
+    """
+    Cap confidence down when the rolling window is immature.
+
+    - 1 sample  → cap at "low"   (0.3)
+    - 2 samples → cap at "medium" (0.6)
+    - ≥3 samples → no cap (full confidence from multi-source quality)
+    """
+    if sample_count_60s >= 3:
+        return confidence, confidence_score
+    cap_rank = max(1, sample_count_60s)  # 1 → low, 2 → medium
+    current_rank = _CONFIDENCE_RANK.get(confidence, 1)
+    if current_rank > cap_rank:
+        capped_label, capped_score = _CONFIDENCE_BY_RANK[cap_rank]
+        return capped_label, capped_score
+    return confidence, confidence_score
+
+
+# ---------------------------------------------------------------------------
+# Price regime classification
+# ---------------------------------------------------------------------------
+
+def classify_price_regime(
+    kalshi_reference_usd: Optional[float],
+    cfb_avg_60s: Optional[float],
+    threshold_bps: float = 10.0,
+) -> str:
+    """
+    Classify the relationship between the Kalshi-derived reference price and
+    the 60-second rolling synthetic CFB average.
+
+    Returns one of:
+      ``"aligned"``       – Kalshi reference is within *threshold_bps* of avg_60s
+      ``"kalshi_ahead"``  – Kalshi reference is meaningfully above avg_60s
+      ``"kalshi_behind"`` – Kalshi reference is meaningfully below avg_60s
+      ``"uncertain"``     – insufficient data (either input is None)
+    """
+    if kalshi_reference_usd is None or cfb_avg_60s is None or cfb_avg_60s == 0.0:
+        return "uncertain"
+    deviation_bps = (kalshi_reference_usd - cfb_avg_60s) / cfb_avg_60s * 10_000.0
+    if abs(deviation_bps) <= threshold_bps:
+        return "aligned"
+    return "kalshi_ahead" if deviation_bps > 0 else "kalshi_behind"
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 def build_synthetic_cfb_snapshot(
     api_key: str,
+    buffer: Optional[RollingSyntheticCfbBuffer] = None,
     outlier_threshold_bps: float = 40.0,
 ) -> SyntheticCfbSnapshot:
     """
-    Scrape all configured sources, filter outliers, and return a
-    ``SyntheticCfbSnapshot``.
+    Scrape all configured sources, filter outliers, update the rolling buffer,
+    and return a ``SyntheticCfbSnapshot``.
 
     Steps
     -----
@@ -198,13 +331,40 @@ def build_synthetic_cfb_snapshot(
     4. Compute a first-pass median.
     5. Reject prices whose deviation from the median exceeds
        *outlier_threshold_bps* basis points.
-    6. Re-compute final median from clean prices.
-    7. Compute spread stats and classify confidence.
+    6. Re-compute final median (= ``synthetic_cfb_spot``) from clean prices.
+    7. If *buffer* is provided, append the spot and derive ``synthetic_cfb_avg_60s``.
+    8. Compute spread stats and classify confidence, capping for immature windows.
 
     Never raises – all exceptions are caught internally.
     """
     now = utc_now_iso()
     observations: list[PriceObservation] = []
+
+    def _failed_snapshot(
+        source_count: int,
+        error: str,
+        avg_60s: Optional[float] = None,
+        sample_count_60s: int = 0,
+    ) -> SyntheticCfbSnapshot:
+        return SyntheticCfbSnapshot(
+            synthetic_cfb_mid=None,
+            synthetic_cfb_spot=None,
+            synthetic_cfb_avg_60s=avg_60s,
+            sample_count_60s=sample_count_60s,
+            window_seconds=buffer.window_seconds if buffer is not None else 60,
+            price_regime="uncertain",
+            source_count=source_count,
+            min_price=None,
+            max_price=None,
+            spread_dollars=None,
+            spread_bps=None,
+            confidence="low",
+            confidence_score=0.3,
+            observations=observations,
+            scraped_at=now,
+            ok=False,
+            error=error,
+        )
 
     try:
         for source_name, source_url in BTC_SOURCES:
@@ -216,18 +376,8 @@ def build_synthetic_cfb_snapshot(
         ]
 
         if len(valid) < 3:
-            return SyntheticCfbSnapshot(
-                synthetic_cfb_mid=None,
+            return _failed_snapshot(
                 source_count=len(valid),
-                min_price=None,
-                max_price=None,
-                spread_dollars=None,
-                spread_bps=None,
-                confidence="low",
-                confidence_score=0.3,
-                observations=observations,
-                scraped_at=now,
-                ok=False,
                 error=f"Only {len(valid)} valid price(s) – minimum 3 required",
             )
 
@@ -244,16 +394,38 @@ def build_synthetic_cfb_snapshot(
             # Fall back to full valid set if filtering discards too many prices
             clean = valid
 
-        final_mid = statistics.median(clean)
+        spot = statistics.median(clean)
         min_price = min(clean)
         max_price = max(clean)
         spread_dollars = max_price - min_price
-        spread_bps = (spread_dollars / final_mid) * 10_000.0 if final_mid else None
+        spread_bps = (spread_dollars / spot) * 10_000.0
+
+        # Update rolling buffer and derive 60s average
+        avg_60s: Optional[float] = None
+        sample_count_60s = 0
+        window_seconds = 60
+        if buffer is not None:
+            buffer.append(spot)
+            avg_60s = buffer.average()
+            sample_count_60s = buffer.sample_count()
+            window_seconds = buffer.window_seconds
+        else:
+            # No buffer: fall back to spot as the best single-sample estimate
+            avg_60s = spot
+            sample_count_60s = 1
 
         confidence, confidence_score = _classify_confidence(len(clean), spread_bps)
+        confidence, confidence_score = _apply_window_confidence_cap(
+            confidence, confidence_score, sample_count_60s
+        )
 
         return SyntheticCfbSnapshot(
-            synthetic_cfb_mid=final_mid,
+            synthetic_cfb_mid=spot,
+            synthetic_cfb_spot=spot,
+            synthetic_cfb_avg_60s=avg_60s,
+            sample_count_60s=sample_count_60s,
+            window_seconds=window_seconds,
+            price_regime="uncertain",  # bot.py fills this after computing Kalshi reference
             source_count=len(clean),
             min_price=min_price,
             max_price=max_price,
@@ -271,6 +443,11 @@ def build_synthetic_cfb_snapshot(
         log.error("build_synthetic_cfb_snapshot failed unexpectedly: %s", exc)
         return SyntheticCfbSnapshot(
             synthetic_cfb_mid=None,
+            synthetic_cfb_spot=None,
+            synthetic_cfb_avg_60s=None,
+            sample_count_60s=0,
+            window_seconds=buffer.window_seconds if buffer is not None else 60,
+            price_regime="uncertain",
             source_count=0,
             min_price=None,
             max_price=None,

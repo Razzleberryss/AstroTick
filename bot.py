@@ -32,7 +32,11 @@ from risk_manager import RiskManager
 from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
 from agent_decision_engine import AgentAction
 import cli_executor
-from synthetic_cfb_price import build_synthetic_cfb_snapshot
+from synthetic_cfb_price import (
+    build_synthetic_cfb_snapshot,
+    classify_price_regime,
+    RollingSyntheticCfbBuffer,
+)
 
 
 def write_dashboard_state(state: dict) -> None:
@@ -164,6 +168,11 @@ log = logging.getLogger("bot")
 # ── Graceful shutdown ─────────────────────────────────────────────────────────────────────────────
 _running = True
 _halt_trading = False
+
+# ── Synthetic CFB rolling buffer ─────────────────────────────────────────────────────────────────
+# Persists across bot cycles so that synthetic_cfb_avg_60s accumulates a
+# true 60-second rolling mean — the closest proxy to Kalshi's BRTI settlement ref.
+_cfb_buffer = RollingSyntheticCfbBuffer(window_seconds=60)
 
 # ── Time-delay strategy state ─────────────────────────────────────────────────────────────────────
 # Tracks the window ID of the last trade placed in reddit_time_delay mode so that
@@ -488,11 +497,17 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
 
     # 1b. Synthetic CF Benchmarks BTC price estimate
     # Scrapes public BTC spot sources to build a best-effort BRTI proxy.
+    # The rolling buffer accumulates spot samples to approximate Kalshi's
+    # settlement reference (simple average of the last 60 seconds of BRTI).
     # Agent context is enriched when ok=True; degraded fields are set on failure.
-    _cfb_snapshot = build_synthetic_cfb_snapshot(config.FIRECRAWL_API_KEY)
+    _cfb_snapshot = build_synthetic_cfb_snapshot(config.FIRECRAWL_API_KEY, buffer=_cfb_buffer)
     if _cfb_snapshot.ok:
         _cfb_ctx: dict = {
+            "synthetic_cfb_spot": _cfb_snapshot.synthetic_cfb_spot,
             "synthetic_cfb_mid": _cfb_snapshot.synthetic_cfb_mid,
+            "synthetic_cfb_avg_60s": _cfb_snapshot.synthetic_cfb_avg_60s,
+            "synthetic_cfb_window_seconds": _cfb_snapshot.window_seconds,
+            "synthetic_cfb_sample_count_60s": _cfb_snapshot.sample_count_60s,
             "synthetic_cfb_confidence": _cfb_snapshot.confidence,
             "synthetic_cfb_confidence_score": _cfb_snapshot.confidence_score,
             "synthetic_cfb_spread_bps": _cfb_snapshot.spread_bps,
@@ -500,11 +515,13 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             "synthetic_cfb_scraped_at": _cfb_snapshot.scraped_at,
         }
         log.debug(
-            "SyntheticCFB ok | mid=%.2f conf=%s spread_bps=%.1f sources=%d",
-            _cfb_snapshot.synthetic_cfb_mid or 0.0,
+            "SyntheticCFB ok | spot=%.2f avg60s=%s conf=%s spread_bps=%.1f sources=%d samples=%d",
+            _cfb_snapshot.synthetic_cfb_spot or 0.0,
+            f"{_cfb_snapshot.synthetic_cfb_avg_60s:.2f}" if _cfb_snapshot.synthetic_cfb_avg_60s else "n/a",
             _cfb_snapshot.confidence,
             _cfb_snapshot.spread_bps or 0.0,
             _cfb_snapshot.source_count,
+            _cfb_snapshot.sample_count_60s,
         )
     else:
         log.warning(
@@ -512,7 +529,11 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             _cfb_snapshot.error,
         )
         _cfb_ctx = {
+            "synthetic_cfb_spot": None,
             "synthetic_cfb_mid": None,
+            "synthetic_cfb_avg_60s": None,
+            "synthetic_cfb_window_seconds": 60,
+            "synthetic_cfb_sample_count_60s": 0,
             "synthetic_cfb_confidence": "low",
             "synthetic_cfb_confidence_score": 0.0,
             "synthetic_cfb_spread_bps": None,
@@ -649,24 +670,26 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             state["spread"] = _ya - _yb
         state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
 
-        # Compute Kalshi dislocation vs synthetic CFB mid if both are available.
-        # mid_price is in cents (0-100 range); synthetic_cfb_mid is in USD.
-        # Dislocation here measures how far the Kalshi market's implied BTC
-        # price (derived from market mid) deviates from the CFB spot estimate.
-        # We express the Kalshi implied BTC price as: cfb_mid * (mid_cents / 100)
-        # and measure deviation from cfb_mid itself.
-        _cfb_mid = _cfb_snapshot.synthetic_cfb_mid
+        # Compute Kalshi dislocation and price regime vs synthetic CFB avg_60s.
+        # mid_price is in cents (0-100 range); synthetic_cfb_avg_60s is in USD.
+        # We express the Kalshi-scaled BTC reference as:
+        #   cfb_avg * (mid_cents / 100)
+        # and measure its deviation from cfb_avg to get the dislocation.
+        _cfb_avg = _cfb_snapshot.synthetic_cfb_avg_60s
         _market_mid_cents = state.get("mid_price")
-        if _cfb_mid is not None and _market_mid_cents is not None:
-            # Kalshi mid as a fraction of CFB spot price
-            kalshi_implied_btc = _cfb_mid * (_market_mid_cents / 100.0)
-            dislocation_dollars = kalshi_implied_btc - _cfb_mid
-            dislocation_bps = (dislocation_dollars / _cfb_mid) * 10_000.0 if _cfb_mid else None
+        if _cfb_avg is not None and _market_mid_cents is not None:
+            kalshi_scaled_cfb = _cfb_avg * (_market_mid_cents / 100.0)
+            dislocation_dollars = kalshi_scaled_cfb - _cfb_avg
+            dislocation_bps = (dislocation_dollars / _cfb_avg) * 10_000.0
             state["kalshi_dislocation_dollars"] = round(dislocation_dollars, 2)
-            state["kalshi_dislocation_bps"] = round(dislocation_bps, 2) if dislocation_bps is not None else None
+            state["kalshi_dislocation_bps"] = round(dislocation_bps, 2)
+            regime = classify_price_regime(kalshi_scaled_cfb, _cfb_avg)
         else:
             state["kalshi_dislocation_dollars"] = None
             state["kalshi_dislocation_bps"] = None
+            regime = "uncertain"
+        _cfb_snapshot.price_regime = regime
+        state["price_regime"] = regime
 
     # ── reddit_time_delay strategy path ───────────────────────────────────────
     if config.STRATEGY_MODE == "reddit_time_delay":

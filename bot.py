@@ -32,6 +32,7 @@ from risk_manager import RiskManager
 from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
 from agent_decision_engine import AgentAction
 import cli_executor
+from synthetic_cfb_price import build_synthetic_cfb_snapshot
 
 
 def write_dashboard_state(state: dict) -> None:
@@ -485,6 +486,42 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     if state is not None:
         state["active_market_ticker"] = ticker
 
+    # 1b. Synthetic CF Benchmarks BTC price estimate
+    # Scrapes public BTC spot sources to build a best-effort BRTI proxy.
+    # Agent context is enriched when ok=True; degraded fields are set on failure.
+    _cfb_snapshot = build_synthetic_cfb_snapshot(config.FIRECRAWL_API_KEY)
+    if _cfb_snapshot.ok:
+        _cfb_ctx: dict = {
+            "synthetic_cfb_mid": _cfb_snapshot.synthetic_cfb_mid,
+            "synthetic_cfb_confidence": _cfb_snapshot.confidence,
+            "synthetic_cfb_confidence_score": _cfb_snapshot.confidence_score,
+            "synthetic_cfb_spread_bps": _cfb_snapshot.spread_bps,
+            "synthetic_cfb_source_count": _cfb_snapshot.source_count,
+            "synthetic_cfb_scraped_at": _cfb_snapshot.scraped_at,
+        }
+        log.debug(
+            "SyntheticCFB ok | mid=%.2f conf=%s spread_bps=%.1f sources=%d",
+            _cfb_snapshot.synthetic_cfb_mid or 0.0,
+            _cfb_snapshot.confidence,
+            _cfb_snapshot.spread_bps or 0.0,
+            _cfb_snapshot.source_count,
+        )
+    else:
+        log.warning(
+            "SYNTHETICCFBFAILED | error=%s | continuing cycle with degraded context",
+            _cfb_snapshot.error,
+        )
+        _cfb_ctx = {
+            "synthetic_cfb_mid": None,
+            "synthetic_cfb_confidence": "low",
+            "synthetic_cfb_confidence_score": 0.0,
+            "synthetic_cfb_spread_bps": None,
+            "synthetic_cfb_source_count": 0,
+            "synthetic_cfb_scraped_at": _cfb_snapshot.scraped_at,
+        }
+    if state is not None:
+        state.update(_cfb_ctx)
+
     # 2. Fetch supporting data
     try:
         # Try to get orderbook from WebSocket if available and connected
@@ -611,6 +648,25 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         if _yb is not None and _ya is not None:
             state["spread"] = _ya - _yb
         state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
+
+        # Compute Kalshi dislocation vs synthetic CFB mid if both are available.
+        # mid_price is in cents (0-100 range); synthetic_cfb_mid is in USD.
+        # Dislocation here measures how far the Kalshi market's implied BTC
+        # price (derived from market mid) deviates from the CFB spot estimate.
+        # We express the Kalshi implied BTC price as: cfb_mid * (mid_cents / 100)
+        # and measure deviation from cfb_mid itself.
+        _cfb_mid = _cfb_snapshot.synthetic_cfb_mid
+        _market_mid_cents = state.get("mid_price")
+        if _cfb_mid is not None and _market_mid_cents is not None:
+            # Kalshi mid as a fraction of CFB spot price
+            kalshi_implied_btc = _cfb_mid * (_market_mid_cents / 100.0)
+            dislocation_dollars = kalshi_implied_btc - _cfb_mid
+            dislocation_bps = (dislocation_dollars / _cfb_mid) * 10_000.0 if _cfb_mid else None
+            state["kalshi_dislocation_dollars"] = round(dislocation_dollars, 2)
+            state["kalshi_dislocation_bps"] = round(dislocation_bps, 2) if dislocation_bps is not None else None
+        else:
+            state["kalshi_dislocation_dollars"] = None
+            state["kalshi_dislocation_bps"] = None
 
     # ── reddit_time_delay strategy path ───────────────────────────────────────
     if config.STRATEGY_MODE == "reddit_time_delay":

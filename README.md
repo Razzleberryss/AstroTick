@@ -4,13 +4,37 @@ A rule-based Python trading bot for Kalshi's BTC Up/Down 15-minute prediction ma
 
 ---
 
-## New Features: Early Exit Logic
-The bot now supports managing open positions before they expire:
+## New Features
+
+### Early Exit Logic
+The bot actively manages open positions before expiry to lock in gains and cut losses:
+
 - **Stop-Loss:** Automatically sells a position if the contract price drops below your entry price by a set amount.
 - **Take-Profit:** Automatically sells a position if the contract price rises above your entry price by a set amount.
 - **Signal Reversal:** Sells an open position if the latest strategy signal flips against your current holding (e.g., holding YES but signal becomes NO).
 - **Daily Risk Limits:** Blocks new entries after hitting `MAX_DAILY_LOSS_CENTS` or `MAX_DAILY_TRADES`, while continuing to manage/exit open positions.
 - **Strict Market Scope:** Discovery and order placement are restricted to `BTC_SERIES_TICKER` markets only.
+
+### OpenClaw Integration
+The bot now integrates with **OpenClaw**, enabling advanced market data ingestion, smarter signal enrichment, and deeper orderbook analysis for more precise BTC Up/Down entries.
+
+- Pulls enriched market context from OpenClaw's data layer to supplement Kalshi orderbook signals.
+- Improves signal confidence scoring by cross-referencing momentum data from multiple sources.
+- Seamlessly plugs into the existing `strategy.py` pipeline with minimal config changes.
+
+### Cursor Plugin Support
+This project is fully optimized for development inside **Cursor** with AI-assisted coding enabled:
+
+- `.cursor` config included for instant project context — no manual setup needed.
+- AI-aware file structure and inline comments make Copilot/Cursor suggestions faster and more accurate.
+- Modular design means Cursor can autocomplete, refactor, and reason about `bot.py`, `strategy.py`, and `risk_manager.py` independently.
+- Faster, cleaner code iteration directly from your editor with context-aware suggestions tailored to this trading bot's architecture.
+
+### Performance & Code Quality
+- Refactored async loop in `bot.py` for lower latency between signal generation and order placement.
+- Cleaner separation of concerns across all modules — easier to extend or swap out strategy logic.
+- Improved logging with structured output for faster debugging and trade review.
+- Reduced boilerplate in `kalshi_client.py` for a leaner, more readable API wrapper.
 
 ---
 
@@ -18,13 +42,13 @@ The bot now supports managing open positions before they expire:
 
 ```
 .
-├── bot.py             # Main loop - manages positions and enters trades
-├── kalshi_client.py   # Kalshi API wrapper (auth, orders, positions, selling)
-├── strategy.py        # Signal generation (momentum + orderbook skew)
-├── risk_manager.py    # Risk checks, position sizing, CSV trade log
-├── config.py          # Config loader (reads from .env)
-├── .env.example       # Copy to .env and fill in your keys
-├── requirements.txt   # Python dependencies
+├── bot.py              # Main loop - manages positions and enters trades
+├── kalshi_client.py    # Kalshi API wrapper (auth, orders, positions, selling)
+├── strategy.py         # Signal generation (momentum + orderbook skew + OpenClaw)
+├── risk_manager.py     # Risk checks, position sizing, CSV trade log
+├── config.py           # Config loader (reads from .env)
+├── .env.example        # Copy to .env and fill in your keys
+├── requirements.txt    # Python dependencies
 └── .gitignore
 ```
 
@@ -36,8 +60,8 @@ The bot now supports managing open positions before they expire:
 git clone https://github.com/Razzleberryss/Kalshi-15-minute-BTC-trader.git
 cd Kalshi-15-minute-BTC-trader
 python3 -m venv venv
-source venv/bin/activate      # Mac/Linux
-# venv\Scripts\activate      # WindowsREADME.md: document new early exit features (stop-loss, take-profit, reversal)
+source venv/bin/activate          # Mac/Linux
+# venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 ```
 
@@ -48,11 +72,12 @@ cp .env.example .env
 ```
 
 Edit `.env` and provide your Kalshi API details:
+
 - `KALSHI_API_KEY_ID`: Your API Key ID
 - `KALSHI_PRIVATE_KEY_PATH`: Path to your RSA private key (e.g., `./kalshi_private_key.pem`)
 - `KALSHI_ENV`: `demo` or `prod`
-- `STOP_LOSS_CENTS`: (New) Max cents to lose before exiting (default: 20)
-- `TAKE_PROFIT_CENTS`: (New) Target profit cents before exiting (default: 30)
+- `STOP_LOSS_CENTS`: Max cents to lose before exiting (default: 20)
+- `TAKE_PROFIT_CENTS`: Target profit cents before exiting (default: 30)
 - `MAX_DAILY_LOSS_CENTS`: Max realized daily loss before stopping new entries (default: 1000)
 - `MAX_DAILY_TRADES`: Max new entries per day (default: 20)
 
@@ -76,23 +101,23 @@ A simple browser dashboard lets you monitor the bot in real time without reading
 
 ### How it works
 
-After every bot cycle `bot.py` writes a small JSON snapshot to `dashboard_state.json` in the project root.
-`dashboard.py` is a tiny Flask server that reads that file and renders an auto-refreshing HTML page.
+After every bot cycle `bot.py` writes a small JSON snapshot to `dashboard_state.json` in the project root. `dashboard.py` is a tiny Flask server that reads that file and renders an auto-refreshing HTML page.
 
 ### Run the dashboard
 
 **Terminal 1 – start the bot:**
+
 ```bash
 python bot.py
 ```
 
 **Terminal 2 – start the dashboard:**
+
 ```bash
 python dashboard.py
 ```
 
-Open **http://127.0.0.1:8000** in your browser.
-The page auto-refreshes every 5 seconds and shows:
+Open **http://127.0.0.1:8000** in your browser. The page auto-refreshes every 5 seconds and shows:
 
 | Field | Description |
 |---|---|
@@ -109,4 +134,5 @@ The page auto-refreshes every 5 seconds and shows:
 ---
 
 ## Disclaimer
+
 This bot is for educational purposes only. Trading involves risk. Use at your own risk.

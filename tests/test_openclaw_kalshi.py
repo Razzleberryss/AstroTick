@@ -9,12 +9,18 @@ Response contract (every JSON object to stdout):
   - warnings is always present on success ([] when empty).
   - details is always present on failure ({} when empty).
   - The two key-sets are disjoint except for ok and code.
+
+  Decision semantics (nested inside result / details):
+    retryable, halt_trading, requires_human_review are always present as bools.
+    They are independent of ok — see DECISION_POLICY in openclaw_kalshi.py.
 """
 
 import datetime
+import inspect
 import io
 import json
 import os
+import re
 import sys
 import unittest
 from types import SimpleNamespace
@@ -32,6 +38,7 @@ import openclaw_kalshi as cli
 
 _SUCCESS_KEYS = {"ok", "code", "result", "warnings"}
 _FAILURE_KEYS = {"ok", "code", "error", "details"}
+_DECISION_KEYS = {"retryable", "halt_trading", "requires_human_review"}
 
 
 def _assert_success_envelope(tc: unittest.TestCase, env: dict, code: str):
@@ -41,6 +48,11 @@ def _assert_success_envelope(tc: unittest.TestCase, env: dict, code: str):
     tc.assertEqual(env["code"], code)
     tc.assertIsInstance(env["result"], dict)
     tc.assertIsInstance(env["warnings"], list)
+    for field in _DECISION_KEYS:
+        tc.assertIn(field, env["result"], f"missing decision field '{field}' in result")
+        tc.assertIsInstance(
+            env["result"][field], bool, f"decision field '{field}' must be bool"
+        )
 
 
 def _assert_failure_envelope(tc: unittest.TestCase, env: dict, code: str):
@@ -50,6 +62,11 @@ def _assert_failure_envelope(tc: unittest.TestCase, env: dict, code: str):
     tc.assertEqual(env["code"], code)
     tc.assertIsInstance(env["error"], str)
     tc.assertIsInstance(env["details"], dict)
+    for field in _DECISION_KEYS:
+        tc.assertIn(field, env["details"], f"missing decision field '{field}' in details")
+        tc.assertIsInstance(
+            env["details"][field], bool, f"decision field '{field}' must be bool"
+        )
 
 
 # ── Test helpers ───────────────────────────────────────────────────────────────
@@ -128,17 +145,17 @@ class TestResponseEnvelopeHelpers(unittest.TestCase):
         env = cli._failure("NO_POSITION", "no contracts")
         _assert_failure_envelope(self, env, "NO_POSITION")
         self.assertEqual(env["error"], "no contracts")
-        self.assertEqual(env["details"], {})
+        self.assertEqual(set(env["details"].keys()), _DECISION_KEYS)
 
     def test_failure_with_details(self):
         env = cli._failure("COMMAND_FAILED", "boom", details={"exc": "ValueError"})
         _assert_failure_envelope(self, env, "COMMAND_FAILED")
         self.assertEqual(env["details"]["exc"], "ValueError")
 
-    def test_failure_none_details_becomes_empty(self):
+    def test_failure_none_details_becomes_decision_only(self):
         env = cli._failure("ERR", "msg", details=None)
         _assert_failure_envelope(self, env, "ERR")
-        self.assertEqual(env["details"], {})
+        self.assertEqual(set(env["details"].keys()), _DECISION_KEYS)
 
 
 # ── Series resolution tests (unchanged logic) ─────────────────────────────────
@@ -787,6 +804,157 @@ class TestParseBidArray(unittest.TestCase):
     def test_empty(self):
         self.assertEqual(cli._parse_bid_array([]), [])
         self.assertEqual(cli._parse_bid_array(None), [])
+
+
+# ── Decision semantics tests ──────────────────────────────────────────────────
+
+
+class TestDecisionSemantics(unittest.TestCase):
+    """Decision flags are present, correct, and independent of ok for all
+    representative response codes."""
+
+    def _flags(self, env):
+        payload = env.get("result") if env["ok"] else env.get("details")
+        return {k: payload[k] for k in _DECISION_KEYS}
+
+    # ── success: trading outcomes ──
+
+    def test_buy_dry_run_no_action_needed(self):
+        env = cli._success("BUY_DRY_RUN", {"action": "BUY"})
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": False, "requires_human_review": False,
+        })
+
+    def test_sell_placed_no_action_needed(self):
+        env = cli._success("SELL_PLACED", {"action": "SELL"})
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": False, "requires_human_review": False,
+        })
+
+    # ── success: advisory / commander intel ──
+
+    def test_sell_clamped_requires_human_review(self):
+        env = cli._success("SELL_CLAMPED", {"action": "SELL"})
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": False, "requires_human_review": True,
+        })
+
+    def test_orderbook_empty_retryable(self):
+        env = cli._success("ORDERBOOK_EMPTY", {"ticker": "X"})
+        self.assertEqual(self._flags(env), {
+            "retryable": True, "halt_trading": False, "requires_human_review": False,
+        })
+
+    # ── failure: retryable transient ──
+
+    def test_orderbook_fetch_error_retryable(self):
+        env = cli._failure("ORDERBOOK_FETCH_ERROR", "network error")
+        self.assertEqual(self._flags(env), {
+            "retryable": True, "halt_trading": False, "requires_human_review": False,
+        })
+
+    def test_series_resolution_network_error_retryable(self):
+        env = cli._failure("SERIES_RESOLUTION_NETWORK_ERROR", "timeout")
+        self.assertEqual(self._flags(env), {
+            "retryable": True, "halt_trading": False, "requires_human_review": False,
+        })
+
+    # ── failure: hard stops ──
+
+    def test_stop_trading_halts(self):
+        env = cli._failure("STOP_TRADING", "stop file present")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": True, "requires_human_review": True,
+        })
+
+    def test_live_trading_blocked_halts(self):
+        env = cli._failure("LIVE_TRADING_BLOCKED", "not enabled")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": True, "requires_human_review": True,
+        })
+
+    def test_config_error_halts(self):
+        env = cli._failure("CONFIG_ERROR", "bad config")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": True, "requires_human_review": True,
+        })
+
+    # ── failure: caller / planning / validation ──
+
+    def test_invalid_ticker_validation_error(self):
+        env = cli._failure("INVALID_TICKER", "bad ticker")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": False, "requires_human_review": True,
+        })
+
+    def test_invalid_side_validation_error(self):
+        env = cli._failure("INVALID_SIDE", "bad side")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": False, "requires_human_review": True,
+        })
+
+    # ── unmapped / unknown codes ──
+
+    def test_unmapped_code_uses_safe_fallback(self):
+        env = cli._failure("TOTALLY_UNKNOWN_CODE", "something weird")
+        self.assertEqual(self._flags(env), {
+            "retryable": False, "halt_trading": True, "requires_human_review": True,
+        })
+
+    # ── merge precedence: policy overwrites caller-provided fields ──
+
+    def test_policy_overwrites_conflicting_caller_fields(self):
+        env = cli._failure("STOP_TRADING", "stop", details={
+            "retryable": True,
+            "halt_trading": False,
+            "requires_human_review": False,
+        })
+        flags = self._flags(env)
+        self.assertFalse(flags["retryable"])
+        self.assertTrue(flags["halt_trading"])
+        self.assertTrue(flags["requires_human_review"])
+
+    def test_policy_overwrites_on_success_too(self):
+        env = cli._success("BUY_PLACED", {
+            "retryable": True,
+            "halt_trading": True,
+            "requires_human_review": True,
+        })
+        flags = self._flags(env)
+        self.assertFalse(flags["retryable"])
+        self.assertFalse(flags["halt_trading"])
+        self.assertFalse(flags["requires_human_review"])
+
+
+# ── Decision-policy completeness ──────────────────────────────────────────────
+
+
+class TestDecisionPolicyCoverage(unittest.TestCase):
+    """Every response code emitted anywhere in the CLI must have an explicit
+    DECISION_POLICY entry.  This test protects future edits from adding codes
+    without decision semantics."""
+
+    def test_all_emitted_codes_have_policy_entries(self):
+        source = inspect.getsource(cli)
+        direct = re.findall(r'_(?:success|failure|die)\(\s*"([A-Z][A-Z_]+)"', source)
+        assigned = re.findall(r'\bcode\s*=\s*"([A-Z][A-Z_]+)"', source)
+        emitted = set(direct + assigned)
+        self.assertGreaterEqual(
+            len(emitted), 10, "suspiciously few codes found in source"
+        )
+        missing = emitted - set(cli.DECISION_POLICY.keys())
+        self.assertEqual(
+            missing, set(),
+            f"Response codes emitted by CLI but missing from DECISION_POLICY: {missing}",
+        )
+
+    def test_policy_keys_are_well_formed(self):
+        for code, values in cli.DECISION_POLICY.items():
+            self.assertIsInstance(code, str, f"policy key must be str: {code!r}")
+            self.assertEqual(code, code.upper(), f"policy key must be uppercase: {code}")
+            self.assertEqual(len(values), 3, f"policy tuple must be 3-tuple: {code}")
+            for v in values:
+                self.assertIsInstance(v, bool, f"policy value must be bool in {code}")
 
 
 if __name__ == "__main__":

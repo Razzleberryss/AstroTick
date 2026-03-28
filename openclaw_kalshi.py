@@ -566,19 +566,17 @@ def cmd_sell(client: KalshiClient, args):
             error_code="price_outside_config_range",
         )
 
+    requested_count = count
     held = client.contracts_held_on_side(ticker, side)
     if held == 0:
         _die(
-            f"no_position: no open {side.upper()} contracts for {ticker}. "
-            f"Check `status` for positions (YES = long YES, NO = long NO).",
-            error_code="no_position",
+            f"No open {side.upper()} contracts for {ticker}. "
+            f"Use status to inspect positions (YES = long YES, NO = long NO).",
+            error_code="NO_POSITION",
         )
-    if count > held:
-        _die(
-            f"insufficient_position: sell count {count} exceeds {side.upper()} "
-            f"position size {held} on {ticker}",
-            error_code="insufficient_position",
-        )
+
+    sell_count = min(requested_count, held)
+    clamped = sell_count < requested_count
 
     client_order_id = str(uuid.uuid4())
     mode = "DRY_RUN" if dry_run else "LIVE"
@@ -587,19 +585,26 @@ def cmd_sell(client: KalshiClient, args):
         "action": "SELL",
         "ticker": ticker,
         "side": side,
-        "count": count,
+        "count": sell_count,
         "price_cents": price_cents,
         "position_held": held,
         "client_order_id": client_order_id,
         "mode": mode,
     }
+    if clamped:
+        audit["requested_count"] = requested_count
+        audit["error"] = (
+            f"Requested sell of {requested_count} contracts exceeds {side.upper()} "
+            f"position of {held}; sell clamped to {sell_count}."
+        )
+        audit["error_code"] = "POSITION_TOO_SMALL"
 
     if dry_run:
         audit["result"] = "simulated"
         _out(audit, args.human)
         return
 
-    result = client.sell_position(ticker, side, count, price_cents, dry_run=False)
+    result = client.sell_position(ticker, side, sell_count, price_cents, dry_run=False)
     order = result.get("order", {}) if result else {}
     audit["order_id"] = order.get("order_id")
     audit["status"] = order.get("status")

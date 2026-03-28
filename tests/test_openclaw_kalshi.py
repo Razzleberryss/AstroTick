@@ -468,20 +468,71 @@ class TestCmdBuySellTickerNormalization(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli.cmd_sell(client, args)
 
-    def test_sell_rejects_no_position(self):
+    def test_sell_no_position_returns_json_error_and_skips_api(self):
         client = MagicMock()
         client.contracts_held_on_side.return_value = 0
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000")
-        with self.assertRaises(SystemExit) as ctx:
+        buf = io.StringIO()
+        with patch("sys.stdout", buf), self.assertRaises(SystemExit) as ctx:
             cli.cmd_sell(client, args)
         self.assertEqual(ctx.exception.code, 1)
+        err = json.loads(buf.getvalue())
+        self.assertEqual(err["error_code"], "NO_POSITION")
+        self.assertIn("KXBTCD-28MAR2615-B85000", err["error"])
+        client.sell_position.assert_not_called()
 
-    def test_sell_rejects_oversized_count(self):
+    def test_sell_within_position_size_no_clamp_warning(self):
+        client = MagicMock()
+        client.contracts_held_on_side.return_value = 10
+        args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=3, dry_run=True)
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
+            cli.cmd_sell(client, args)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["count"], 3)
+        self.assertEqual(out["position_held"], 10)
+        self.assertEqual(out["result"], "simulated")
+        self.assertNotIn("error_code", out)
+        self.assertNotIn("requested_count", out)
+        client.sell_position.assert_not_called()
+
+    def test_sell_clamps_when_requested_exceeds_held_dry_run(self):
         client = MagicMock()
         client.contracts_held_on_side.return_value = 2
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=5, dry_run=True)
-        with self.assertRaises(SystemExit):
+        buf = io.StringIO()
+        with patch("sys.stdout", buf):
             cli.cmd_sell(client, args)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["requested_count"], 5)
+        self.assertEqual(out["error_code"], "POSITION_TOO_SMALL")
+        self.assertIn("clamped", out["error"].lower())
+        self.assertEqual(out["result"], "simulated")
+        client.sell_position.assert_not_called()
+
+    def test_sell_clamps_when_requested_exceeds_held_live(self):
+        client = MagicMock()
+        client.contracts_held_on_side.return_value = 2
+        client.sell_position.return_value = {
+            "order": {"order_id": "ord-1", "status": "resting"},
+        }
+        args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=5, dry_run=False)
+        buf = io.StringIO()
+        with (
+            patch("sys.stdout", buf),
+            patch.dict(os.environ, {"KALSHI_TRADING_LIVE": "1"}, clear=False),
+            patch.object(cli, "_check_stop_file"),
+        ):
+            cli.cmd_sell(client, args)
+        out = json.loads(buf.getvalue())
+        self.assertEqual(out["count"], 2)
+        self.assertEqual(out["requested_count"], 5)
+        self.assertEqual(out["error_code"], "POSITION_TOO_SMALL")
+        self.assertEqual(out["result"], "placed")
+        client.sell_position.assert_called_once_with(
+            "KXBTCD-28MAR2615-B85000", "yes", 2, 45, dry_run=False
+        )
 
 
 class TestParseBidArray(unittest.TestCase):

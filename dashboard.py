@@ -13,6 +13,9 @@ import json
 import logging
 from pathlib import Path
 
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+
 from flask import Flask, render_template_string
 
 STATE_FILE = Path(__file__).parent / "dashboard_state.json"

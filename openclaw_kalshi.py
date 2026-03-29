@@ -468,7 +468,7 @@ def cmd_status(client: KalshiClient, args):
 
 def cmd_markets(client: KalshiClient, args):
     series = args.series
-    markets = client.list_markets(series, status="open", limit=100)
+    markets = client.list_markets(series, status="open", limit=1000)
     markets = [
         m
         for m in markets
@@ -494,6 +494,66 @@ def cmd_markets(client: KalshiClient, args):
                 "volume": m.get("volume"),
             }
         )
+
+    # Enrich markets with live orderbook prices.
+    # The /markets list endpoint frequently returns null bid/ask even when
+    # markets are live; the /orderbook endpoint always has real data.
+    # Strategy:
+    #   1. Find the soonest close_time (active settlement window).
+    #   2. Among all markets in that window, fetch orderbooks and find the
+    #      one with mid_price closest to 50 (most uncertain / near-spot).
+    #      This is the tradeable market — the one Kalshi shows on the UI.
+    #   3. Move that market to rows[0] so the skill sees it first.
+    if rows:
+        # Step 1: find active close window (soonest close_time)
+        active_close = rows[0]["close_time"]
+        window_markets = [r for r in rows if r.get("close_time") == active_close]
+
+        # Step 2: enrich each window market with orderbook data (limit to 20
+        # near-center strikes to avoid too many API calls)
+        import re as _re
+        def _strike(ticker):
+            m = _re.search(r'-T(\d+)', ticker or '')
+            return int(m.group(1)) if m else 0
+
+        # Sort window markets by strike ascending, take a slice around the middle
+        window_markets.sort(key=lambda r: _strike(r["ticker"]))
+        mid_idx = len(window_markets) // 2
+        candidates = window_markets[max(0, mid_idx-10):mid_idx+10]
+
+        best_market = None
+        best_distance = 999
+        for cand in candidates:
+            try:
+                raw_ob = client.get_orderbook(cand["ticker"])
+                yes_raw, no_raw = _extract_raw_bids(raw_ob)
+                yes_bids = _parse_bid_array(yes_raw)
+                no_bids  = _parse_bid_array(no_raw)
+                _yes_best = max(yes_bids, key=lambda x: x[0]) if yes_bids else None
+                _no_best  = max(no_bids,  key=lambda x: x[0]) if no_bids  else None
+                byb = _yes_best[0] if _yes_best else None
+                bnb = _no_best[0]  if _no_best  else None
+                bya = (100 - bnb)  if bnb  is not None else None
+                bna = (100 - byb)  if byb  is not None else None
+                if byb is not None and bya is not None:
+                    mid = (byb + bya) / 2
+                    cand["yes_bid"]      = byb
+                    cand["yes_ask"]      = bya
+                    cand["no_bid"]       = bnb
+                    cand["no_ask"]       = bna
+                    cand["mid_price"]    = int(mid)
+                    cand["_ob_enriched"] = True
+                    dist = abs(mid - 50)
+                    if dist < best_distance:
+                        best_distance = dist
+                        best_market = cand
+            except Exception:
+                pass
+
+        # Step 3: move best (closest-to-50 mid) market to front of rows
+        if best_market is not None:
+            rows.remove(best_market)
+            rows.insert(0, best_market)
 
     result = {"series": series, "count": len(rows), "markets": rows}
     _out(_success("MARKETS_OK", result), args.human)

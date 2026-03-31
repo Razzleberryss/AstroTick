@@ -16,6 +16,7 @@ import datetime
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 import requests
@@ -29,6 +30,13 @@ import config
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class HistoricalCutoffs:
+    market_settled_ts: datetime.datetime
+    trades_created_ts: datetime.datetime
+    orders_updated_ts: datetime.datetime
+
+
 class KalshiClient:
     """Authenticated HTTP client for Kalshi Trade API v2."""
 
@@ -38,6 +46,8 @@ class KalshiClient:
         self._private_key = self._load_private_key(config.KALSHI_PRIVATE_KEY_PATH)
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
+        self._cutoffs: Optional[HistoricalCutoffs] = None
+        self._cutoffs_fetched_at: Optional[datetime.datetime] = None
 
         # Configure HTTP connection pooling for better performance
         # Pool connections to reduce TCP handshake overhead
@@ -157,7 +167,254 @@ class KalshiClient:
         )
         raise last_exc
 
+    # ── Historical helpers ───────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _ensure_utc_datetime(ts: datetime.datetime) -> datetime.datetime:
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=datetime.timezone.utc)
+        return ts.astimezone(datetime.timezone.utc)
+
+    @classmethod
+    def _parse_datetime_to_utc(cls, raw_ts, field_name: str) -> datetime.datetime:
+        if isinstance(raw_ts, datetime.datetime):
+            return cls._ensure_utc_datetime(raw_ts)
+        if isinstance(raw_ts, (int, float)):
+            return datetime.datetime.fromtimestamp(raw_ts, tz=datetime.timezone.utc)
+        if isinstance(raw_ts, str):
+            cleaned = raw_ts.strip()
+            if cleaned.endswith("Z"):
+                cleaned = cleaned[:-1] + "+00:00"
+            try:
+                parsed = datetime.datetime.fromisoformat(cleaned)
+                return cls._ensure_utc_datetime(parsed)
+            except ValueError:
+                try:
+                    return datetime.datetime.fromtimestamp(float(cleaned), tz=datetime.timezone.utc)
+                except ValueError as exc:
+                    raise ValueError(f"Could not parse datetime field '{field_name}': {raw_ts}") from exc
+        raise ValueError(f"Unsupported datetime type for '{field_name}': {type(raw_ts)}")
+
+    @classmethod
+    def _to_unix_ts(cls, ts: datetime.datetime) -> int:
+        return int(cls._ensure_utc_datetime(ts).timestamp())
+
+    def _fetch_paginated_list(self, path: str, list_key: str, params: dict = None) -> list[dict]:
+        out: list[dict] = []
+        req_params = dict(params or {})
+        seen_cursors = set()
+
+        while True:
+            data = self._request("GET", path, params=req_params)
+            out.extend(data.get(list_key, []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+            if cursor in seen_cursors:
+                log.warning("Stopping pagination for %s due to repeated cursor '%s'", path, cursor)
+                break
+            seen_cursors.add(cursor)
+            req_params["cursor"] = cursor
+
+        return out
+
+    def _get_historical_cutoffs(self, force_refresh: bool = False) -> HistoricalCutoffs:
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        if (
+            not force_refresh
+            and self._cutoffs is not None
+            and self._cutoffs_fetched_at is not None
+            and (now_utc - self._cutoffs_fetched_at) < datetime.timedelta(hours=1)
+        ):
+            return self._cutoffs
+
+        data = self._request("GET", "/historical/cutoff")
+        cutoffs = HistoricalCutoffs(
+            market_settled_ts=self._parse_datetime_to_utc(data["market_settled_ts"], "market_settled_ts"),
+            trades_created_ts=self._parse_datetime_to_utc(data["trades_created_ts"], "trades_created_ts"),
+            orders_updated_ts=self._parse_datetime_to_utc(data["orders_updated_ts"], "orders_updated_ts"),
+        )
+        self._cutoffs = cutoffs
+        self._cutoffs_fetched_at = now_utc
+        return cutoffs
+
+    def _fill_time(self, fill: dict) -> datetime.datetime:
+        created_time = fill.get("created_time")
+        if created_time is not None:
+            return self._parse_datetime_to_utc(created_time, "fill.created_time")
+        ts = fill.get("ts")
+        if ts is not None:
+            return self._parse_datetime_to_utc(ts, "fill.ts")
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+    def _order_update_time(self, order: dict) -> datetime.datetime:
+        last_update_time = order.get("last_update_time")
+        if last_update_time is not None:
+            return self._parse_datetime_to_utc(last_update_time, "order.last_update_time")
+        updated_time = order.get("updated_time")
+        if updated_time is not None:
+            return self._parse_datetime_to_utc(updated_time, "order.updated_time")
+        updated_ts = order.get("updated_ts")
+        if updated_ts is not None:
+            return self._parse_datetime_to_utc(updated_ts, "order.updated_ts")
+        created_time = order.get("created_time")
+        if created_time is not None:
+            return self._parse_datetime_to_utc(created_time, "order.created_time")
+        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+    def _fetch_live_fills(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
+        params = {
+            "min_ts": self._to_unix_ts(start_ts),
+            "max_ts": self._to_unix_ts(end_ts),
+            "limit": 200,
+        }
+        return self._fetch_paginated_list("/portfolio/fills", "fills", params=params)
+
+    def _fetch_historical_fills(self, end_ts: datetime.datetime) -> list[dict]:
+        params = {
+            "max_ts": self._to_unix_ts(end_ts),
+            "limit": 200,
+        }
+        return self._fetch_paginated_list("/historical/fills", "fills", params=params)
+
+    def _fetch_live_orders(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
+        params = {
+            "min_ts": self._to_unix_ts(start_ts),
+            "max_ts": self._to_unix_ts(end_ts),
+            "limit": 200,
+        }
+        return self._fetch_paginated_list("/portfolio/orders", "orders", params=params)
+
+    def _fetch_historical_orders(self, end_ts: datetime.datetime) -> list[dict]:
+        params = {
+            "max_ts": self._to_unix_ts(end_ts),
+            "limit": 200,
+        }
+        return self._fetch_paginated_list("/historical/orders", "orders", params=params)
+
     # ── Public API methods ────────────────────────────────────────────────────────────────────────
+    def get_fills(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
+        """
+        Return fills across live + historical data for [start_ts, end_ts].
+        """
+        start_utc = self._ensure_utc_datetime(start_ts)
+        end_utc = self._ensure_utc_datetime(end_ts)
+        if end_utc < start_utc:
+            raise ValueError("end_ts must be greater than or equal to start_ts")
+
+        cutoffs = self._get_historical_cutoffs()
+        cutoff = cutoffs.trades_created_ts
+
+        fills: list[dict] = []
+
+        # Historical segment: [start, min(end, cutoff))
+        hist_end = min(end_utc, cutoff)
+        if start_utc < hist_end:
+            hist_rows = self._fetch_historical_fills(hist_end)
+            fills.extend(
+                f
+                for f in hist_rows
+                if start_utc <= self._fill_time(f) < hist_end
+            )
+
+        # Live segment: [max(start, cutoff), end]
+        live_start = max(start_utc, cutoff)
+        if live_start <= end_utc:
+            live_rows = self._fetch_live_fills(live_start, end_utc)
+            fills.extend(
+                f
+                for f in live_rows
+                if live_start <= self._fill_time(f) <= end_utc
+            )
+
+        fills.sort(key=self._fill_time)
+        return fills
+
+    def get_orders(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
+        """
+        Return orders across live + historical data for [start_ts, end_ts].
+        """
+        start_utc = self._ensure_utc_datetime(start_ts)
+        end_utc = self._ensure_utc_datetime(end_ts)
+        if end_utc < start_utc:
+            raise ValueError("end_ts must be greater than or equal to start_ts")
+
+        cutoffs = self._get_historical_cutoffs()
+        cutoff = cutoffs.orders_updated_ts
+
+        orders: list[dict] = []
+
+        # Active/resting orders are always in /portfolio/orders.
+        live_rows = self._fetch_live_orders(start_utc, end_utc)
+        orders.extend(
+            o
+            for o in live_rows
+            if start_utc <= self._order_update_time(o) <= end_utc
+        )
+
+        # Historical orders are canceled/executed orders with update time before cutoff.
+        hist_end = min(end_utc, cutoff)
+        if start_utc < hist_end:
+            hist_rows = self._fetch_historical_orders(hist_end)
+            orders.extend(
+                o
+                for o in hist_rows
+                if start_utc <= self._order_update_time(o) < hist_end
+            )
+
+        # De-duplicate by order_id in case APIs overlap at boundary conditions.
+        deduped_by_id: dict[str, dict] = {}
+        for order in orders:
+            order_id = order.get("order_id")
+            if order_id:
+                current = deduped_by_id.get(order_id)
+                if current is None or self._order_update_time(order) >= self._order_update_time(current):
+                    deduped_by_id[order_id] = order
+                continue
+            deduped_by_id[f"_anon_{len(deduped_by_id)}"] = order
+
+        merged = list(deduped_by_id.values())
+        merged.sort(key=self._order_update_time)
+        return merged
+
+    def get_market_with_history(self, ticker: str) -> dict:
+        """
+        Placeholder: eventually this should route between live /markets/{ticker}
+        and historical markets/candlesticks based on market_settled_ts.
+        For now just call GET /markets/{ticker}.
+        """
+        return self._request("GET", f"/markets/{ticker}")
+
+    def debug_historical_cutoffs(self) -> None:
+        """
+        Log current historical cutoffs and run a small fill sample around cutoff.
+        """
+        cutoffs = self._get_historical_cutoffs(force_refresh=True)
+        log.info(
+            "Historical cutoffs: market_settled_ts=%s trades_created_ts=%s orders_updated_ts=%s",
+            cutoffs.market_settled_ts.isoformat(),
+            cutoffs.trades_created_ts.isoformat(),
+            cutoffs.orders_updated_ts.isoformat(),
+        )
+
+        sample_start = cutoffs.trades_created_ts - datetime.timedelta(minutes=5)
+        sample_end = cutoffs.trades_created_ts + datetime.timedelta(minutes=5)
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        sample_end = min(sample_end, now_utc)
+
+        if sample_start >= sample_end:
+            return
+
+        try:
+            sample_fills = self.get_fills(sample_start, sample_end)
+            log.info(
+                "Historical cutoff sample fills [%s, %s]: %d rows",
+                sample_start.isoformat(),
+                sample_end.isoformat(),
+                len(sample_fills),
+            )
+        except Exception as exc:
+            log.warning("debug_historical_cutoffs sample fetch failed: %s", exc)
+
     def get_balance(self) -> float:
         """
         Return available balance in dollars.

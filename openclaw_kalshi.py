@@ -104,11 +104,12 @@ import datetime
 import json
 import logging
 import os
+import re
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STOP_FILE = Path.home() / ".openclaw" / "workspace" / "STOP_TRADING"
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -506,64 +507,52 @@ def cmd_markets(client: KalshiClient, args):
     #      This is the tradeable market — the one Kalshi shows on the UI.
     #   3. Move that market to rows[0] so the skill sees it first.
     if rows:
-        # Step 1: find active close window (soonest close_time)
         active_close = rows[0]["close_time"]
         window_markets = [r for r in rows if r.get("close_time") == active_close]
 
-        # Step 2: enrich each window market with orderbook data (limit to 20
-        # near-center strikes to avoid too many API calls)
-        import re as _re
         def _strike(ticker):
-            m = _re.search(r'-T(\d+)', ticker or '')
+            m = re.search(r'-T(\d+)', ticker or '')
             return int(m.group(1)) if m else 0
 
-        # Sort window markets by strike ascending, take a slice around the middle
         window_markets.sort(key=lambda r: _strike(r["ticker"]))
         mid_idx = len(window_markets) // 2
-        candidates = window_markets[max(0, mid_idx-10):mid_idx+10]
+        candidates = window_markets[max(0, mid_idx - 10):mid_idx + 10]
 
-        best_market = None
-        best_distance = 999
-
-        def _fetch_orderbook(ticker: str):
-            return client.get_orderbook(ticker)
-
-        max_workers = max(1, min(10, len(candidates)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(_fetch_orderbook, cand["ticker"]): cand for cand in candidates
+        # Fetch orderbooks in parallel (I/O-bound network calls)
+        enriched: list[tuple[float, dict]] = []
+        n_workers = min(10, len(candidates))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            future_to_cand = {
+                pool.submit(client.get_orderbook, cand["ticker"]): cand
+                for cand in candidates
             }
-
-            for future in as_completed(future_map):
-                cand = future_map[future]
+            for future in as_completed(future_to_cand):
+                cand = future_to_cand[future]
                 try:
                     raw_ob = future.result()
                     yes_raw, no_raw = _extract_raw_bids(raw_ob)
                     yes_bids = _parse_bid_array(yes_raw)
-                    no_bids = _parse_bid_array(no_raw)
+                    no_bids  = _parse_bid_array(no_raw)
                     _yes_best = max(yes_bids, key=lambda x: x[0]) if yes_bids else None
-                    _no_best = max(no_bids, key=lambda x: x[0]) if no_bids else None
+                    _no_best  = max(no_bids,  key=lambda x: x[0]) if no_bids  else None
                     byb = _yes_best[0] if _yes_best else None
-                    bnb = _no_best[0] if _no_best else None
-                    bya = (100 - bnb) if bnb is not None else None
-                    bna = (100 - byb) if byb is not None else None
+                    bnb = _no_best[0]  if _no_best  else None
+                    bya = (100 - bnb)  if bnb is not None else None
+                    bna = (100 - byb)  if byb is not None else None
                     if byb is not None and bya is not None:
                         mid = (byb + bya) / 2
-                        cand["yes_bid"] = byb
-                        cand["yes_ask"] = bya
-                        cand["no_bid"] = bnb
-                        cand["no_ask"] = bna
-                        cand["mid_price"] = int(mid)
+                        cand["yes_bid"]      = byb
+                        cand["yes_ask"]      = bya
+                        cand["no_bid"]       = bnb
+                        cand["no_ask"]       = bna
+                        cand["mid_price"]    = int(mid)
                         cand["_ob_enriched"] = True
-                        dist = abs(mid - 50)
-                        if dist < best_distance:
-                            best_distance = dist
-                            best_market = cand
-                except Exception:
-                    pass
+                        enriched.append((abs(mid - 50), cand))
+                except Exception as exc:
+                    log.debug("Orderbook fetch failed for %s: %s", cand["ticker"], exc)
 
-        # Step 3: move best (closest-to-50 mid) market to front of rows
-        if best_market is not None:
+        if enriched:
+            best_market = min(enriched, key=lambda x: x[0])[1]
             rows.remove(best_market)
             rows.insert(0, best_market)
 
@@ -597,28 +586,8 @@ def _parse_bid_array(bid_array):
 
 def _extract_raw_bids(raw_ob: dict) -> tuple:
     """Extract (yes_bids_raw, no_bids_raw) from orderbook response."""
-    ob_data = raw_ob.get("orderbook", {})
-    ob_fp = raw_ob.get("orderbook_fp", {})
-
-    yes_raw = (
-        ob_fp.get("yes_dollars_fp")
-        or ob_fp.get("yes_dollars")
-        or ob_data.get("yes_dollars_fp")
-        or ob_data.get("yes_dollars")
-        or raw_ob.get("yes_dollars")
-        or ob_data.get("yes", [])
-        or raw_ob.get("yes", [])
-    )
-    no_raw = (
-        ob_fp.get("no_dollars_fp")
-        or ob_fp.get("no_dollars")
-        or ob_data.get("no_dollars_fp")
-        or ob_data.get("no_dollars")
-        or raw_ob.get("no_dollars")
-        or ob_data.get("no", [])
-        or raw_ob.get("no", [])
-    )
-    return yes_raw or [], no_raw or []
+    from orderbook_utils import extract_raw_arrays
+    return extract_raw_arrays(raw_ob)
 
 
 def cmd_orderbook(client: KalshiClient, args):

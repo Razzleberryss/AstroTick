@@ -279,76 +279,15 @@ class KalshiClient:
         infer the other side's ask using the complementary price relationship.
         """
         try:
+            from orderbook_utils import extract_yes_no_bids
+
             orderbook = self.get_orderbook(ticker)
-            orderbook_data = orderbook.get("orderbook", {})
+            yes_bids, no_bids = extract_yes_no_bids(orderbook)
 
-            # Support multiple orderbook formats, in priority order:
-            # 1. orderbook_fp.yes_dollars_fp / no_dollars_fp  (new fixed-point REST format)
-            # 2. orderbook_fp.yes_dollars / no_dollars        (older fp variant, kept for compat)
-            # 3. orderbook["orderbook"].yes_dollars_fp / no_dollars_fp  (WebSocket-wrapped _fp)
-            # 4. orderbook["orderbook"].yes_dollars / no_dollars        (WebSocket-wrapped _dollars)
-            # 5. top-level yes_dollars / no_dollars on the orderbook response
-            # 6. orderbook["orderbook"].yes / no              (legacy integer-cents, wrapped)
-            # 7. top-level yes / no                           (legacy integer-cents, direct)
-            # All string-price entries are converted to integer cents in parse_bids().
-            orderbook_fp = orderbook.get("orderbook_fp", {})
-            yes_bids = (
-                orderbook_fp.get("yes_dollars_fp")
-                or orderbook_fp.get("yes_dollars")
-                or orderbook_data.get("yes_dollars_fp")
-                or orderbook_data.get("yes_dollars")
-                or orderbook.get("yes_dollars")
-                or orderbook_data.get("yes", [])
-                or orderbook.get("yes", [])
-            )
-            no_bids = (
-                orderbook_fp.get("no_dollars_fp")
-                or orderbook_fp.get("no_dollars")
-                or orderbook_data.get("no_dollars_fp")
-                or orderbook_data.get("no_dollars")
-                or orderbook.get("no_dollars")
-                or orderbook_data.get("no", [])
-                or orderbook.get("no", [])
-            )
-
-            # Parse bid arrays - support both [price, size] and ["price_string", "count_string"] formats
-            def parse_bids(bid_array):
-                """Parse bid array, handling both numeric and string formats."""
-                if not bid_array:
-                    return []
-
-                parsed = []
-                for entry in bid_array:
-                    if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                        # Handle string format: ["0.55", "10"]
-                        if isinstance(entry[0], str):
-                            try:
-                                price_cents = round(float(entry[0]) * 100)
-                                size = int(float(entry[1]))
-                                parsed.append([price_cents, size])
-                            except (ValueError, TypeError):
-                                continue
-                        # Handle numeric format: [55, 10] or float dollars: [0.55, 10]
-                        else:
-                            price = entry[0]
-                            if isinstance(price, float) and 0.0 <= price <= 1.0:
-                                price_cents = int(round(price * 100))
-                            else:
-                                price_cents = int(price)
-                            parsed.append([price_cents, int(entry[1])])
-                return parsed
-
-            yes_bids = parse_bids(yes_bids)
-            no_bids = parse_bids(no_bids)
-
-            # Kalshi arrays are sorted ascending; best (highest) bid is the last entry.
-            # Use max() for robustness regardless of actual sort order.
-            _yes_best = max(yes_bids, key=lambda x: x[0]) if yes_bids else None
-            _no_best = max(no_bids, key=lambda x: x[0]) if no_bids else None
-            best_yes_bid = _yes_best[0] if _yes_best else None
-            best_yes_bid_size = _yes_best[1] if _yes_best else 0
-            best_no_bid = _no_best[0] if _no_best else None
-            best_no_bid_size = _no_best[1] if _no_best else 0
+            best_yes_bid = yes_bids[0][0] if yes_bids else None
+            best_yes_bid_size = yes_bids[0][1] if yes_bids else 0
+            best_no_bid = no_bids[0][0] if no_bids else None
+            best_no_bid_size = no_bids[0][1] if no_bids else 0
 
             # Compute asks from the complementary side
             # YES ask = what you pay to buy YES = 100 - (what NO buyers are willing to pay)

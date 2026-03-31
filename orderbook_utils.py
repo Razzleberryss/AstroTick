@@ -134,6 +134,43 @@ def get_weighted_bid_liquidity(bid_array, top_n: int = 10) -> float:
     return sum(float(price * size) for price, size in parsed)
 
 
+def extract_raw_arrays(orderbook: dict) -> Tuple:
+    """
+    Extract raw YES and NO bid arrays from orderbook dict without parsing.
+
+    Handles all Kalshi orderbook formats (see extract_yes_no_bids for full list).
+
+    Returns:
+        Tuple of (yes_raw, no_raw) where each is the raw list from the orderbook.
+    """
+    orderbook_fp = orderbook.get("orderbook_fp", {}) or {}
+    orderbook_data = orderbook.get("orderbook", {}) or {}
+
+    yes_raw = (
+        orderbook_fp.get("yes_dollars_fp")
+        or orderbook_fp.get("yes_dollars")
+        or orderbook_data.get("yes_dollars_fp")
+        or orderbook_data.get("yes_dollars")
+        or orderbook.get("yes_dollars")
+        or orderbook_data.get("yes")
+        or orderbook.get("yes")
+        or []
+    )
+
+    no_raw = (
+        orderbook_fp.get("no_dollars_fp")
+        or orderbook_fp.get("no_dollars")
+        or orderbook_data.get("no_dollars_fp")
+        or orderbook_data.get("no_dollars")
+        or orderbook.get("no_dollars")
+        or orderbook_data.get("no")
+        or orderbook.get("no")
+        or []
+    )
+
+    return yes_raw, no_raw
+
+
 def extract_yes_no_bids(orderbook: dict, max_levels: Optional[int] = None) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
     """
     Extract and parse both YES and NO bid arrays from orderbook dict.
@@ -153,35 +190,9 @@ def extract_yes_no_bids(orderbook: dict, max_levels: Optional[int] = None) -> Tu
     Returns:
         Tuple of (yes_bids, no_bids) where each is a list of (price_cents, size) tuples
     """
-    # Try to find orderbook data in various locations
-    orderbook_fp = orderbook.get("orderbook_fp", {})
-    orderbook_data = orderbook.get("orderbook", {})
+    yes_raw, no_raw = extract_raw_arrays(orderbook)
 
-    # YES side - check all possible locations
-    yes_array = (
-        orderbook_fp.get("yes_dollars_fp")
-        or orderbook_fp.get("yes_dollars")
-        or orderbook_data.get("yes_dollars_fp")
-        or orderbook_data.get("yes_dollars")
-        or orderbook.get("yes_dollars")
-        or orderbook_data.get("yes")
-        or orderbook.get("yes")
-        or []
-    )
-
-    # NO side - check all possible locations
-    no_array = (
-        orderbook_fp.get("no_dollars_fp")
-        or orderbook_fp.get("no_dollars")
-        or orderbook_data.get("no_dollars_fp")
-        or orderbook_data.get("no_dollars")
-        or orderbook.get("no_dollars")
-        or orderbook_data.get("no")
-        or orderbook.get("no")
-        or []
-    )
-
-    yes_bids = parse_bid_array(yes_array, max_levels=max_levels)
-    no_bids = parse_bid_array(no_array, max_levels=max_levels)
+    yes_bids = parse_bid_array(yes_raw, max_levels=max_levels)
+    no_bids = parse_bid_array(no_raw, max_levels=max_levels)
 
     return yes_bids, no_bids

@@ -59,8 +59,12 @@ def fetch_historical_markets(
     """
     # Validate date format
     try:
-        start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d")
+        start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc
+        )
+        end_dt = datetime.datetime.strptime(end_date, "%Y-%m-%d").replace(
+            tzinfo=datetime.timezone.utc
+        )
     except ValueError as exc:
         raise ValueError(f"Invalid date format. Use YYYY-MM-DD: {exc}")
 

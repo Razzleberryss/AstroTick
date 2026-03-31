@@ -21,7 +21,6 @@ import signal
 import sys
 import time
 import datetime
-import unittest
 import functools
 from pathlib import Path
 
@@ -33,6 +32,7 @@ from risk_manager import RiskManager
 from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
 from agent_decision_engine import AgentAction
 import cli_executor
+from orderbook_utils import extract_raw_arrays as _extract_raw_arrays
 from synthetic_cfb_price import (
     build_synthetic_cfb_snapshot,
     RollingSyntheticCfbBuffer,
@@ -63,24 +63,6 @@ def _compute_trade_contracts(sig_size, budget_contracts):
     regressions if the sizing logic is modified in the future.
     """
     return min(sig_size, budget_contracts)
-
-
-class TestComputeTradeContracts(unittest.TestCase):
-    """
-    Unit tests for trade sizing semantics.
-
-    Ensures that contract sizing respects the cap of
-    ``min(sig.size, budget_contracts)`` both when the signal size is below and
-    above the available budget.
-    """
-
-    def test_sig_size_smaller_than_budget(self):
-        # When the signal size is below the budget, we should trade the full signal size.
-        self.assertEqual(_compute_trade_contracts(5, 10), 5)
-
-    def test_sig_size_larger_than_budget(self):
-        # When the signal size exceeds the budget, we should be capped by the budget.
-        self.assertEqual(_compute_trade_contracts(20, 10), 10)
 
 
 # ── Time-delay strategy helpers ───────────────────────────────────────────────────────────────
@@ -572,20 +554,8 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             # Try to get orderbook from WebSocket
             ws_orderbook = ws_client.get_latest_orderbook(ticker)
             if ws_orderbook:
-                # Check if orderbook has any non-empty side (yes OR no)
-                # Support all formats: legacy yes/no, yes_dollars, and yes_dollars_fp
-                has_yes = bool(
-                    ws_orderbook.get("yes")
-                    or ws_orderbook.get("yes_dollars")
-                    or ws_orderbook.get("yes_dollars_fp")
-                )
-                has_no = bool(
-                    ws_orderbook.get("no")
-                    or ws_orderbook.get("no_dollars")
-                    or ws_orderbook.get("no_dollars_fp")
-                )
-
-                if has_yes or has_no:
+                ws_yes, ws_no = _extract_raw_arrays({"orderbook": ws_orderbook})
+                if ws_yes or ws_no:
                     # Wrap in same format as REST API response
                     orderbook = {"orderbook": ws_orderbook}
                     log.debug("Using WebSocket orderbook for %s", ticker)
@@ -638,33 +608,10 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                      ticker, market.get("last_price"),
                      yes_bid, yes_ask, no_bid, no_ask, mid)
         else:
-            # Only log as empty if BOTH sides are truly empty
-            # Extract raw orderbook data for debugging
-            orderbook_data = orderbook.get("orderbook", {})
-            orderbook_fp = orderbook.get("orderbook_fp", {})
-            yes_raw = (
-                orderbook_fp.get("yes_dollars_fp")
-                or orderbook_fp.get("yes_dollars")
-                or orderbook_data.get("yes")
-                or orderbook.get("yes")
-            )
-            no_raw = (
-                orderbook_fp.get("no_dollars_fp")
-                or orderbook_fp.get("no_dollars")
-                or orderbook_data.get("no")
-                or orderbook.get("no")
-            )
+            yes_raw, no_raw = _extract_raw_arrays(orderbook)
 
-            # Truncate arrays if they're too long for logging
-            def truncate_array(arr, max_items=5):
-                if not arr:
-                    return arr
-                if isinstance(arr, list) and len(arr) > max_items:
-                    return arr[:max_items] + [f"...({len(arr) - max_items} more)"]
-                return arr
-
-            yes_display = truncate_array(yes_raw) if yes_raw else []
-            no_display = truncate_array(no_raw) if no_raw else []
+            yes_display = yes_raw[:5] if yes_raw else []
+            no_display = no_raw[:5] if no_raw else []
 
             log.warning("Active market: %s | orderbook empty (no quotes available) | "
                        "Raw orderbook: yes=%s, no=%s",
@@ -853,8 +800,10 @@ def _run_once_time_delay(
         exit_error = True
 
     if exit_error:
+        risk._clear_datetime_cache()
         return False
     if _halt_trading:
+        risk._clear_datetime_cache()
         return False
 
     # 2. Compute window context
@@ -916,8 +865,11 @@ def _run_once_time_delay(
         entry_price = bot_pos["entry_price"]
         current_price = market.get(f"{side}_bid", entry_price)
         exit_price_order = max(1, current_price - 1)
-        # PnL = (sell price - buy price) × contracts — same for YES and NO
-        pnl_cents = (exit_price_order - entry_price) * count
+        pnl_cents = (
+            (exit_price_order - entry_price) * count
+            if side == "yes"
+            else (entry_price - exit_price_order) * count
+        )
         log_trade(
             "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc",
             ticker, side, entry_price, exit_price_order, pnl_cents,

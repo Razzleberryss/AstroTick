@@ -112,6 +112,7 @@ class KalshiWebSocketClient:
 
     def _run_websocket(self):
         """Main WebSocket event loop (runs in background thread)."""
+        reconnect_attempts = 0
         while self._running:
             try:
                 ts = str(int(datetime.datetime.now().timestamp() * 1000))
@@ -129,14 +130,15 @@ class KalshiWebSocketClient:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
+                reconnect_attempts = 0
                 self.ws.run_forever()
             except Exception as exc:
                 log.error("WebSocket connection error: %s", exc)
 
-            # Reconnect with exponential backoff if still running
             if self._running:
                 self._connected = False
-                backoff = 2
+                backoff = min(2 ** reconnect_attempts, 60)
+                reconnect_attempts += 1
                 log.info("Reconnecting WebSocket in %ds...", backoff)
                 time.sleep(backoff)
 
@@ -250,10 +252,11 @@ class KalshiWebSocketClient:
         with self._lock:
             orderbook = self._orderbooks.get(ticker)
             if orderbook:
-                # Return a copy to avoid external modification
+                yes = orderbook.get("yes")
+                no = orderbook.get("no")
                 return {
-                    "yes": orderbook.get("yes", []).copy() if orderbook.get("yes") else [],
-                    "no": orderbook.get("no", []).copy() if orderbook.get("no") else []
+                    "yes": list(yes) if yes else [],
+                    "no": list(no) if no else [],
                 }
             return None
 

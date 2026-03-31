@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 # Cache for BTC momentum data to avoid redundant yfinance API calls
 # TTL set to 5 minutes (300s) since 1-minute bars don't change that frequently
 # and reduces API calls in a 15-minute market window
-_btc_momentum_cache: dict = {"data": None, "timestamp": 0, "ttl": 300}
+_btc_momentum_cache: dict = {"data": None, "timestamp": 0, "ttl": 60}
 
 # A market whose YES ask ≈ 1.00 and YES bid ≈ 0.00 (spread ≥ this) is considered
 # a ghost / dead book and is always skipped.
@@ -71,7 +71,7 @@ def get_btc_momentum() -> Optional[float]:
         # Request only the last 30 minutes of 1-min bars (6x the lookback period)
         # to minimize data transfer while ensuring we have enough bars even if some
         # are missing. This reduces download size from 1440 bars (1 day) to ~30 bars.
-        hist = ticker.history(period="1d", interval="1m")
+        hist = ticker.history(period="60m", interval="1m")
         if hist.empty or len(hist) < config.MOMENTUM_LOOKBACK_BARS + 1:
             log.warning("Not enough BTC price history available")
             return None
@@ -126,66 +126,19 @@ def get_orderbook_skew(orderbook: dict, max_levels: int = 10) -> float:
         Skew value in [-1.0, 1.0]
     """
     try:
-        from orderbook_utils import get_weighted_bid_liquidity, extract_yes_no_bids
+        from orderbook_utils import get_weighted_bid_liquidity, extract_raw_arrays
 
-        # Extract YES and NO arrays (handles all formats)
-        orderbook_data = orderbook.get("orderbook", {})
-        orderbook_fp = orderbook.get("orderbook_fp", {})
+        yes_raw, no_raw = extract_raw_arrays(orderbook)
 
-        yes_raw = (
-            orderbook_fp.get("yes_dollars_fp")
-            or orderbook_fp.get("yes_dollars")
-            or orderbook_data.get("yes_dollars_fp")
-            or orderbook_data.get("yes_dollars")
-            or orderbook.get("yes_dollars")
-            or orderbook_data.get("yes", [])
-            or orderbook.get("yes", [])
-        )
-        no_raw = (
-            orderbook_fp.get("no_dollars_fp")
-            or orderbook_fp.get("no_dollars")
-            or orderbook_data.get("no_dollars_fp")
-            or orderbook_data.get("no_dollars")
-            or orderbook.get("no_dollars")
-            or orderbook_data.get("no", [])
-            or orderbook.get("no", [])
-        )
-
-        # Slice arrays before processing (performance optimization)
-        yes_raw_limited = yes_raw[:max_levels] if yes_raw else []
-        no_raw_limited = no_raw[:max_levels] if no_raw else []
-
-        def to_price_cents(raw_price):
-            """Convert price to integer cents (handles both string dollars and int cents)."""
-            if isinstance(raw_price, str):
-                return round(float(raw_price) * 100)
-            return int(raw_price)
-
-        # Calculate liquidity weighted by price_cents * size
-        # Only process top N levels for performance
-        yes_liquidity = 0
-        no_liquidity = 0
-
-        for entry in yes_raw_limited:
-            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                try:
-                    yes_liquidity += to_price_cents(entry[0]) * int(float(entry[1]))
-                except (ValueError, TypeError):
-                    pass
-
-        for entry in no_raw_limited:
-            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                try:
-                    no_liquidity += to_price_cents(entry[0]) * int(float(entry[1]))
-                except (ValueError, TypeError):
-                    pass
+        yes_liquidity = get_weighted_bid_liquidity(yes_raw, top_n=max_levels)
+        no_liquidity = get_weighted_bid_liquidity(no_raw, top_n=max_levels)
 
         total = yes_liquidity + no_liquidity
 
         if total == 0:
             return 0.0
 
-        skew = (yes_liquidity - no_liquidity) / total  # -1 to +1
+        skew = (yes_liquidity - no_liquidity) / total
         log.debug("Orderbook skew: %.3f (YES=%d, NO=%d, levels=%d)", skew, yes_liquidity, no_liquidity, max_levels)
         return skew
     except Exception as exc:
@@ -626,26 +579,8 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     # even when the market dict has no pre-computed "spread" or
     # "yes_depth_near_mid" fields (those are only populated by
     # get_market_quotes(), which is not called in the main bot loop).
-    _ob_fp   = orderbook.get("orderbook_fp", {}) or {}
-    _ob_data = orderbook.get("orderbook", {}) or {}
-    yes_raw = (
-        _ob_fp.get("yes_dollars_fp")
-        or _ob_fp.get("yes_dollars")
-        or _ob_data.get("yes_dollars_fp")
-        or _ob_data.get("yes_dollars")
-        or orderbook.get("yes_dollars")
-        or _ob_data.get("yes")
-        or orderbook.get("yes")
-    )
-    no_raw = (
-        _ob_fp.get("no_dollars_fp")
-        or _ob_fp.get("no_dollars")
-        or _ob_data.get("no_dollars_fp")
-        or _ob_data.get("no_dollars")
-        or orderbook.get("no_dollars")
-        or _ob_data.get("no")
-        or orderbook.get("no")
-    )
+    from orderbook_utils import extract_raw_arrays as _extract_raw
+    yes_raw, no_raw = _extract_raw(orderbook)
 
     yes_bid_price, yes_depth = _extract_best_bid_depth(yes_raw)
     no_bid_price, _          = _extract_best_bid_depth(no_raw)

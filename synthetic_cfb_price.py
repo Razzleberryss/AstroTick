@@ -33,12 +33,13 @@ import datetime
 import re
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
-import config
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -448,7 +449,6 @@ def build_synthetic_cfb_snapshot(
                 future = executor.submit(scrape_price_source, api_key, source_name, source_url)
                 tasks[future] = (source_name, source_url)
 
-            # Direct REST API sources — no Firecrawl needed, always attempted
             for source_name, source_url, json_path in BTC_API_SOURCES:
                 future = executor.submit(fetch_price_api, source_name, source_url, json_path)
                 tasks[future] = (source_name, source_url)

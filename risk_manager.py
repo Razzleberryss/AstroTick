@@ -190,7 +190,7 @@ class RiskManager:
             log.error("Failed to flush trade log buffer: %s", exc)
 
     def _reset_daily_if_needed(self) -> None:
-        today = datetime.now(timezone.utc).date()
+        today = self._get_current_datetime().date()
         if today != self._today:
             self._today = today
             self._daily_trade_count = 0
@@ -222,12 +222,12 @@ class RiskManager:
                     # Skip first incomplete line
                     lines = partial.split("\n", 1)[-1].splitlines()
 
-            # Parse CSV from lines
             if not lines:
                 return
 
             import io
-            csv_content = "\n".join(lines)
+            header = ",".join(self._trade_log_headers())
+            csv_content = header + "\n" + "\n".join(lines)
             reader = csv.DictReader(io.StringIO(csv_content))
 
             for row in reader:
@@ -281,7 +281,7 @@ class RiskManager:
         for pos in positions:
             # Kalshi position: quantity * average cost
             qty = abs(pos.get("position", 0))
-            avg_price = pos.get("average_price", 50)  # default 50c
+            avg_price = pos.get("average_price", 99)  # conservative default
             total_cents += qty * avg_price
         return total_cents / 100
 

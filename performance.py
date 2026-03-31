@@ -45,13 +45,14 @@ def monitor_performance(threshold_ms: float = 100.0, log_all: bool = False):
                 elapsed_ms = (time.perf_counter() - start) * 1000
 
                 if log_all:
-                    log.info(f"{func.__name__} took {elapsed_ms:.1f}ms")
+                    log.info("%s took %.1fms", func.__name__, elapsed_ms)
                 elif elapsed_ms > threshold_ms:
                     log.warning(
-                        f"{func.__name__} took {elapsed_ms:.1f}ms (threshold: {threshold_ms}ms)"
+                        "%s took %.1fms (threshold: %.1fms)",
+                        func.__name__, elapsed_ms, threshold_ms,
                     )
                 else:
-                    log.debug(f"{func.__name__} took {elapsed_ms:.1f}ms")
+                    log.debug("%s took %.1fms", func.__name__, elapsed_ms)
 
         return wrapper
     return decorator
@@ -145,12 +146,12 @@ class BotMetrics:
         for category, data in stats.items():
             if data:
                 log.info(
-                    f"{category}: avg={data['avg_ms']:.1f}ms, "
-                    f"p95={data['p95_ms']:.1f}ms, max={data['max_ms']:.1f}ms "
-                    f"(n={data['count']})"
+                    "%s: avg=%.1fms, p95=%.1fms, max=%.1fms (n=%d)",
+                    category, data['avg_ms'], data['p95_ms'],
+                    data['max_ms'], data['count'],
                 )
             else:
-                log.info(f"{category}: no data")
+                log.info("%s: no data", category)
 
 
 class TimingContext:

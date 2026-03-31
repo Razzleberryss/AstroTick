@@ -27,4 +27,3 @@ flask>=3.0.0
 
 # Firecrawl: web scraping client for synthetic CF Benchmarks BTC price estimation
 firecrawl-py>=1.13.5
-python-dotenv==1.2.2

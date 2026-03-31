@@ -55,5 +55,17 @@ class BotRequirementsTests(unittest.TestCase):
         self.assertEqual(pnl, 40)
 
 
+class TestComputeTradeContracts(unittest.TestCase):
+    """Ensures contract sizing respects min(sig.size, budget_contracts)."""
+
+    def test_sig_size_smaller_than_budget(self):
+        from bot import _compute_trade_contracts
+        self.assertEqual(_compute_trade_contracts(5, 10), 5)
+
+    def test_sig_size_larger_than_budget(self):
+        from bot import _compute_trade_contracts
+        self.assertEqual(_compute_trade_contracts(20, 10), 10)
+
+
 if __name__ == "__main__":
     unittest.main()

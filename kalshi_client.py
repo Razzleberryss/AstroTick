@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 _LOG_BODY_MAX_LEN = 500
 
 
-def _truncate_for_log(text: str, max_len: int = _LOG_BODY_MAX_LEN) -> str:
+def _truncate_for_log(text: Optional[str], max_len: int = _LOG_BODY_MAX_LEN) -> str:
     if text is None:
         return ""
     text = str(text)

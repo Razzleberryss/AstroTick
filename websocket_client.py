@@ -90,6 +90,10 @@ class KalshiWebSocketClient:
             log.warning("WebSocket client already running")
             return
 
+        # Clear any stale signal from a previous run so the wait below always
+        # reflects the outcome of THIS handshake attempt, not a prior one.
+        self._connected_event.clear()
+
         self._running = True
         self.ws_thread = threading.Thread(target=self._run_websocket, daemon=True)
         self.ws_thread.start()

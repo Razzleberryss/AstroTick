@@ -170,11 +170,13 @@ class KalshiClient:
                 )
 
             if attempt < max_attempts - 1:
-                # Full jitter backoff: sleep between 0 and 2^attempt seconds.
+                # Full jitter backoff: sleep between 0.1 s and 2^attempt seconds.
+                # The 0.1 s floor guarantees a minimum cooling-off period so the
+                # upstream service has time to recover before we retry.
                 # Avoids thundering-herd when multiple retries fire at once and
                 # keeps the worst-case retry wait well under the previous fixed
                 # 1 + 2 + 4 = 7 s schedule.
-                backoff = random.uniform(0, 2 ** attempt)
+                backoff = random.uniform(0.1, max(0.2, 2 ** attempt))
                 log.info("Retrying in %.2fs...", backoff)
                 time.sleep(backoff)
 

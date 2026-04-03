@@ -179,7 +179,12 @@ class KalshiWebSocketClient:
             # For snapshot messages, replace the entire orderbook
             if data.get("type") == "orderbook_snapshot":
                 orderbook_data = payload
-                # Normalize outside the lock so heavy parsing doesn't block readers
+                # All WebSocket callbacks fire on a single background thread
+                # (the websocket-client library is single-threaded per connection),
+                # so there is no concurrent writer for the same ticker here.
+                # We normalize outside the lock to keep lock-hold time minimal:
+                # only the final dict-swap is protected, allowing the main thread
+                # to read the previous snapshot without blocking during parsing.
                 normalized = self._normalize_orderbook(orderbook_data)
                 with self._lock:
                     self._orderbooks[ticker] = normalized

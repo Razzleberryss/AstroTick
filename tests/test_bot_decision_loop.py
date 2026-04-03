@@ -133,6 +133,23 @@ class TestExecuteCli(unittest.TestCase):
 # Layer 2: execute_with_decision_engine — retry/halt/escalate loop
 # ══════════════════════════════════════════════════════════════════════════
 
+class TestEnvelopeFnPath(unittest.TestCase):
+    """In-process envelope_fn bypasses subprocess but still uses decision engine."""
+
+    def test_envelope_fn_used_instead_of_cli(self):
+        env = _ok_envelope("BUY_DRY_RUN", {"order_id": None})
+
+        def _fn():
+            return env
+
+        outcome, out = cli_executor.execute_with_decision_engine(
+            ["ignored"],
+            envelope_fn=_fn,
+        )
+        self.assertEqual(outcome.action, AgentAction.CONTINUE)
+        self.assertEqual(out, env)
+
+
 class TestContinueAction(unittest.TestCase):
     """CONTINUE → return immediately with (outcome, envelope)."""
 
@@ -445,7 +462,8 @@ class TestCliBuyArgs(unittest.TestCase):
     """_cli_buy must format args correctly for the CLI."""
 
     @patch("cli_executor.execute_with_decision_engine")
-    def test_builds_buy_args(self, mock_exec):
+    @patch("config.INPROCESS_KALSHI_ORDERS", False)
+    def test_builds_buy_args(self, _inprocess, mock_exec):
         ok_outcome = DecisionOutcome(
             ok=True, code="BUY_PLACED", action=AgentAction.CONTINUE,
             retry_allowed=False, halt_trading=False,
@@ -454,13 +472,14 @@ class TestCliBuyArgs(unittest.TestCase):
         mock_exec.return_value = (ok_outcome, _ok_envelope("BUY_PLACED"))
 
         import bot
-        bot._cli_buy("KXBTCD-28MAR2615-B85000", "yes", 5, 45)
+        bot._cli_buy(MagicMock(), "KXBTCD-28MAR2615-B85000", "yes", 5, 45)
         mock_exec.assert_called_once_with(
             ["buy", "--ticker", "KXBTCD-28MAR2615-B85000", "yes", "5", "45"],
         )
 
     @patch("cli_executor.execute_with_decision_engine")
-    def test_builds_buy_args_with_dry_run(self, mock_exec):
+    @patch("config.INPROCESS_KALSHI_ORDERS", False)
+    def test_builds_buy_args_with_dry_run(self, _inprocess, mock_exec):
         ok_outcome = DecisionOutcome(
             ok=True, code="BUY_DRY_RUN", action=AgentAction.CONTINUE,
             retry_allowed=False, halt_trading=False,
@@ -469,7 +488,7 @@ class TestCliBuyArgs(unittest.TestCase):
         mock_exec.return_value = (ok_outcome, _ok_envelope("BUY_DRY_RUN"))
 
         import bot
-        bot._cli_buy("KXBTCD-28MAR2615-B85000", "no", 10, 50, dry_run=True)
+        bot._cli_buy(MagicMock(), "KXBTCD-28MAR2615-B85000", "no", 10, 50, dry_run=True)
         mock_exec.assert_called_once_with(
             ["buy", "--ticker", "KXBTCD-28MAR2615-B85000", "no", "10", "50", "--dry-run"],
         )
@@ -479,7 +498,8 @@ class TestCliSellArgs(unittest.TestCase):
     """_cli_sell must format args correctly for the CLI."""
 
     @patch("cli_executor.execute_with_decision_engine")
-    def test_builds_sell_args(self, mock_exec):
+    @patch("config.INPROCESS_KALSHI_ORDERS", False)
+    def test_builds_sell_args(self, _inprocess, mock_exec):
         ok_outcome = DecisionOutcome(
             ok=True, code="SELL_PLACED", action=AgentAction.CONTINUE,
             retry_allowed=False, halt_trading=False,
@@ -488,13 +508,14 @@ class TestCliSellArgs(unittest.TestCase):
         mock_exec.return_value = (ok_outcome, _ok_envelope("SELL_PLACED"))
 
         import bot
-        bot._cli_sell("KXBTCD-28MAR2615-B85000", "yes", 3, 55)
+        bot._cli_sell(MagicMock(), "KXBTCD-28MAR2615-B85000", "yes", 3, 55)
         mock_exec.assert_called_once_with(
             ["sell", "--ticker", "KXBTCD-28MAR2615-B85000", "yes", "3", "55"],
         )
 
     @patch("cli_executor.execute_with_decision_engine")
-    def test_builds_sell_args_with_dry_run(self, mock_exec):
+    @patch("config.INPROCESS_KALSHI_ORDERS", False)
+    def test_builds_sell_args_with_dry_run(self, _inprocess, mock_exec):
         ok_outcome = DecisionOutcome(
             ok=True, code="SELL_DRY_RUN", action=AgentAction.CONTINUE,
             retry_allowed=False, halt_trading=False,
@@ -503,7 +524,7 @@ class TestCliSellArgs(unittest.TestCase):
         mock_exec.return_value = (ok_outcome, _ok_envelope("SELL_DRY_RUN"))
 
         import bot
-        bot._cli_sell("KXBTCD-28MAR2615-B85000", "no", 2, 40, dry_run=True)
+        bot._cli_sell(MagicMock(), "KXBTCD-28MAR2615-B85000", "no", 2, 40, dry_run=True)
         mock_exec.assert_called_once_with(
             ["sell", "--ticker", "KXBTCD-28MAR2615-B85000", "no", "2", "40", "--dry-run"],
         )

@@ -448,8 +448,22 @@ def cmd_markets(client: KalshiClient, args):
                     bnb = _no_best[0]  if _no_best  else None
                     bya = (100 - bnb)  if bnb is not None else None
                     bna = (100 - byb)  if byb is not None else None
-                    if byb is not None and bya is not None:
-                        mid = (byb + bya) / 2
+                    if byb is not None or bya is not None:
+                        # Compute mid safely for one-sided books.
+                        # Kalshi only returns YES bids; NO bids are separate.
+                        # When BTC << strike, yes_dollars is empty (byb=None)
+                        # but no_dollars has real bids → bya = 100 - bnb.
+                        # Treat the absent side as 0 for mid estimation.
+                        if byb is not None and bya is not None:
+                            mid = (byb + bya) / 2
+                        elif bya is not None:
+                            # Only NO side present; YES is near-zero.
+                            # Estimate: mid ≈ bya / 2 (YES bid implied ~0)
+                            mid = bya / 2.0
+                        else:
+                            # Only YES side present; NO is near-zero.
+                            # Estimate: mid ≈ (100 + byb) / 2 (NO bid implied ~0)
+                            mid = (100 + byb) / 2.0
                         cand["yes_bid"]      = byb
                         cand["yes_ask"]      = bya
                         cand["no_bid"]       = bnb

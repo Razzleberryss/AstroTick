@@ -96,7 +96,8 @@ class TestKalshiClientRetries(unittest.TestCase):
         self.assertEqual(client.session.request.call_count, 1)
 
     @patch("time.sleep", return_value=None)
-    def test_retries_on_timeout(self, mock_sleep):
+    @patch("kalshi_client.random.uniform", return_value=1.0)
+    def test_retries_on_timeout(self, mock_uniform, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
@@ -111,12 +112,15 @@ class TestKalshiClientRetries(unittest.TestCase):
 
             self.assertEqual(result, {"ok": True})
             self.assertEqual(client.session.request.call_count, 2)
-            mock_sleep.assert_called_once_with(1)  # backoff for attempt 0: 2**0 = 1
+            # random.uniform is called with (0.1, max(0.2, 2**0)) = (0.1, 1.0)
+            mock_uniform.assert_called_once_with(0.1, 1.0)
+            mock_sleep.assert_called_once_with(1.0)
         finally:
             config.REQUEST_MAX_RETRIES = orig_retries
 
     @patch("time.sleep", return_value=None)
-    def test_retries_on_connection_error(self, mock_sleep):
+    @patch("kalshi_client.random.uniform", return_value=0.5)
+    def test_retries_on_connection_error(self, mock_uniform, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
@@ -135,7 +139,8 @@ class TestKalshiClientRetries(unittest.TestCase):
             config.REQUEST_MAX_RETRIES = orig_retries
 
     @patch("time.sleep", return_value=None)
-    def test_raises_after_max_retries_exceeded(self, mock_sleep):
+    @patch("kalshi_client.random.uniform", return_value=0.5)
+    def test_raises_after_max_retries_exceeded(self, mock_uniform, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
@@ -166,7 +171,8 @@ class TestKalshiClientRetries(unittest.TestCase):
             config.REQUEST_MAX_RETRIES = orig_retries
 
     @patch("time.sleep", return_value=None)
-    def test_retries_on_5xx_server_error(self, mock_sleep):
+    @patch("kalshi_client.random.uniform", return_value=0.5)
+    def test_retries_on_5xx_server_error(self, mock_uniform, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3

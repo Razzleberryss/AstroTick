@@ -415,7 +415,18 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
 
                 if isinstance(entry, dict):
                     raw_price = entry.get("price")
-                    raw_size = entry.get("size", 0)
+                    if raw_price is None:
+                        raw_price = entry.get("price_dollars")
+                    raw_size = entry.get("size")
+                    if raw_size is None:
+                        raw_size = entry.get("count")
+                    if raw_size is None and entry.get("count_fp") is not None:
+                        try:
+                            raw_size = int(float(entry["count_fp"]))
+                        except (ValueError, TypeError):
+                            raw_size = 0
+                    if raw_size is None:
+                        raw_size = 0
                 elif isinstance(entry, (list, tuple)) and len(entry) >= 1:
                     raw_price = entry[0]
                     raw_size = entry[1] if len(entry) >= 2 else 0

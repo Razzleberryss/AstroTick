@@ -15,6 +15,7 @@ import sys
 from typing import List, Dict, Optional
 
 from kalshi_client import KalshiClient
+from kalshi_money import enrich_market_quotes_from_dollar_fields
 import config
 
 log = logging.getLogger(__name__)
@@ -46,12 +47,11 @@ def fetch_historical_markets(
             - close_time: str (ISO 8601)
             - expected_expiration_time: str (ISO 8601)
             - result: str ("yes", "no", or empty if unresolved)
-            - last_price: int (cents)
+            - last_price: int (cents), from last_price_dollars when present
             - yes_price: int (cents, if available)
             - no_price: int (cents, if available)
             - status: str ("open", "closed", "settled")
             - volume: int (if available)
-            - liquidity: int (if available)
 
     Raises:
         ValueError: If date format is invalid
@@ -120,21 +120,24 @@ def fetch_historical_markets(
     # Extract relevant fields for each market
     structured_markets = []
     for market in all_markets:
+        m = dict(market)
+        enrich_market_quotes_from_dollar_fields(m)
         structured_market = {
-            "ticker": market.get("ticker"),
-            "series_ticker": market.get("series_ticker"),
-            "title": market.get("title", ""),
-            "subtitle": market.get("subtitle", ""),
-            "open_time": market.get("open_time", ""),
-            "close_time": market.get("close_time", ""),
-            "expected_expiration_time": market.get("expected_expiration_time", ""),
-            "result": market.get("result", ""),
-            "last_price": market.get("last_price"),
-            "yes_price": market.get("yes_price"),
-            "no_price": market.get("no_price"),
-            "status": market.get("status", ""),
-            "volume": market.get("volume"),
-            "liquidity": market.get("liquidity"),
+            "ticker": m.get("ticker"),
+            "series_ticker": m.get("series_ticker"),
+            "title": m.get("title", ""),
+            "subtitle": m.get("subtitle", ""),
+            "open_time": m.get("open_time", ""),
+            "close_time": m.get("close_time", ""),
+            "expected_expiration_time": m.get("expected_expiration_time", ""),
+            "result": m.get("result", ""),
+            "last_price": m.get("last_price")
+            if m.get("last_price") is not None
+            else parse_dollars_to_cents_int(m.get("last_price_dollars")),
+            "yes_price": m.get("yes_price"),
+            "no_price": m.get("no_price"),
+            "status": m.get("status", ""),
+            "volume": m.get("volume"),
         }
         structured_markets.append(structured_market)
 

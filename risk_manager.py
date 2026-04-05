@@ -18,6 +18,7 @@ from typing import Optional
 
 import config
 from strategy import Signal
+from kalshi_money import position_average_price_cents
 
 log = logging.getLogger(__name__)
 
@@ -279,9 +280,9 @@ class RiskManager:
         """Rough estimate of total dollars currently at risk in open positions."""
         total_cents = 0
         for pos in positions:
-            # Kalshi position: quantity * average cost
+            # Kalshi position: quantity * average cost (API v2: average_price_dollars)
             qty = abs(pos.get("position", 0))
-            avg_price = pos.get("average_price", 99)  # conservative default
+            avg_price = position_average_price_cents(pos, default_cents=99)
             total_cents += qty * avg_price
         return total_cents / 100
 

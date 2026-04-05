@@ -27,8 +27,14 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import config
+from kalshi_money import enrich_market_quotes_from_dollar_fields
 
 log = logging.getLogger(__name__)
+
+# Order create responses: Kalshi removed "pending" from the public status enum.
+_ORDER_CREATE_OK_STATUSES = frozenset(
+    {"resting", "queued", "open", "executed", "filled", "partially_filled"}
+)
 
 _LOG_BODY_MAX_LEN = 500
 
@@ -400,11 +406,11 @@ class KalshiClient:
 
     def get_market_with_history(self, ticker: str) -> dict:
         """
-        Placeholder: eventually this should route between live /markets/{ticker}
-        and historical markets/candlesticks based on market_settled_ts.
-        For now just call GET /markets/{ticker}.
+        Placeholder: route between live GET /markets/{ticker} and historical
+        market/candle endpoints using GET /historical/cutoff market_settled_ts
+        when the contract is settled. For now this is a thin alias of get_market().
         """
-        return self._request("GET", f"/markets/{ticker}")
+        return self.get_market(ticker)
 
     def debug_historical_cutoffs(self) -> None:
         """
@@ -480,7 +486,7 @@ class KalshiClient:
             log.warning("All BTC markets are provisional; skipping trading")
             return None
         markets.sort(key=lambda m: m.get("close_time", ""))
-        return markets[0]
+        return enrich_market_quotes_from_dollar_fields(markets[0])
 
     def get_markets(
         self,
@@ -533,8 +539,13 @@ class KalshiClient:
         return self._request("GET", f"/markets/{ticker}/orderbook")
 
     def get_market(self, ticker: str) -> dict:
-        """Return market details including last_price, yes_ask, no_ask."""
-        return self._request("GET", f"/markets/{ticker}")
+        """Return raw GET /markets/{ticker} JSON, with *_dollars quote fields mirrored into legacy cent keys where possible."""
+        data = self._request("GET", f"/markets/{ticker}")
+        if isinstance(data.get("market"), dict):
+            enrich_market_quotes_from_dollar_fields(data["market"])
+        elif isinstance(data, dict) and data.get("ticker") is not None:
+            enrich_market_quotes_from_dollar_fields(data)
+        return data
 
     def get_market_quotes(self, ticker: str) -> dict:
         """
@@ -653,9 +664,42 @@ class KalshiClient:
             }
 
     def get_positions(self) -> list:
-        """Return list of current open positions."""
+        """
+        Return unsettled market_positions only (per API v2).
+
+        Settled / closed exposure is not included here; use get_settlements() and/or
+        get_fills() for historical P&L and closed positions.
+        """
         data = self._request("GET", "/portfolio/positions")
         return data.get("market_positions", [])
+
+    def get_settlements(self, params: Optional[dict] = None) -> list[dict]:
+        """Portfolio settlements (settled positions / payouts). Pass-through query params (pagination, filters) as supported by the API."""
+        req = dict(params or {})
+        req.setdefault("limit", 200)
+        return self._fetch_paginated_list("/portfolio/settlements", "settlements", params=req)
+
+    def get_account_limits(self) -> dict:
+        """GET /account/limits — trading / account limits for the authenticated user."""
+        return self._request("GET", "/account/limits")
+
+    def get_markets_orderbooks(self, tickers: list[str]) -> dict[str, dict]:
+        """
+        GET /markets/orderbooks for up to 100 tickers per request.
+        Returns ticker -> {"ticker", "orderbook_fp", ...} rows (suitable for orderbook_utils.extract_raw_arrays).
+        """
+        out: dict[str, dict] = {}
+        if not tickers:
+            return out
+        for i in range(0, len(tickers), 100):
+            chunk = tickers[i : i + 100]
+            req_params = [("tickers", t) for t in chunk]
+            data = self._request("GET", "/markets/orderbooks", params=req_params)
+            for row in data.get("orderbooks", []):
+                t = row.get("ticker")
+                if t:
+                    out[t] = row
+        return out
 
     def contracts_held_on_side(self, ticker: str, side: str) -> int:
         """
@@ -724,10 +768,10 @@ class KalshiClient:
             order = response.get("order", {})
             status = order.get("status")
 
-            if status not in ("resting", "pending", "queued"):
+            if status and status not in _ORDER_CREATE_OK_STATUSES:
                 log.warning(
-                    "Order placed but status is '%s' (expected resting/pending/queued): %s",
-                    status, order
+                    "Order placed but status is '%s' (expected one of %s): %s",
+                    status, sorted(_ORDER_CREATE_OK_STATUSES), order
                 )
 
             log.info("Order placed successfully: order_id=%s status=%s", order.get("order_id"), status)
@@ -784,10 +828,10 @@ class KalshiClient:
             order = response.get("order", {})
             status = order.get("status")
 
-            if status not in ("resting", "pending", "queued"):
+            if status and status not in _ORDER_CREATE_OK_STATUSES:
                 log.warning(
-                    "Sell order placed but status is '%s' (expected resting/pending/queued): %s",
-                    status, order
+                    "Sell order placed but status is '%s' (expected one of %s): %s",
+                    status, sorted(_ORDER_CREATE_OK_STATUSES), order
                 )
 
             log.info("Sell order placed successfully: order_id=%s status=%s", order.get("order_id"), status)

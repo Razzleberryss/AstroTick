@@ -307,11 +307,14 @@ class KalshiWebSocketClient:
                 price = level.get("price")
                 if price is None:
                     price = level.get("price_dollars")
-                size = (
-                    level.get("size")
-                    if level.get("size") is not None
-                    else level.get("count")
-                )
+                size = level.get("size")
+                if size is None:
+                    size = level.get("count")
+                if size is None and level.get("count_fp") is not None:
+                    try:
+                        size = int(float(level["count_fp"]))
+                    except (TypeError, ValueError):
+                        size = None
             elif isinstance(level, (list, tuple)) and len(level) >= 2:
                 price, size = level[0], level[1]
 
@@ -383,6 +386,11 @@ class KalshiWebSocketClient:
                 raw_size = update.get("count")
             if raw_size is None:
                 raw_size = update.get("quantity")
+            if raw_size is None and update.get("count_fp") is not None:
+                try:
+                    raw_size = int(float(update["count_fp"]))
+                except (TypeError, ValueError):
+                    raw_size = None
             if raw_size is None and update.get("delta_fp") is not None:
                 raw_size = None
 

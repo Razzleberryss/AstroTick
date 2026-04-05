@@ -15,7 +15,8 @@ def to_price_cents(value) -> int:
     Handles both string dollar amounts ("0.52") and integer cents (52).
     """
     if isinstance(value, str):
-        return int(float(value) * 100)
+        # round() avoids float artifacts (e.g. "0.5800" -> 57 with bare int(float*100))
+        return int(round(float(value) * 100))
     return int(value)
 
 
@@ -45,6 +46,27 @@ def parse_bid_array(bid_array, max_levels: Optional[int] = None) -> List[Tuple[i
     items = bid_array[:max_levels] if max_levels else bid_array
 
     for entry in items:
+        if isinstance(entry, dict):
+            raw_price = entry.get("price")
+            if raw_price is None:
+                raw_price = entry.get("price_dollars")
+            raw_size = entry.get("size")
+            if raw_size is None:
+                raw_size = entry.get("count")
+            if raw_size is None and entry.get("count_fp") is not None:
+                try:
+                    raw_size = int(float(entry["count_fp"]))
+                except (ValueError, TypeError):
+                    raw_size = None
+            if raw_price is None or raw_size is None:
+                continue
+            try:
+                price = to_price_cents(raw_price)
+                size = int(float(raw_size))
+                parsed.append((price, size))
+            except (ValueError, TypeError):
+                continue
+            continue
         if isinstance(entry, (list, tuple)) and len(entry) >= 2:
             try:
                 price = to_price_cents(entry[0])

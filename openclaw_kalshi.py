@@ -122,6 +122,7 @@ os.environ.setdefault("BTC_SERIES_TICKER", _series_override)
 sys.path.insert(0, str(PROJECT_DIR))
 import config  # noqa: E402
 from kalshi_client import KalshiClient  # noqa: E402
+from kalshi_money import enrich_market_quotes_from_dollar_fields  # noqa: E402
 
 log = logging.getLogger("openclaw_kalshi")
 
@@ -386,6 +387,8 @@ def cmd_markets(client: KalshiClient, args):
         if m.get("ticker", "").startswith(f"{series}-")
         and not m.get("is_provisional", False)
     ]
+    for m in markets:
+        enrich_market_quotes_from_dollar_fields(m)
     markets.sort(key=lambda m: m.get("close_time", ""))
 
     rows = []

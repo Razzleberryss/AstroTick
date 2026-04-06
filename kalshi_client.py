@@ -31,6 +31,10 @@ from kalshi_money import enrich_market_quotes_from_dollar_fields
 
 log = logging.getLogger(__name__)
 
+# Keep logging robust when pricing fields may be None.
+def fmt_cents(v: int | None) -> str:
+    return "NA" if v is None else str(v)
+
 # Order create responses: Kalshi removed "pending" from the public status enum.
 _ORDER_CREATE_OK_STATUSES = frozenset(
     {"resting", "queued", "open", "executed", "filled", "partially_filled"}
@@ -593,14 +597,20 @@ class KalshiClient:
                 # No NO bids available, but we can still estimate YES ask
                 # Use a minimal spread assumption: ask = bid + 1 cent (minimum tick)
                 best_yes_ask = min(best_yes_bid + 1, 99)
-                log.debug("Inferred best_yes_ask=%d from best_yes_bid=%d (no NO bids available)",
-                         best_yes_ask, best_yes_bid)
+                log.debug(
+                    "Inferred best_yes_ask=%s from best_yes_bid=%s (no NO bids available)",
+                    fmt_cents(best_yes_ask),
+                    fmt_cents(best_yes_bid),
+                )
 
             if best_no_bid is not None and best_no_ask is None:
                 # No YES bids available, but we can still estimate NO ask
                 best_no_ask = min(best_no_bid + 1, 99)
-                log.debug("Inferred best_no_ask=%d from best_no_bid=%d (no YES bids available)",
-                         best_no_ask, best_no_bid)
+                log.debug(
+                    "Inferred best_no_ask=%s from best_no_bid=%s (no YES bids available)",
+                    fmt_cents(best_no_ask),
+                    fmt_cents(best_no_bid),
+                )
 
             # Compute mid price if we have at least one complete bid/ask pair
             if best_yes_bid is not None and best_yes_ask is not None:

@@ -40,6 +40,7 @@ from synthetic_cfb_price import (
     RollingSyntheticCfbBuffer,
 )
 
+
 _dashboard_last_write_mono: float = 0.0
 _dashboard_last_payload: str | None = None
 _cfb_last_full_monotonic: float | None = None
@@ -87,6 +88,15 @@ def _compute_trade_contracts(sig_size, budget_contracts):
     regressions if the sizing logic is modified in the future.
     """
     return min(sig_size, budget_contracts)
+
+
+def fmt_cents(value):
+    if value is None:
+        return "NA"
+    try:
+        return f"{int(round(value))}c"
+    except Exception:
+        return "NA"
 
 
 # ── Time-delay strategy helpers ───────────────────────────────────────────────────────────────
@@ -613,6 +623,7 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     if state is not None:
         state.update(_cfb_ctx)
 
+
     # 2. Fetch supporting data
     try:
         # Try to get orderbook from WebSocket if available and connected
@@ -668,27 +679,74 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                 market[legacy_field] = quotes[new_field]
 
         # Log with orderbook-based prices
-        yes_bid = quotes.get("best_yes_bid")
-        yes_ask = quotes.get("best_yes_ask")
-        no_bid = quotes.get("best_no_bid")
-        no_ask = quotes.get("best_no_ask")
-        mid = quotes.get("mid_price")
+        market_ticker = ticker
+        last_cents = market.get("last_price")
+        yes_bid_cents = quotes.get("best_yes_bid")
+        yes_ask_cents = quotes.get("best_yes_ask")
+        no_bid_cents = quotes.get("best_no_bid")
+        no_ask_cents = quotes.get("best_no_ask")
+        mid_cents = quotes.get("mid_price")
+        yes_depth = quotes.get("best_yes_bid_size")
 
-        # Check if orderbook is truly empty (both YES and NO sides have no quotes)
-        # With one-sided inference, we should have at least bid OR ask on YES side
-        if yes_bid is not None and yes_ask is not None:
-            log.info("Active market: %s | last=%sc yes=%dc/%dc no=%dc/%dc mid=%dc (from orderbook)",
-                     ticker, market.get("last_price"),
-                     yes_bid, yes_ask, no_bid, no_ask, mid)
-        else:
-            yes_raw, no_raw = _extract_raw_arrays(orderbook)
+        log.info(
+            "Active market: %s | last=%s yes=%s/%s no=%s/%s mid=%s (from orderbook)",
+            market_ticker,
+            fmt_cents(last_cents),
+            fmt_cents(yes_bid_cents),
+            fmt_cents(yes_ask_cents),
+            fmt_cents(no_bid_cents),
+            fmt_cents(no_ask_cents),
+            fmt_cents(mid_cents),
+        )
 
-            yes_display = yes_raw[:5] if yes_raw else []
-            no_display = no_raw[:5] if no_raw else []
+        yes_raw, no_raw = _extract_raw_arrays(orderbook)
+        if not yes_raw and not no_raw:
+            log.warning(
+                "Empty orderbook for %s: raw_yes=%s raw_no=%s -- skipping cycle",
+                market_ticker,
+                yes_raw,
+                no_raw,
+            )
+            risk._clear_datetime_cache()
+            return False
 
-            log.warning("Active market: %s | orderbook empty (no quotes available) | "
-                       "Raw orderbook: yes=%s, no=%s",
-                       ticker, yes_display, no_display)
+        # Hard orderbook sanity validation before strategy evaluation
+        yes_bid = (float(yes_bid_cents) / 100.0) if yes_bid_cents is not None else None
+        yes_ask = (float(yes_ask_cents) / 100.0) if yes_ask_cents is not None else None
+        if (
+            yes_bid is None
+            or yes_ask is None
+            or yes_depth is None
+            or yes_depth <= 0
+            or yes_bid < 0
+            or yes_bid > 1
+            or yes_ask < 0
+            or yes_ask > 1
+            or yes_bid > yes_ask
+        ):
+            log.warning(
+                "Invalid orderbook for %s: yes_bid=%s yes_ask=%s yes_depth=%s raw_yes=%s raw_no=%s -- skipping cycle",
+                market_ticker,
+                yes_bid,
+                yes_ask,
+                yes_depth,
+                yes_raw,
+                no_raw,
+            )
+            risk._clear_datetime_cache()
+            return False
+
+        spread = yes_ask - yes_bid
+        if spread < 0:
+            log.warning(
+                "Crossed/invalid orderbook for %s: yes_bid=%.4f yes_ask=%.4f spread=%.4f -- skipping cycle",
+                market_ticker,
+                yes_bid,
+                yes_ask,
+                spread,
+            )
+            risk._clear_datetime_cache()
+            return False
     else:
         # Use old market data fields
         log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",

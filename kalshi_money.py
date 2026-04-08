@@ -145,5 +145,5 @@ def fmt_cents(value) -> str:
         return "NA"
     try:
         return f"{int(round(value))}c"
-    except Exception:
+    except (TypeError, ValueError):
         return "NA"

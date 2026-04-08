@@ -35,6 +35,7 @@ from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_m
 from agent_decision_engine import AgentAction
 import cli_executor
 from orderbook_utils import extract_raw_arrays as _extract_raw_arrays
+from kalshi_money import fmt_cents
 
 
 _dashboard_last_write_mono: float = 0.0
@@ -83,15 +84,6 @@ def _compute_trade_contracts(sig_size, budget_contracts):
     regressions if the sizing logic is modified in the future.
     """
     return min(sig_size, budget_contracts)
-
-
-def fmt_cents(value):
-    if value is None:
-        return "NA"
-    try:
-        return f"{int(round(value))}c"
-    except Exception:
-        return "NA"
 
 
 # ── Time-delay strategy helpers ───────────────────────────────────────────────────────────────
@@ -475,14 +467,20 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
         if result["best_yes_bid"] is not None and result["best_yes_ask"] is None:
             # No NO bids, infer YES ask with minimal spread
             result["best_yes_ask"] = min(result["best_yes_bid"] + 1, 99)
-            log.debug("Inferred best_yes_ask=%d from best_yes_bid=%d (one-sided book)",
-                     result["best_yes_ask"], result["best_yes_bid"])
+            log.debug(
+                "Inferred best_yes_ask=%s from best_yes_bid=%s (one-sided book)",
+                fmt_cents(result["best_yes_ask"]),
+                fmt_cents(result["best_yes_bid"]),
+            )
 
         if result["best_no_bid"] is not None and result["best_no_ask"] is None:
             # No YES bids, infer NO ask with minimal spread
             result["best_no_ask"] = min(result["best_no_bid"] + 1, 99)
-            log.debug("Inferred best_no_ask=%d from best_no_bid=%d (one-sided book)",
-                     result["best_no_ask"], result["best_no_bid"])
+            log.debug(
+                "Inferred best_no_ask=%s from best_no_bid=%s (one-sided book)",
+                fmt_cents(result["best_no_ask"]),
+                fmt_cents(result["best_no_bid"]),
+            )
 
         # Compute mid price if we have at least one complete bid/ask pair
         if result["best_yes_bid"] is not None and result["best_yes_ask"] is not None:

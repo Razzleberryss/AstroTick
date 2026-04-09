@@ -670,6 +670,34 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             )
             risk._clear_datetime_cache()
             return False
+        yes_bid = quotes.get("best_yes_bid")
+        yes_ask = quotes.get("best_yes_ask")
+        no_bid = quotes.get("best_no_bid")
+        no_ask = quotes.get("best_no_ask")
+        mid = quotes.get("mid_price")
+
+        # Check if orderbook is truly empty (both YES and NO sides have no quotes)
+        # With one-sided inference, we should have at least bid OR ask on YES side
+        if yes_bid is not None and yes_ask is not None:
+            log.info(
+                "Active market: %s | last=%sc yes=%sc/%sc no=%sc/%sc mid=%sc (from orderbook)",
+                ticker,
+                fmt_cents(market.get("last_price")),
+                fmt_cents(yes_bid),
+                fmt_cents(yes_ask),
+                fmt_cents(no_bid),
+                fmt_cents(no_ask),
+                fmt_cents(mid),
+            )
+        else:
+            yes_raw, no_raw = _extract_raw_arrays(orderbook)
+
+            yes_display = yes_raw[:5] if yes_raw else []
+            no_display = no_raw[:5] if no_raw else []
+
+            log.warning("Active market: %s | orderbook empty (no quotes available) | "
+                       "Raw orderbook: yes=%s, no=%s",
+                       ticker, yes_display, no_display)
     else:
         # Use old market data fields
         log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",

@@ -97,6 +97,11 @@ def position_average_price_cents(pos: dict, default_cents: int = 99) -> int:
     return default_cents
 
 
+def fmt_cents(v: "int | None") -> str:
+    """Format a cent-valued integer for logging; returns 'NA' when the value is None."""
+    return "NA" if v is None else str(v)
+
+
 def enrich_market_quotes_from_dollar_fields(market: dict) -> dict:
     """
     Populate legacy cent keys (yes_bid, yes_ask, …, last_price) from *_dollars
@@ -137,3 +142,13 @@ def enrich_market_quotes_from_dollar_fields(market: dict) -> dict:
         market.setdefault("best_no_ask", market.get("no_ask"))
 
     return market
+
+
+def fmt_cents(value) -> str:
+    """Format a cent-valued integer for logging; returns 'NA' when the value is None."""
+    if value is None:
+        return "NA"
+    try:
+        return f"{int(round(value))}c"
+    except (TypeError, ValueError):
+        return "NA"

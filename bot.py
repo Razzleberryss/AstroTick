@@ -35,15 +35,11 @@ from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_m
 from agent_decision_engine import AgentAction
 import cli_executor
 from orderbook_utils import extract_raw_arrays as _extract_raw_arrays
-from synthetic_cfb_price import (
-    build_synthetic_cfb_snapshot,
-    RollingSyntheticCfbBuffer,
-)
+from kalshi_money import fmt_cents
 
 
 _dashboard_last_write_mono: float = 0.0
 _dashboard_last_payload: str | None = None
-_cfb_last_full_monotonic: float | None = None
 
 
 def write_dashboard_state(state: dict) -> None:
@@ -88,15 +84,6 @@ def _compute_trade_contracts(sig_size, budget_contracts):
     regressions if the sizing logic is modified in the future.
     """
     return min(sig_size, budget_contracts)
-
-
-def fmt_cents(value):
-    if value is None:
-        return "NA"
-    try:
-        return f"{int(round(value))}c"
-    except Exception:
-        return "NA"
 
 
 # ── Time-delay strategy helpers ───────────────────────────────────────────────────────────────
@@ -174,11 +161,6 @@ log = logging.getLogger("bot")
 # ── Graceful shutdown ─────────────────────────────────────────────────────────────────────────────
 _running = True
 _halt_trading = False
-
-# ── Synthetic CFB rolling buffer ─────────────────────────────────────────────────────────────────
-# Persists across bot cycles so that synthetic_cfb_avg_60s accumulates a
-# true 60-second rolling mean — the closest proxy to Kalshi's BRTI settlement ref.
-_cfb_buffer = RollingSyntheticCfbBuffer(window_seconds=60)
 
 # ── Time-delay strategy state ─────────────────────────────────────────────────────────────────────
 # Tracks the window ID of the last trade placed in reddit_time_delay mode so that
@@ -485,14 +467,20 @@ def _quotes_from_orderbook(orderbook: dict) -> dict:
         if result["best_yes_bid"] is not None and result["best_yes_ask"] is None:
             # No NO bids, infer YES ask with minimal spread
             result["best_yes_ask"] = min(result["best_yes_bid"] + 1, 99)
-            log.debug("Inferred best_yes_ask=%d from best_yes_bid=%d (one-sided book)",
-                     result["best_yes_ask"], result["best_yes_bid"])
+            log.debug(
+                "Inferred best_yes_ask=%s from best_yes_bid=%s (one-sided book)",
+                fmt_cents(result["best_yes_ask"]),
+                fmt_cents(result["best_yes_bid"]),
+            )
 
         if result["best_no_bid"] is not None and result["best_no_ask"] is None:
             # No YES bids, infer NO ask with minimal spread
             result["best_no_ask"] = min(result["best_no_bid"] + 1, 99)
-            log.debug("Inferred best_no_ask=%d from best_no_bid=%d (one-sided book)",
-                     result["best_no_ask"], result["best_no_bid"])
+            log.debug(
+                "Inferred best_no_ask=%s from best_no_bid=%s (one-sided book)",
+                fmt_cents(result["best_no_ask"]),
+                fmt_cents(result["best_no_bid"]),
+            )
 
         # Compute mid price if we have at least one complete bid/ask pair
         if result["best_yes_bid"] is not None and result["best_yes_ask"] is not None:
@@ -541,7 +529,7 @@ def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
 
 def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, state: dict = None):
     """Internal implementation of one bot cycle. Updates *state* in-place for the dashboard."""
-    global _last_trade_window_id, _halt_trading, _cfb_last_full_monotonic
+    global _last_trade_window_id, _halt_trading
 
     # 1. Find the active market
     market = client.get_active_btc_market()
@@ -558,71 +546,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
 
     if state is not None:
         state["active_market_ticker"] = ticker
-
-    # 1b. Synthetic CF Benchmarks BTC price estimate
-    # Scrapes public BTC spot sources to build a best-effort BRTI proxy.
-    # The rolling buffer accumulates spot samples to approximate Kalshi's
-    # settlement reference (simple average of the last 60 seconds of BRTI).
-    # Agent context is enriched when ok=True; degraded fields are set on failure.
-    now_mono = time.monotonic()
-    skip_firecrawl = False
-    if config.CFB_MIN_INTERVAL_SECONDS > 0 and _cfb_last_full_monotonic is not None:
-        if (now_mono - _cfb_last_full_monotonic) < config.CFB_MIN_INTERVAL_SECONDS:
-            skip_firecrawl = True
-    if not skip_firecrawl:
-        _cfb_last_full_monotonic = now_mono
-    if skip_firecrawl:
-        log.debug(
-            "SyntheticCFB: API-only refresh (full scrape throttled, interval=%ss)",
-            config.CFB_MIN_INTERVAL_SECONDS,
-        )
-    _cfb_snapshot = build_synthetic_cfb_snapshot(
-        config.FIRECRAWL_API_KEY,
-        buffer=_cfb_buffer,
-        skip_firecrawl=skip_firecrawl,
-    )
-    if _cfb_snapshot.ok:
-        _cfb_ctx: dict = {
-            "synthetic_cfb_spot": _cfb_snapshot.synthetic_cfb_spot,
-            "synthetic_cfb_mid": _cfb_snapshot.synthetic_cfb_mid,
-            "synthetic_cfb_avg_60s": _cfb_snapshot.synthetic_cfb_avg_60s,
-            "synthetic_cfb_window_seconds": _cfb_snapshot.window_seconds,
-            "synthetic_cfb_sample_count_60s": _cfb_snapshot.sample_count_60s,
-            "synthetic_cfb_confidence": _cfb_snapshot.confidence,
-            "synthetic_cfb_confidence_score": _cfb_snapshot.confidence_score,
-            "synthetic_cfb_spread_bps": _cfb_snapshot.spread_bps,
-            "synthetic_cfb_source_count": _cfb_snapshot.source_count,
-            "synthetic_cfb_scraped_at": _cfb_snapshot.scraped_at,
-        }
-        log.debug(
-            "SyntheticCFB ok | spot=%.2f avg60s=%s conf=%s spread_bps=%.1f sources=%d samples=%d",
-            _cfb_snapshot.synthetic_cfb_spot or 0.0,
-            f"{_cfb_snapshot.synthetic_cfb_avg_60s:.2f}" if _cfb_snapshot.synthetic_cfb_avg_60s else "n/a",
-            _cfb_snapshot.confidence,
-            _cfb_snapshot.spread_bps or 0.0,
-            _cfb_snapshot.source_count,
-            _cfb_snapshot.sample_count_60s,
-        )
-    else:
-        log.warning(
-            "SYNTHETICCFBFAILED | error=%s | continuing cycle with degraded context",
-            _cfb_snapshot.error,
-        )
-        _cfb_ctx = {
-            "synthetic_cfb_spot": None,
-            "synthetic_cfb_mid": None,
-            "synthetic_cfb_avg_60s": None,
-            "synthetic_cfb_window_seconds": _cfb_snapshot.window_seconds,
-            "synthetic_cfb_sample_count_60s": 0,
-            "synthetic_cfb_confidence": _cfb_snapshot.confidence,
-            "synthetic_cfb_confidence_score": _cfb_snapshot.confidence_score,
-            "synthetic_cfb_spread_bps": _cfb_snapshot.spread_bps,
-            "synthetic_cfb_source_count": _cfb_snapshot.source_count,
-            "synthetic_cfb_scraped_at": _cfb_snapshot.scraped_at,
-        }
-    if state is not None:
-        state.update(_cfb_ctx)
-
 
     # 2. Fetch supporting data
     try:
@@ -710,7 +633,9 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             risk._clear_datetime_cache()
             return False
 
-        # Hard orderbook sanity validation before strategy evaluation
+        # Hard orderbook sanity validation before strategy evaluation.
+        # Kalshi prices are always expressed on the YES side (YES + NO = 100¢),
+        # so we validate the YES bid/ask pair directly.
         yes_bid = (float(yes_bid_cents) / 100.0) if yes_bid_cents is not None else None
         yes_ask = (float(yes_ask_cents) / 100.0) if yes_ask_cents is not None else None
         if (
@@ -735,18 +660,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             )
             risk._clear_datetime_cache()
             return False
-
-        spread = yes_ask - yes_bid
-        if spread < 0:
-            log.warning(
-                "Crossed/invalid orderbook for %s: yes_bid=%.4f yes_ask=%.4f spread=%.4f -- skipping cycle",
-                market_ticker,
-                yes_bid,
-                yes_ask,
-                spread,
-            )
-            risk._clear_datetime_cache()
-            return False
     else:
         # Use old market data fields
         log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",
@@ -767,9 +680,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         if _yb is not None and _ya is not None:
             state["spread"] = _ya - _yb
         state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
-        # NOTE: kalshi_dislocation_* (mid vs synthetic CFB) is intentionally omitted.
-        # mid_price is contract probability in cents, not a BTC/USD level; dislocation
-        # vs synthetic_cfb_* requires a proper strike/index reference (future work).
 
     # ── reddit_time_delay strategy path ───────────────────────────────────────
     if config.STRATEGY_MODE == "reddit_time_delay":
@@ -1107,7 +1017,6 @@ def main():
     log.info(" Max Daily Loss : %sc", config.MAX_DAILY_LOSS_CENTS)
     log.info(" Max Daily Trades: %s", config.MAX_DAILY_TRADES)
     log.info(" Use WebSocket: %s", config.USE_WEBSOCKET_ORDERBOOK)
-    log.info(" CFB scrape interval: %ss (0=always full)", config.CFB_MIN_INTERVAL_SECONDS)
     log.info(" In-process orders: %s", config.INPROCESS_KALSHI_ORDERS)
     log.info("=" * 60)
     if config.KALSHI_ENV == "prod" and not config.DRY_RUN:

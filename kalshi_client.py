@@ -191,13 +191,12 @@ class KalshiClient:
                 log.warning("Kalshi SDK init failed (using noop SDK): %s", sdk_exc)
                 self._sdk = _NoopSdk()
 
-            masked_key_id = (self.api_key_id or "")
-            masked_key_id = (masked_key_id[:6] + "***") if masked_key_id else "MISSING"
+            key_id_status = "SET" if self.api_key_id else "MISSING"
             log.debug(
                 "Kalshi SDK client initialized (env=%s host=%s key_id=%s)",
                 config.KALSHI_ENV,
                 self.base_url,
-                masked_key_id,
+                key_id_status,
             )
         except Exception as exc:
             log.error("Failed to initialize Kalshi SDK client: %s", exc, exc_info=True)

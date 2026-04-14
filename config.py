@@ -11,7 +11,9 @@ from typing import Optional
 from dotenv import load_dotenv
 
 # -- Load .env file from project root ----------------------------------------
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+# Unit tests frequently need a clean environment; allow skipping dotenv load.
+if os.getenv("ASTROTICK_SKIP_DOTENV", "0") != "1":
+    load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # =============================================================================
 # Kalshi API
@@ -33,7 +35,7 @@ KALSHI_BASE_URL = BASE_URL  # alias used in kalshi_client.py
 # Risk Controls
 # =============================================================================
 MAX_TRADE_DOLLARS: float = float(os.getenv("MAX_TRADE_DOLLARS", "10"))
-MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
+MAX_OPEN_POSITIONS: int = int(os.getenv("MAX_OPEN_POSITIONS", "32"))
 MAX_TOTAL_EXPOSURE: float = float(os.getenv("MAX_TOTAL_EXPOSURE", "50"))
 MAX_DAILY_LOSS_CENTS: int = int(os.getenv("MAX_DAILY_LOSS_CENTS", "1000"))
 MAX_DAILY_TRADES: int = int(os.getenv("MAX_DAILY_TRADES", "20"))

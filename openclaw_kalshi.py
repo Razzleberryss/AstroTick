@@ -111,7 +111,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-STOP_FILE = Path.home() / ".openclaw" / "workspace" / "STOP_TRADING"
+STOP_FILE = Path(os.environ.get("OPENCLAW_STOP_FILE", str(Path.home() / ".openclaw" / "workspace" / "STOP_TRADING")))
 PROJECT_DIR = Path(__file__).resolve().parent
 
 # Override BTC_SERIES_TICKER before config import so KalshiClient's

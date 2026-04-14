@@ -26,4 +26,4 @@ websocket-client>=1.6.0
 flask>=3.0.0
 
 # Official Kalshi synchronous Python SDK (Trade API v2)
-kalshi-python-sync>=3.11.0
+kalshi-python-sync>=3.2.0,<4

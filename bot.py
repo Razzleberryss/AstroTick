@@ -158,6 +158,29 @@ def setup_logging():
 
 log = logging.getLogger("bot")
 
+# ── Shared pool for overlapping Kalshi REST calls ────────────────────────────────────────────────
+_fetch_executor: ThreadPoolExecutor | None = None
+
+
+def _get_fetch_executor() -> ThreadPoolExecutor:
+    """Lazily create a process-wide pool (max 3 workers: orderbook + balance + positions)."""
+    global _fetch_executor
+    if _fetch_executor is None:
+        _fetch_executor = ThreadPoolExecutor(
+            max_workers=3,
+            thread_name_prefix="kalshi_fetch",
+        )
+    return _fetch_executor
+
+
+def _shutdown_fetch_executor() -> None:
+    """Release worker threads; call from main() on exit."""
+    global _fetch_executor
+    if _fetch_executor is not None:
+        _fetch_executor.shutdown(wait=True)
+        _fetch_executor = None
+
+
 # ── Graceful shutdown ─────────────────────────────────────────────────────────────────────────────
 _running = True
 _halt_trading = False
@@ -566,13 +589,18 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                 else:
                     log.debug("WebSocket orderbook for %s is empty, falling back to REST", ticker)
 
-        # Fall back to REST if WebSocket data not available
+        pool = _get_fetch_executor()
+        # Fall back to REST if WebSocket data not available — overlap orderbook + balance + positions.
         if orderbook is None:
-            orderbook = client.get_orderbook(ticker)
+            fut_ob = pool.submit(client.get_orderbook, ticker)
+            fut_bal = pool.submit(client.get_balance)
+            fut_pos = pool.submit(client.get_positions)
+            orderbook = fut_ob.result()
+            balance = fut_bal.result()
+            positions = fut_pos.result()
             if ws_client and ws_client.is_connected():
                 log.debug("WebSocket orderbook not available, using REST for %s", ticker)
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        else:
             fut_bal = pool.submit(client.get_balance)
             fut_pos = pool.submit(client.get_positions)
             balance = fut_bal.result()
@@ -1070,6 +1098,7 @@ def main():
         if ws_client:
             log.info("Shutting down WebSocket client...")
             ws_client.stop()
+        _shutdown_fetch_executor()
 
     log.info("Bot stopped cleanly.")
 

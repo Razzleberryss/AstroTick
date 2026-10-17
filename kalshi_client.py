@@ -213,7 +213,8 @@ class KalshiClient:
                     method_name, attempt + 1, max_attempts, exc,
                 )
                 if attempt < max_attempts - 1:
-                    time.sleep(random.uniform(0.1, max(0.2, 2 ** attempt)))
+                    # Backoff jitter, not a cryptographic use of randomness.
+                    time.sleep(random.uniform(0.1, max(0.2, 2 ** attempt)))  # nosec B311
         log.error(
             "Kalshi API %s failed after %d attempt(s): %s",
             method_name, max_attempts, last_exc,

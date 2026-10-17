@@ -1,6 +1,7 @@
 # ==============================================================================
 # Kalshi 15-Minute BTC Trader  -  Python Dependencies
 # Install with: pip install -r requirements.txt
+# Requires Python >= 3.13 (the kalshi-python-sync SDK's minimum).
 # ==============================================================================
 
 # HTTP requests (Kalshi REST API calls)

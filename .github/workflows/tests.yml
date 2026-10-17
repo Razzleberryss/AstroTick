@@ -8,14 +8,13 @@ on:
 jobs:
   pytest:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          # kalshi-python-sync >= 3.31 requires Python >= 3.13, so that is the
+          # project's minimum Python version.
+          python-version: "3.13"
           cache: pip
       - name: Install dependencies
         run: |

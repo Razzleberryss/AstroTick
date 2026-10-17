@@ -9,7 +9,7 @@ requests>=2.33.0
 python-dotenv>=1.0.0
 
 # BTC spot price data (yfinance for real-time 1-min candles)
-yfinance>=0.2.54
+yfinance>=1.7,<2
 # RSA-PSS signing for Kalshi API authentication
 cryptography>=46.0.7
 
@@ -25,5 +25,7 @@ websocket-client>=1.6.0
 # Local web dashboard for monitoring the bot
 flask>=3.0.0
 
-# Official Kalshi synchronous Python SDK (Trade API v2)
-kalshi-python-sync>=3.2.0,<4
+# Official Kalshi synchronous Python SDK (Trade API v2).
+# >=3.31 is required: earlier 3.x releases still had the legacy create_order
+# method this repo no longer uses, and lacked CreateOrderV2 and Ed25519 signing.
+kalshi-python-sync>=3.31.0,<4

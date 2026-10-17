@@ -79,10 +79,47 @@ def fill_fee_cents(fill: dict) -> Optional[int]:
         return c
 
 
+def position_count(pos: dict) -> float:
+    """
+    Signed contract count for a market_positions row.
+
+    The current API reports the fixed-point string ``position_fp`` ("3.00",
+    possibly fractional and negative for NO exposure); older payloads used the
+    signed integer ``position``. Positive = long YES, negative = long NO.
+    """
+    fp = pos.get("position_fp")
+    if fp is not None:
+        try:
+            return float(str(fp))
+        except (TypeError, ValueError):
+            pass
+    try:
+        return float(pos.get("position", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def position_exposure_dollars(pos: dict) -> Optional[float]:
+    """Current market exposure in dollars for a market_positions row, if reported."""
+    d = parse_dollars_to_decimal(pos.get("market_exposure_dollars"))
+    if d is not None:
+        return float(d)
+    exposure_cents = pos.get("market_exposure")
+    if exposure_cents is not None:
+        try:
+            return int(exposure_cents) / 100.0
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
 def position_average_price_cents(pos: dict, default_cents: int = 99) -> int:
     """
     Average entry price in cents for a market_positions row.
-    Prefer *_dollars fields from the API; fall back to legacy integer average_price.
+
+    Prefer explicit *_dollars average-price fields (older payloads); the
+    current API no longer sends one, so estimate from total_traded_dollars
+    over the contract count before falling back to the conservative default.
     """
     for key in ("average_price_dollars", "avg_price_dollars", "avg_entry_price_dollars"):
         c = parse_dollars_to_cents_int(pos.get(key))
@@ -94,6 +131,14 @@ def position_average_price_cents(pos: dict, default_cents: int = 99) -> int:
             return int(ap)
         except (TypeError, ValueError):
             pass
+    traded = parse_dollars_to_decimal(pos.get("total_traded_dollars"))
+    count = abs(position_count(pos))
+    if traded is not None and count > 0:
+        cents = (traded / Decimal(str(count)) * 100).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+        if 0 < int(cents) <= 100:
+            return int(cents)
     return default_cents
 
 

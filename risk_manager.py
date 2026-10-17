@@ -18,7 +18,11 @@ from typing import Optional
 
 import config
 from strategy import Signal
-from kalshi_money import position_average_price_cents
+from kalshi_money import (
+    position_average_price_cents,
+    position_count,
+    position_exposure_dollars,
+)
 
 log = logging.getLogger(__name__)
 
@@ -284,6 +288,24 @@ class RiskManager:
         self._open_positions.pop(ticker, None)
         log.debug("Removed closed position from tracking: %s", ticker)
 
+    def reduce_position(self, ticker: str, closed_quantity: int) -> None:
+        """
+        Shrink a tracked position after a partial exit fill; remove it entirely
+        once nothing remains.
+        """
+        pos = self._open_positions.get(ticker)
+        if pos is None:
+            return
+        remaining = pos["quantity"] - closed_quantity
+        if remaining > 0:
+            pos["quantity"] = remaining
+            log.debug(
+                "Reduced tracked position %s by %d; %d remaining",
+                ticker, closed_quantity, remaining,
+            )
+        else:
+            self.record_closed_position(ticker)
+
     def get_open_positions(self) -> dict[str, dict]:
         """Return a deep snapshot of positions opened by this bot instance."""
         return {ticker: dict(pos) for ticker, pos in self._open_positions.items()}
@@ -293,13 +315,18 @@ class RiskManager:
     @staticmethod
     def _estimate_deployed(positions: list) -> float:
         """Rough estimate of total dollars currently at risk in open positions."""
-        total_cents = 0
+        total_dollars = 0.0
         for pos in positions:
-            # Kalshi position: quantity * average cost (API v2: average_price_dollars)
-            qty = abs(pos.get("position", 0))
+            # Prefer the API's own exposure figure (market_exposure_dollars);
+            # fall back to |position| * average cost for older payloads.
+            exposure = position_exposure_dollars(pos)
+            if exposure is not None:
+                total_dollars += abs(exposure)
+                continue
+            qty = abs(position_count(pos))
             avg_price = position_average_price_cents(pos, default_cents=99)
-            total_cents += qty * avg_price
-        return total_cents / 100
+            total_dollars += qty * avg_price / 100
+        return total_dollars
 
     def _ensure_log_file(self):
         """Create the CSV with headers if it doesn't already exist."""

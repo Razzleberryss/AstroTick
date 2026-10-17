@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import Any, Optional
 
 import config
-from kalshi_money import enrich_market_quotes_from_dollar_fields, fmt_cents
+from kalshi_money import (
+    enrich_market_quotes_from_dollar_fields,
+    fmt_cents,
+    parse_dollars_to_cents_int,
+    position_count,
+)
 import requests
 
 try:
@@ -44,11 +49,6 @@ class _NoopSdk:
         )
 
 log = logging.getLogger(__name__)
-
-# Order create responses: Kalshi removed "pending" from the public status enum.
-_ORDER_CREATE_OK_STATUSES = frozenset(
-    {"resting", "queued", "open", "executed", "filled", "partially_filled"}
-)
 
 _LOG_BODY_MAX_LEN = 500
 
@@ -124,8 +124,8 @@ def _get_first_present(d: dict, *keys: str) -> Any:
 
 def _price_cents_to_dollars_fp(price_cents: int) -> str:
     """
-    Convert integer cents (1-99) to a dollars fixed-point string for SDK fields.
-    Prefer 4dp ("0.5500") to align with *_dollars_fp conventions.
+    Convert integer cents (1-99) to a fixed-point dollars string for the
+    CreateOrderV2 'price' field (2 decimals, e.g. "0.55").
     """
     try:
         cents = int(price_cents)
@@ -133,8 +133,18 @@ def _price_cents_to_dollars_fp(price_cents: int) -> str:
         raise ValueError(f"price_cents must be an int, got {price_cents!r}")
     if not (0 <= cents <= 100):
         raise ValueError(f"price_cents out of range 0-100: {cents}")
-    d = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    d = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return format(d, "f")
+
+
+def _fp_to_int(value: Any, default: int = 0) -> int:
+    """Parse a fixed-point count string like '3.00' into an int (floor)."""
+    if value is None:
+        return default
+    try:
+        return int(float(str(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 class KalshiClient:
@@ -207,6 +217,54 @@ class KalshiClient:
     def _load_private_key(path: str):
         # Backward-compatibility shim: some unit tests patch this symbol.
         return None
+
+    # ── SDK call wrapper (timeout + transient-error retry) ────────────────────────────────────
+    def _sdk_get(self, method_name: str, **params) -> Any:
+        """
+        Call a read-only SDK method with the configured request timeout,
+        retrying transient failures (5xx / connection problems) with backoff.
+
+        Order placement deliberately does NOT go through this helper: blindly
+        retrying a create-order call can double-submit.
+        """
+        fn = getattr(self._sdk, method_name)
+        max_attempts = 1 + max(0, int(getattr(config, "REQUEST_MAX_RETRIES", 0)))
+        last_exc: Exception = RuntimeError("No attempts made")
+        for attempt in range(max_attempts):
+            try:
+                return fn(**params, _request_timeout=config.REQUEST_TIMEOUT_SECONDS)
+            except Exception as exc:
+                if not self._is_transient_sdk_error(exc):
+                    raise
+                last_exc = exc
+                log.warning(
+                    "Transient Kalshi API error in %s (attempt %d/%d): %s",
+                    method_name, attempt + 1, max_attempts, exc,
+                )
+                if attempt < max_attempts - 1:
+                    time.sleep(random.uniform(0.1, max(0.2, 2 ** attempt)))
+        log.error(
+            "Kalshi API %s failed after %d attempt(s): %s",
+            method_name, max_attempts, last_exc,
+        )
+        raise last_exc
+
+    @staticmethod
+    def _is_transient_sdk_error(exc: Exception) -> bool:
+        """True for errors worth retrying: HTTP 5xx/429 and connection-level failures."""
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return status >= 500 or status == 429
+        # urllib3 / socket-level errors surface without a status attribute.
+        return exc.__class__.__name__ in (
+            "MaxRetryError",
+            "NewConnectionError",
+            "ConnectTimeoutError",
+            "ReadTimeoutError",
+            "ProtocolError",
+            "TimeoutError",
+            "ConnectionError",
+        )
 
     # ── Legacy request helper (tests rely on this) ─────────────────────────────────────────────
     def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> dict:
@@ -575,7 +633,7 @@ class KalshiClient:
         The legacy integer-cents 'balance' field is deprecated.
         """
         try:
-            raw = self._sdk.get_balance()
+            raw = self._sdk_get("get_balance")
             data = _to_dict(raw)
             # Prefer *_dollars string if present.
             bal_dollars = _get_first_present(data, "balance_dollars", "available_balance_dollars")
@@ -610,7 +668,7 @@ class KalshiClient:
             "status": "open",
             "limit": 10,
         }
-        data = _to_dict(self._sdk.get_markets(**params))
+        data = _to_dict(self._sdk_get("get_markets", **params))
         markets = data.get("markets", []) or []
         if not markets:
             log.warning("No open BTC 15-min markets found for series %s", config.BTC_SERIES_TICKER)
@@ -647,7 +705,7 @@ class KalshiClient:
         params: dict = {"series_ticker": series_ticker, "limit": limit}
         if status is not None:
             params["status"] = status
-        data = _to_dict(self._sdk.get_markets(**params))
+        data = _to_dict(self._sdk_get("get_markets", **params))
         return data.get("markets", []) or []
 
     def list_markets(
@@ -672,17 +730,12 @@ class KalshiClient:
         list_markets / get_markets when you only need the markets list.
         """
         # Preserve existing shape used by historical.py: includes cursor for pagination.
-        return _to_dict(self._sdk.get_markets(**(params or {})))
+        return _to_dict(self._sdk_get("get_markets", **(params or {})))
 
     def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
         """Return the full orderbook dict for a market ticker."""
         try:
-            # SDK exposes get_market_orderbook per provided facts.
-            raw = self._sdk.get_market_orderbook(ticker=ticker, depth=int(depth))
-            return _to_dict(raw)
-        except TypeError:
-            # Some generated clients use positional args.
-            raw = self._sdk.get_market_orderbook(ticker, int(depth))
+            raw = self._sdk_get("get_market_orderbook", ticker=ticker, depth=int(depth))
             return _to_dict(raw)
         except Exception as exc:
             log.error("get_orderbook failed for %s: %s", ticker, exc, exc_info=True)
@@ -827,7 +880,7 @@ class KalshiClient:
         get_fills() for historical P&L and closed positions.
         """
         try:
-            data = _to_dict(self._sdk.get_positions())
+            data = _to_dict(self._sdk_get("get_positions"))
             # API v2 uses "market_positions" but some clients use "positions".
             rows = _get_first_present(data, "market_positions", "positions")
             return rows or []
@@ -867,8 +920,10 @@ class KalshiClient:
         """
         Return non-negative contract count held on side for ticker, or 0.
 
-        Kalshi uses a signed ``position`` per market: positive = long YES,
-        negative = long NO.
+        Kalshi reports a signed per-market count: positive = long YES,
+        negative = long NO. The current API sends it as the fixed-point string
+        ``position_fp``; older payloads used the integer ``position``.
+        Fractional holdings are floored so a sell never exceeds the position.
         """
         side = side.lower()
         if side not in ("yes", "no"):
@@ -876,11 +931,11 @@ class KalshiClient:
         for p in self.get_positions():
             if p.get("ticker") != ticker:
                 continue
-            pos = int(p.get("position", 0) or 0)
+            pos = position_count(p)
             if side == "yes" and pos > 0:
-                return pos
+                return int(pos)
             if side == "no" and pos < 0:
-                return abs(pos)
+                return int(abs(pos))
         return 0
 
     def place_order_yes(
@@ -928,7 +983,7 @@ class KalshiClient:
             return None
         return self.sell_yes(market_id, quantity, price, dry_run=False) if side == "yes" else self.sell_no(market_id, quantity, price, dry_run=False)
 
-    # ── SDK-backed wrapper methods (required by migration task) ─────────────────────────────────
+    # ── SDK-backed order methods (CreateOrderV2) ──────────────────────────────────────────────
     def _build_order_payload(
         self,
         *,
@@ -942,11 +997,19 @@ class KalshiClient:
         client_order_id: str | None = None,
     ) -> dict:
         """
-        Single private helper for SDK order creation.
+        Build CreateOrderV2 request kwargs from the bot's (side, action, cents)
+        order vocabulary.
 
-        - Converts cents → dollars-string fields (yes_price_dollars/no_price_dollars)
-        - Uses count_fp (repo convention)
-        - Sets cancel_order_on_pause=True by default
+        CreateOrderV2 uses a single-book model: every order is a bid or ask on
+        the YES book at a YES-denominated dollar price. The mapping is:
+          buy  yes @ P  -> bid @ P
+          sell yes @ P  -> ask @ P
+          buy  no  @ P  -> ask @ (1 - P)   (buying NO == selling YES)
+          sell no  @ P  -> bid @ (1 - P)
+
+        Orders are immediate-or-cancel so the response reports the exact fill
+        and nothing rests on the book un-tracked; post_only orders rest
+        good-till-canceled instead (IOC + post_only is contradictory).
         """
         side_l = (side or "").lower()
         if side_l not in ("yes", "no"):
@@ -959,26 +1022,73 @@ class KalshiClient:
         if not (1 <= int(price_cents) <= 99):
             raise ValueError("price_cents must be 1-99")
 
-        coid = client_order_id or str(uuid.uuid4())
+        if side_l == "yes":
+            book_price_cents = int(price_cents)
+            book_side = "bid" if action_l == "buy" else "ask"
+        else:
+            book_price_cents = 100 - int(price_cents)
+            book_side = "ask" if action_l == "buy" else "bid"
+
         payload: dict[str, Any] = {
             "ticker": ticker,
-            "side": side_l,
-            "action": action_l,
-            # Keep order type explicit and stable (limit).
-            "type": "limit",
-            "count": int(contracts),
-            "count_fp": f"{int(contracts)}.00",
-            "client_order_id": coid,
-            "reduce_only": bool(reduce_only),
-            "post_only": bool(post_only),
-            "cancel_order_on_pause": True,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": book_side,
+            "count": str(int(contracts)),
+            "price": _price_cents_to_dollars_fp(book_price_cents),
+            "time_in_force": "good_till_canceled" if post_only else "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        price_dollars = _price_cents_to_dollars_fp(int(price_cents))
-        if side_l == "yes":
-            payload["yes_price_dollars"] = price_dollars
-        else:
-            payload["no_price_dollars"] = price_dollars
+        if post_only:
+            payload["post_only"] = True
+            payload["cancel_order_on_pause"] = True
+        if reduce_only and not post_only:
+            # reduce_only is only valid with immediate_or_cancel orders.
+            payload["reduce_only"] = True
         return payload
+
+    def _submit_order(self, payload: dict, *, order_side: str) -> dict:
+        """
+        Submit a CreateOrderV2 request and normalize the response to the
+        {"order": {...}} shape the envelope layer consumes, including fill
+        information (orders are IOC, so the response is final):
+          fill_count / remaining_count      - integers
+          average_fill_price_cents          - denominated in *order_side* prices
+          status                            - executed | partially_filled | unfilled
+        """
+        log.info("Placing order via SDK (CreateOrderV2): %s", payload)
+        raw = self._sdk.create_order_v2(
+            **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
+        )
+        data = _to_dict(raw)
+        filled = _fp_to_int(data.get("fill_count"))
+        remaining = _fp_to_int(data.get("remaining_count"))
+        if filled > 0 and remaining == 0:
+            status = "executed"
+        elif filled > 0:
+            status = "partially_filled"
+        else:
+            status = "unfilled"
+
+        # average_fill_price is YES-book-denominated; convert back to the
+        # order's own side for callers that think in side prices.
+        avg_yes_cents = parse_dollars_to_cents_int(data.get("average_fill_price"))
+        avg_side_cents = None
+        if avg_yes_cents is not None:
+            avg_side_cents = avg_yes_cents if order_side == "yes" else 100 - avg_yes_cents
+
+        order = {
+            "order_id": data.get("order_id"),
+            "client_order_id": data.get("client_order_id"),
+            "status": status,
+            "fill_count": filled,
+            "remaining_count": remaining,
+            "average_fill_price_cents": avg_side_cents,
+            "average_fee_paid_dollars": data.get("average_fee_paid"),
+        }
+        if status != "executed":
+            log.warning("Order %s: status=%s filled=%d remaining=%d",
+                        order["order_id"], status, filled, remaining)
+        return {"order": order, "raw": data}
 
     def place_order(
         self,
@@ -1017,18 +1127,8 @@ class KalshiClient:
             post_only=bool(post_only),
             client_order_id=client_order_id,
         )
-        log.info("Placing order via SDK: %s", payload)
         try:
-            raw = self._sdk.create_order(**payload)
-            resp = _to_dict(raw)
-            order = resp.get("order", resp)
-            status = (order or {}).get("status") if isinstance(order, dict) else None
-            if status and status not in _ORDER_CREATE_OK_STATUSES:
-                log.warning(
-                    "Order placed but status=%s (expected one of %s): %s",
-                    status, sorted(_ORDER_CREATE_OK_STATUSES), _truncate_for_log(order),
-                )
-            return resp
+            return self._submit_order(payload, order_side=(side or "").lower())
         except Exception as exc:
             log.error("Order placement failed: %s", exc, exc_info=True)
             raise
@@ -1096,22 +1196,18 @@ class KalshiClient:
             post_only=bool(post_only),
             client_order_id=client_order_id,
         )
-        log.info("Placing SELL via SDK: %s", payload)
         try:
-            raw = self._sdk.create_order(**payload)
-            resp = _to_dict(raw)
-            return resp
+            return self._submit_order(payload, order_side=(side or "").lower())
         except Exception as exc:
             log.error("Sell placement failed: %s", exc, exc_info=True)
             raise
 
     def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order by ID."""
+        """Cancel an open order by ID (the SDK only exposes cancel_order_v2 now)."""
         try:
-            raw = self._sdk.cancel_order(order_id=order_id)
-            return _to_dict(raw)
-        except TypeError:
-            raw = self._sdk.cancel_order(order_id)
+            raw = self._sdk.cancel_order_v2(
+                order_id=order_id, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
+            )
             return _to_dict(raw)
         except Exception as exc:
             log.error("cancel_order failed for %s: %s", order_id, exc, exc_info=True)

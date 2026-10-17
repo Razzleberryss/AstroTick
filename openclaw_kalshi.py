@@ -327,13 +327,20 @@ def resolve_live_market_ticker(
             detail_lines.append(f"  ... and {len(filtered_out) - 10} more")
         raise RuntimeError("\n".join(detail_lines))
 
-    candidates.sort(key=lambda m: (m.get("close_time", ""), -(m.get("volume", 0) or 0)))
+    def _volume(m: dict) -> float:
+        # Current API sends fixed-point string volume_fp; 'volume' is legacy.
+        try:
+            return float(m.get("volume_fp") or m.get("volume") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    candidates.sort(key=lambda m: (m.get("close_time", ""), -_volume(m)))
     chosen = candidates[0]
     chosen_ticker = chosen["ticker"]
 
     _debug_print(
         f"RESOLVED: {chosen_ticker} (close_time={chosen.get('close_time')}, "
-        f"volume={chosen.get('volume', 0)}, out of {len(candidates)} candidates)",
+        f"volume={_volume(chosen)}, out of {len(candidates)} candidates)",
         debug,
     )
 
@@ -410,7 +417,7 @@ def cmd_markets(client: KalshiClient, args):
                 "no_ask": m.get("no_ask"),
                 "no_bid": m.get("no_bid"),
                 "last_price": m.get("last_price"),
-                "volume": m.get("volume"),
+                "volume": m.get("volume_fp") or m.get("volume"),
             }
         )
 
@@ -697,6 +704,9 @@ def cmd_buy(client: KalshiClient, args):
     order = api_result.get("order", {}) if api_result else {}
     audit["order_id"] = order.get("order_id")
     audit["order_status"] = order.get("status")
+    audit["fill_count"] = order.get("fill_count")
+    audit["remaining_count"] = order.get("remaining_count")
+    audit["average_fill_price_cents"] = order.get("average_fill_price_cents")
     _out(_success("BUY_PLACED", audit), args.human)
 
 
@@ -781,6 +791,9 @@ def cmd_sell(client: KalshiClient, args):
     order = api_result.get("order", {}) if api_result else {}
     audit["order_id"] = order.get("order_id")
     audit["order_status"] = order.get("status")
+    audit["fill_count"] = order.get("fill_count")
+    audit["remaining_count"] = order.get("remaining_count")
+    audit["average_fill_price_cents"] = order.get("average_fill_price_cents")
     code = "SELL_CLAMPED" if clamped else "SELL_PLACED"
     _out(_success(code, audit, warnings), args.human)
 

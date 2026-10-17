@@ -109,6 +109,9 @@ def buy_envelope(
     order = api_result.get("order", {}) if api_result else {}
     audit["order_id"] = order.get("order_id")
     audit["order_status"] = order.get("status")
+    audit["fill_count"] = order.get("fill_count")
+    audit["remaining_count"] = order.get("remaining_count")
+    audit["average_fill_price_cents"] = order.get("average_fill_price_cents")
     return success_envelope("BUY_PLACED", audit)
 
 
@@ -227,5 +230,8 @@ def sell_envelope(
     order = api_result.get("order", {}) if api_result else {}
     audit["order_id"] = order.get("order_id")
     audit["order_status"] = order.get("status")
+    audit["fill_count"] = order.get("fill_count")
+    audit["remaining_count"] = order.get("remaining_count")
+    audit["average_fill_price_cents"] = order.get("average_fill_price_cents")
     code = "SELL_CLAMPED" if clamped else "SELL_PLACED"
     return success_envelope(code, audit, warnings)

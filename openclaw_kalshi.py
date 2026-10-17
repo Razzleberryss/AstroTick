@@ -713,20 +713,33 @@ def cmd_sell(client: KalshiClient, args):
         _die("INVALID_SIDE", "side must be 'yes' or 'no'")
     if count < 1:
         _die("INVALID_COUNT", "count must be >= 1")
+    # Sells allow the full 1-99c range: the MIN/MAX_CONTRACT_PRICE band is an
+    # entry filter and would otherwise reject stop-loss/take-profit exits.
     if not (1 <= price_cents <= 99):
         _die("INVALID_PRICE_RANGE", "price must be 1-99 (cents)")
-    if not (
-        config.MIN_CONTRACT_PRICE_CENTS
-        <= price_cents
-        <= config.MAX_CONTRACT_PRICE_CENTS
-    ):
-        _die(
-            "PRICE_OUTSIDE_CONFIG_RANGE",
-            f"price {price_cents}c outside allowed range "
-            f"[{config.MIN_CONTRACT_PRICE_CENTS}, {config.MAX_CONTRACT_PRICE_CENTS}]",
-        )
 
     requested_count = count
+    client_order_id = str(uuid.uuid4())
+
+    # Dry-run exits must not depend on live positions (dry-run buys never
+    # create one), so short-circuit before the position lookup.
+    if dry_run:
+        audit = {
+            "action": "SELL",
+            "ticker": ticker,
+            "side": side,
+            "count": requested_count,
+            "requested_count": requested_count,
+            "price_cents": price_cents,
+            "position_held": requested_count,
+            "client_order_id": client_order_id,
+            "mode": "DRY_RUN",
+            "order_id": None,
+            "order_status": None,
+        }
+        _out(_success("SELL_DRY_RUN", audit, []), args.human)
+        return
+
     held = client.contracts_held_on_side(ticker, side)
     if held == 0:
         _die(
@@ -738,9 +751,6 @@ def cmd_sell(client: KalshiClient, args):
     sell_count = min(requested_count, held)
     clamped = sell_count < requested_count
 
-    client_order_id = str(uuid.uuid4())
-    mode = "DRY_RUN" if dry_run else "LIVE"
-
     audit = {
         "action": "SELL",
         "ticker": ticker,
@@ -750,7 +760,7 @@ def cmd_sell(client: KalshiClient, args):
         "price_cents": price_cents,
         "position_held": held,
         "client_order_id": client_order_id,
-        "mode": mode,
+        "mode": "LIVE",
         "order_id": None,
         "order_status": None,
     }
@@ -764,11 +774,6 @@ def cmd_sell(client: KalshiClient, args):
                 f"{side.upper()} position of {held}; clamped to {sell_count}."
             ),
         })
-
-    if dry_run:
-        code = "SELL_CLAMPED" if clamped else "SELL_DRY_RUN"
-        _out(_success(code, audit, warnings), args.human)
-        return
 
     api_result = client.sell_position(
         ticker, side, sell_count, price_cents, dry_run=False,

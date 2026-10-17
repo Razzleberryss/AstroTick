@@ -23,6 +23,19 @@ from kalshi_money import position_average_price_cents
 log = logging.getLogger(__name__)
 
 
+def compute_pnl_cents(side: str, entry_price: int, exit_price: int, size: int) -> int:
+    """
+    Realized PnL in cents for a closed position.
+
+    Entry and exit prices are both denominated in the position's own side
+    (YES prices for a YES position, NO prices for a NO position), so the PnL
+    is (exit - entry) * size for BOTH sides. The *side* parameter is kept so
+    call sites stay explicit about which book the prices came from.
+    """
+    del side  # both sides use side-denominated prices; see docstring
+    return (exit_price - entry_price) * size
+
+
 class RiskManager:
     """Stateful risk guard. One instance lives for the duration of the bot run."""
 
@@ -156,8 +169,10 @@ class RiskManager:
         exit_price: int,
         exit_reason: str,
     ) -> int:
-        pnl_cents = (exit_price - entry_price) * size if side.lower() == "yes" else (entry_price - exit_price) * size
-        # PnL update (reset not needed here, done once per cycle)
+        pnl_cents = compute_pnl_cents(side, entry_price, exit_price, size)
+        # Roll the daily window before accounting, so an exit logged just after
+        # midnight lands in the new day's totals rather than yesterday's.
+        self._reset_daily_if_needed()
         self._daily_realized_pnl_cents += pnl_cents
         row = {
             "timestamp": self._get_current_datetime().isoformat(),

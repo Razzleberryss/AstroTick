@@ -146,10 +146,15 @@ class TestDecideTradeNetEV(unittest.TestCase):
         self.assertEqual(action, "BUY_YES")
 
     def test_fee_formula_uses_ceil(self):
-        # Verify that the fee is at least 1 cent even for tiny C*P*(1-P)
-        # C=1, P=0.01 → 0.07*1*0.01*0.99 = 0.000693 → ceil = 1 cent
-        fee = math.ceil(0.07 * 1 * 0.01 * 0.99)
+        # Fees are ceil(rate * C * P * (1-P)) rounded UP to the next whole cent,
+        # so the dollar-valued product must be scaled by 100 before ceiling.
+        # C=1, P=0.01 → 0.07*1*0.01*0.99 = $0.000693 → 0.0693 cents → ceil = 1 cent
+        fee = math.ceil(0.07 * 1 * 0.01 * 0.99 * 100)
         self.assertEqual(fee, 1)
+        # C=10, P=0.60 → 0.07*10*0.6*0.4 = $0.168 → 16.8 cents → ceil = 17 cents
+        # (the old dollars-as-cents formula computed 1 cent here)
+        fee = math.ceil(0.07 * 10 * 0.60 * 0.40 * 100)
+        self.assertEqual(fee, 17)
 
     def test_net_ev_for_no_side_is_positive(self):
         # Buying NO: market_price=0.85, model_p_yes=0.70 → mispricing=-0.15
@@ -162,8 +167,8 @@ class TestDecideTradeNetEV(unittest.TestCase):
         import math as _math
         P, P_exit = 0.85, 0.5
         ev_gross = (1.0 - 0.70) - (1.0 - P)
-        fee_open = _math.ceil(0.07 * size * P * (1.0 - P))
-        fee_close = _math.ceil(0.07 * size * P_exit * (1.0 - P_exit))
+        fee_open = _math.ceil(0.07 * size * P * (1.0 - P) * 100)
+        fee_close = _math.ceil(0.07 * size * P_exit * (1.0 - P_exit) * 100)
         ev_net = ev_gross - (fee_open + fee_close) / 100.0 / size
         self.assertGreaterEqual(ev_net, cfg.MIN_EXPECTED_NET_PER_CONTRACT)
 

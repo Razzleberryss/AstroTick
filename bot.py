@@ -30,7 +30,7 @@ import colorlog
 
 import config
 from kalshi_client import KalshiClient
-from risk_manager import RiskManager
+from risk_manager import RiskManager, compute_pnl_cents
 from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
 from agent_decision_engine import AgentAction
 import cli_executor
@@ -303,11 +303,7 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
 
     if exit_reason:
         exit_price = max(1, current_price - 1)  # aggressive limit sell
-        pnl_cents = (
-            (exit_price - entry_price) * count
-            if side == "yes"
-            else (entry_price - exit_price) * count
-        )
+        pnl_cents = compute_pnl_cents(side, entry_price, exit_price, count)
         log_trade(
             "EXIT %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc | reason=%s",
             ticker, side, entry_price, exit_price, pnl_cents, exit_reason,
@@ -934,11 +930,7 @@ def _run_once_time_delay(
         entry_price = bot_pos["entry_price"]
         current_price = market.get(f"{side}_bid", entry_price)
         exit_price_order = max(1, current_price - 1)
-        pnl_cents = (
-            (exit_price_order - entry_price) * count
-            if side == "yes"
-            else (entry_price - exit_price_order) * count
-        )
+        pnl_cents = compute_pnl_cents(side, entry_price, exit_price_order, count)
         log_trade(
             "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc",
             ticker, side, entry_price, exit_price_order, pnl_cents,

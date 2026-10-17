@@ -140,20 +140,34 @@ def sell_envelope(
         return failure_envelope("INVALID_SIDE", "side must be 'yes' or 'no'")
     if count < 1:
         return failure_envelope("INVALID_COUNT", "count must be >= 1")
+    # Sells intentionally allow the full 1-99c range: the MIN/MAX_CONTRACT_PRICE
+    # band is an ENTRY filter. Applying it to exits would reject exactly the
+    # stop-loss (price collapsed below the band) and take-profit (price ran
+    # above it) orders that position management depends on.
     if not (1 <= price_cents <= 99):
         return failure_envelope("INVALID_PRICE_RANGE", "price must be 1-99 (cents)")
-    if not (
-        config.MIN_CONTRACT_PRICE_CENTS
-        <= price_cents
-        <= config.MAX_CONTRACT_PRICE_CENTS
-    ):
-        return failure_envelope(
-            "PRICE_OUTSIDE_CONFIG_RANGE",
-            f"price {price_cents}c outside allowed range "
-            f"[{config.MIN_CONTRACT_PRICE_CENTS}, {config.MAX_CONTRACT_PRICE_CENTS}]",
-        )
 
     requested_count = count
+    client_order_id = str(uuid.uuid4())
+
+    # Dry-run exits must not depend on live positions: dry-run buys never create
+    # one, so a held-position lookup here would always fail with NO_POSITION.
+    if dry_run:
+        audit = {
+            "action": "SELL",
+            "ticker": ticker,
+            "side": side,
+            "count": requested_count,
+            "requested_count": requested_count,
+            "price_cents": price_cents,
+            "position_held": requested_count,
+            "client_order_id": client_order_id,
+            "mode": "DRY_RUN",
+            "order_id": None,
+            "order_status": None,
+        }
+        return success_envelope("SELL_DRY_RUN", audit, [])
+
     try:
         held = client.contracts_held_on_side(ticker, side)
     except Exception as exc:
@@ -173,8 +187,6 @@ def sell_envelope(
 
     sell_count = min(requested_count, held)
     clamped = sell_count < requested_count
-    client_order_id = str(uuid.uuid4())
-    mode = "DRY_RUN" if dry_run else "LIVE"
 
     audit = {
         "action": "SELL",
@@ -185,7 +197,7 @@ def sell_envelope(
         "price_cents": price_cents,
         "position_held": held,
         "client_order_id": client_order_id,
-        "mode": mode,
+        "mode": "LIVE",
         "order_id": None,
         "order_status": None,
     }
@@ -199,10 +211,6 @@ def sell_envelope(
                 f"{side.upper()} position of {held}; clamped to {sell_count}."
             ),
         })
-
-    if dry_run:
-        code = "SELL_CLAMPED" if clamped else "SELL_DRY_RUN"
-        return success_envelope(code, audit, warnings)
 
     try:
         api_result = client.sell_position(

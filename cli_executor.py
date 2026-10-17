@@ -29,6 +29,7 @@ from agent_decision_engine import (
     RetryPolicy,
     interpret_cli_response,
 )
+from kalshi_agent_envelope import failure_envelope
 
 log = logging.getLogger("cli_executor")
 
@@ -184,18 +185,17 @@ def execute_with_decision_engine(
                 envelope = envelope_fn()
             except Exception as exc:
                 log.exception("envelope_fn() failed during execute_with_decision_engine")
-                envelope = {
-                    "ok": False,
-                    "code": "ENVELOPE_FN_EXCEPTION",
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "details": {
+                # Build via failure_envelope so the decision flags are complete;
+                # a hand-rolled dict missing requires_human_review reads as
+                # malformed and (incorrectly) halts trading.
+                envelope = failure_envelope(
+                    "ENVELOPE_FN_EXCEPTION",
+                    f"{type(exc).__name__}: {exc}",
+                    details={
                         "exception_type": type(exc).__name__,
                         "exception_message": str(exc),
-                        "retryable": False,
-                        "escalate": True,
-                        "halt_trading": False,
                     },
-                }
+                )
         else:
             envelope = execute_cli(args, timeout=timeout)
         outcome = interpret_cli_response(

@@ -274,11 +274,16 @@ def decide_trade_fee_aware(
     # ── 4. Fee and net EV check ────────────────────────────────────────────────
     # P_exit=0.5 is intentionally the worst-case (maximum-fee) assumption:
     # P*(1-P) peaks at P=0.5, so using 0.5 maximises the estimated close fee,
-    # making the EV filter more conservative and harder to pass.
+    # making the EV filter more conservative and harder to pass. (A position held
+    # to settlement pays no close fee at all, so this over- rather than
+    # under-estimates costs.)
     P_exit = 0.5
-    # Fees are in cents (ceil of formula); convert to dollars for EV comparison
-    fee_open_cents = math.ceil(0.07 * C * P * (1.0 - P))
-    fee_close_cents = math.ceil(0.07 * C * P_exit * (1.0 - P_exit))
+    # Kalshi fee schedule: ceil(rate * C * P * (1-P)) rounded up to the next
+    # cent. rate * C * P * (1-P) is in dollars, so multiply by 100 before
+    # ceiling to get whole cents.
+    fee_rate = getattr(cfg, "KALSHI_FEE_RATE", 0.07)
+    fee_open_cents = math.ceil(fee_rate * C * P * (1.0 - P) * 100.0)
+    fee_close_cents = math.ceil(fee_rate * C * P_exit * (1.0 - P_exit) * 100.0)
     ev_net_per_contract = ev_gross - (fee_open_cents + fee_close_cents) / 100.0 / C
 
     if ev_net_per_contract < cfg.MIN_EXPECTED_NET_PER_CONTRACT:
@@ -584,7 +589,7 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     yes_raw, no_raw = _extract_raw(orderbook)
 
     yes_bid_price, yes_depth = _extract_best_bid_depth(yes_raw)
-    no_bid_price, _          = _extract_best_bid_depth(no_raw)
+    no_bid_price, no_depth   = _extract_best_bid_depth(no_raw)
 
     # YES ask = 1 − best NO bid (standard Kalshi complementary pricing).
     # Fall back to the market-dict value when the NO side is empty.
@@ -630,19 +635,23 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
         )
         return None
 
-    # ── YES depth check ───────────────────────────────────────────────────────
-    if yes_depth < config.MIN_YES_DEPTH:
+    # ── Depth check on the entry side ─────────────────────────────────────────
+    # A position is exited into its own side's bids, so require depth on the
+    # side we are about to enter (MIN_YES_DEPTH for YES, MIN_NO_DEPTH for NO).
+    side_depth = yes_depth if side == "yes" else no_depth
+    side_min_depth = config.MIN_YES_DEPTH if side == "yes" else config.MIN_NO_DEPTH
+    if side_depth < side_min_depth:
         log.info(
-            "YES depth %d < MIN_YES_DEPTH %d — skipping cycle",
-            yes_depth, config.MIN_YES_DEPTH,
+            "%s depth %d < MIN_%s_DEPTH %d — skipping cycle",
+            side.upper(), side_depth, side.upper(), side_min_depth,
         )
         return None
 
     log.info(
         "Liquidity OK: spread=%.4f ($%.2fc) <= MAX_SLIPPAGE %.4f, "
-        "yes_depth=%d >= MIN_YES_DEPTH %d — proceeding",
+        "%s_depth=%d >= MIN_%s_DEPTH %d — proceeding",
         effective_spread, effective_spread * 100, config.MAX_SLIPPAGE,
-        yes_depth, config.MIN_YES_DEPTH,
+        side, side_depth, side.upper(), side_min_depth,
     )
 
     # Map composite score to a model probability estimate.

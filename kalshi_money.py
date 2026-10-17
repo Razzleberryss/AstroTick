@@ -36,49 +36,6 @@ def parse_dollars_to_cents_int(value: Any) -> Optional[int]:
     return int(cents)
 
 
-def get_fill_price_cents(fill: dict, side: str) -> Optional[int]:
-    """Best-effort fill price in cents using yes_price_dollars / no_price_dollars, then legacy int fields."""
-    side_l = (side or "").lower()
-    if side_l == "yes":
-        c = parse_dollars_to_cents_int(fill.get("yes_price_dollars"))
-        if c is not None:
-            return c
-        p = fill.get("yes_price")
-        if p is not None:
-            try:
-                return int(p)
-            except (TypeError, ValueError):
-                return None
-        return None
-    if side_l == "no":
-        c = parse_dollars_to_cents_int(fill.get("no_price_dollars"))
-        if c is not None:
-            return c
-        p = fill.get("no_price")
-        if p is not None:
-            try:
-                return int(p)
-            except (TypeError, ValueError):
-                return None
-        return None
-    return None
-
-
-def fill_fee_cents(fill: dict) -> Optional[int]:
-    """Parse fee_cost / fee_cost_dollars on a fill if present (whole cents)."""
-    d = parse_dollars_to_cents_int(fill.get("fee_cost_dollars"))
-    if d is not None:
-        return d
-    fc = fill.get("fee_cost")
-    if fc is None:
-        return None
-    try:
-        return int(fc)
-    except (TypeError, ValueError):
-        c = parse_dollars_to_cents_int(fc)
-        return c
-
-
 def position_count(pos: dict) -> float:
     """
     Signed contract count for a market_positions row.

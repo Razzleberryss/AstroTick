@@ -203,37 +203,32 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # ── CLI execution wrappers ────────────────────────────────────────────────────────────────────
 
 def _cli_buy(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
-    """Execute a buy via in-process envelope or CLI subprocess + decision engine."""
-    if config.INPROCESS_KALSHI_ORDERS:
-        from kalshi_inprocess_orders import buy_envelope
+    """Execute a buy via an in-process order envelope + decision engine.
 
-        def _fn():
-            return buy_envelope(
-                client, ticker, side, count, price_cents, dry_run=dry_run,
-            )
+    (The old alternative — spawning openclaw_kalshi.py per order — was removed:
+    it resolved tickers against its own default series, so every bot order was
+    rejected with INVALID_TICKER. openclaw_kalshi.py remains as a manual CLI.)
+    """
+    from kalshi_inprocess_orders import buy_envelope
 
-        return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
-    args = ["buy", "--ticker", ticker, side, str(count), str(price_cents)]
-    if dry_run:
-        args.append("--dry-run")
-    return cli_executor.execute_with_decision_engine(args)
+    def _fn():
+        return buy_envelope(
+            client, ticker, side, count, price_cents, dry_run=dry_run,
+        )
+
+    return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
 
 
 def _cli_sell(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
-    """Execute a sell via in-process envelope or CLI subprocess + decision engine."""
-    if config.INPROCESS_KALSHI_ORDERS:
-        from kalshi_inprocess_orders import sell_envelope
+    """Execute a sell via an in-process order envelope + decision engine."""
+    from kalshi_inprocess_orders import sell_envelope
 
-        def _fn():
-            return sell_envelope(
-                client, ticker, side, count, price_cents, dry_run=dry_run,
-            )
+    def _fn():
+        return sell_envelope(
+            client, ticker, side, count, price_cents, dry_run=dry_run,
+        )
 
-        return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
-    args = ["sell", "--ticker", ticker, side, str(count), str(price_cents)]
-    if dry_run:
-        args.append("--dry-run")
-    return cli_executor.execute_with_decision_engine(args)
+    return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
 
 # ── Position Management ────────────────────────────────────────────────────────────────────────
 def _record_exit(risk: RiskManager, closed: dict) -> None:
@@ -329,7 +324,6 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
     settlement value so their PnL reaches the daily-loss accounting instead of
     silently bypassing it. Yields a dict for every position (or part) exited.
     """
-    global _halt_trading
     active_ticker = market["ticker"]
 
     for ticker, pos in risk.get_open_positions().items():
@@ -1168,7 +1162,6 @@ def main():
     log.info(" Max Daily Loss : %sc", config.MAX_DAILY_LOSS_CENTS)
     log.info(" Max Daily Trades: %s", config.MAX_DAILY_TRADES)
     log.info(" Use WebSocket: %s", config.USE_WEBSOCKET_ORDERBOOK)
-    log.info(" In-process orders: %s", config.INPROCESS_KALSHI_ORDERS)
     log.info("=" * 60)
     if config.KALSHI_ENV == "prod" and not config.DRY_RUN:
         log.warning("!" * 60)

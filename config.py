@@ -180,11 +180,6 @@ LOOP_INTERVAL_SECONDS: int = POLL_INTERVAL_SECONDS  # alias used in bot.py
 # How many seconds before contract close_time to trigger the expiry exit
 EXPIRY_EXIT_SECONDS: int = int(os.getenv("EXPIRY_EXIT_SECONDS", "120"))
 
-# =============================================================================
-# When True, bot buy/sell uses kalshi_inprocess_orders (same envelopes as CLI)
-# instead of spawning openclaw_kalshi.py per order.
-INPROCESS_KALSHI_ORDERS: bool = os.getenv("INPROCESS_KALSHI_ORDERS", "true").lower() == "true"
-
 # Skip writing dashboard_state.json if unchanged and last write was within this
 # many seconds (0 = write every cycle).
 DASHBOARD_MIN_WRITE_SECONDS: float = float(os.getenv("DASHBOARD_MIN_WRITE_SECONDS", "2"))

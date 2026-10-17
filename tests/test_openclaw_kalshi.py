@@ -963,21 +963,31 @@ class TestDecisionPolicyCoverage(unittest.TestCase):
     without decision semantics."""
 
     def test_all_emitted_codes_have_policy_entries(self):
-        source = inspect.getsource(cli)
-        direct = re.findall(r'_(?:success|failure|die)\(\s*"([A-Z][A-Z_]+)"', source)
+        import kalshi_inprocess_orders
+        from kalshi_agent_envelope import DECISION_POLICY
+
+        # The CLI delegates buys/sells to kalshi_inprocess_orders, so scan both
+        # modules for emitted codes.
+        source = inspect.getsource(cli) + inspect.getsource(kalshi_inprocess_orders)
+        direct = re.findall(
+            r'(?:_success|_failure|_die|success_envelope|failure_envelope)\(\s*\n?\s*"([A-Z][A-Z_]+)"',
+            source,
+        )
         assigned = re.findall(r'\bcode\s*=\s*"([A-Z][A-Z_]+)"', source)
         emitted = set(direct + assigned)
         self.assertGreaterEqual(
             len(emitted), 10, "suspiciously few codes found in source"
         )
-        missing = emitted - set(cli.DECISION_POLICY.keys())
+        missing = emitted - set(DECISION_POLICY.keys())
         self.assertEqual(
             missing, set(),
             f"Response codes emitted by CLI but missing from DECISION_POLICY: {missing}",
         )
 
     def test_policy_keys_are_well_formed(self):
-        for code, values in cli.DECISION_POLICY.items():
+        from kalshi_agent_envelope import DECISION_POLICY
+
+        for code, values in DECISION_POLICY.items():
             self.assertIsInstance(code, str, f"policy key must be str: {code!r}")
             self.assertEqual(code, code.upper(), f"policy key must be uppercase: {code}")
             self.assertEqual(len(values), 3, f"policy tuple must be 3-tuple: {code}")

@@ -444,64 +444,19 @@ def _extract_best_bid_depth(raw_array) -> tuple:
     """
     Return ``(best_bid_price_dollars, best_bid_count)`` from a raw orderbook side.
 
-    Each entry may be one of:
-      - ``[price, count]`` where *price* is a string dollar (``"0.55"``),
-        a float dollar (``0.55``), or an integer cent value (``55``).
-      - A dict with ``"price"`` / ``"price_dollars"`` and ``"size"`` / ``"count"`` keys.
-
-    Returns ``(None, 0)`` when the array is empty or completely unparseable.
+    Thin wrapper around the shared orderbook_utils parser (one parser for all
+    modules); zero-size levels are skipped. Returns ``(None, 0)`` when the
+    array is empty or completely unparseable.
     """
     if not raw_array or not isinstance(raw_array, list):
         return None, 0
 
-    best_price: Optional[float] = None
-    best_count: int = 0
+    from orderbook_utils import parse_bid_array
 
-    for entry in raw_array:
-        price = None
-        count = 0
-
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-            price, count = entry[0], entry[1]
-        elif isinstance(entry, dict):
-            price = entry.get("price") or entry.get("price_dollars")
-            count = entry.get("size") if entry.get("size") is not None else entry.get("count", 0)
-        else:
-            continue
-
-        # Convert price to the 0-1 dollar range
-        try:
-            if isinstance(price, str):
-                price_d = float(price)
-                if price_d > 1.0:       # treat as cents by mistake
-                    price_d /= 100.0
-            elif isinstance(price, float):
-                price_d = price if price <= 1.0 else price / 100.0
-            elif isinstance(price, int):
-                # Integer prices from Kalshi are always in cents (1=1¢, 99=99¢).
-                # Always divide by 100 to convert to dollars.
-                price_d = price / 100.0
-            else:
-                price_d = float(price)
-                if price_d > 1.0:
-                    price_d /= 100.0
-        except (TypeError, ValueError):
-            continue
-
-        try:
-            count_i = int(float(count))
-        except (TypeError, ValueError):
-            count_i = 0
-
-        if count_i <= 0:
-            continue
-
-        # Keep the highest-priced (best bid) level
-        if best_price is None or price_d > best_price:
-            best_price = price_d
-            best_count = count_i
-
-    return best_price, best_count
+    for price_cents, count in parse_bid_array(raw_array):
+        if count > 0:
+            return price_cents / 100.0, count
+    return None, 0
 
 
 def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:

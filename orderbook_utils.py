@@ -12,11 +12,15 @@ def to_price_cents(value) -> int:
     """
     Convert price value to integer cents.
 
-    Handles both string dollar amounts ("0.52") and integer cents (52).
+    Handles string dollar amounts ("0.52"), float dollars in (0, 1]
+    (0.52 -> 52), float cents (52.0 -> 52), and integer cents (52).
     """
     if isinstance(value, str):
         # round() avoids float artifacts (e.g. "0.5800" -> 57 with bare int(float*100))
         return int(round(float(value) * 100))
+    if isinstance(value, float):
+        # A float at or below 1.0 is a dollar price; larger floats are cents.
+        return int(round(value * 100)) if value <= 1.0 else int(round(value))
     return int(value)
 
 
@@ -42,10 +46,7 @@ def parse_bid_array(bid_array, max_levels: Optional[int] = None) -> List[Tuple[i
         return []
 
     parsed = []
-    # Limit iteration if max_levels specified (performance optimization)
-    items = bid_array[:max_levels] if max_levels else bid_array
-
-    for entry in items:
+    for entry in bid_array:
         if isinstance(entry, dict):
             raw_price = entry.get("price")
             if raw_price is None:
@@ -76,9 +77,14 @@ def parse_bid_array(bid_array, max_levels: Optional[int] = None) -> List[Tuple[i
                 # Skip malformed entries
                 continue
 
-    # Sort by price descending (highest price = best bid); skip for 0–1 entries
+    # Sort by price descending (highest price = best bid); skip for 0–1 entries.
+    # Sorting must happen BEFORE the max_levels cut: REST books arrive in
+    # ascending price order, so slicing the raw array first would keep the
+    # worst levels and drop the best bid.
     if len(parsed) > 1:
         parsed.sort(key=lambda x: x[0], reverse=True)
+    if max_levels:
+        parsed = parsed[:max_levels]
     return parsed
 
 

@@ -13,12 +13,10 @@ blast radius while migrating from a hand-rolled REST client to:
 
 from __future__ import annotations
 
-import datetime
 import logging
 import random
 import time
 import uuid
-from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Optional
@@ -30,7 +28,6 @@ from kalshi_money import (
     parse_dollars_to_cents_int,
     position_count,
 )
-import requests
 
 try:
     from kalshi_python_sync import Configuration as _SdkConfiguration
@@ -49,26 +46,6 @@ class _NoopSdk:
         )
 
 log = logging.getLogger(__name__)
-
-_LOG_BODY_MAX_LEN = 500
-
-
-def _truncate_for_log(text: Optional[str], max_len: int = _LOG_BODY_MAX_LEN) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + f"... [truncated, {len(text)} chars]"
-
-
-@dataclass
-class HistoricalCutoffs:
-    # Retained for backward compatibility. The SDK supports historical endpoints,
-    # but this repo only uses these cutoffs in optional debug helpers.
-    market_settled_ts: datetime.datetime
-    trades_created_ts: datetime.datetime
-    orders_updated_ts: datetime.datetime
 
 
 def _pick_trade_api_host() -> str:
@@ -157,12 +134,6 @@ class KalshiClient:
     def __init__(self):
         self.base_url = _pick_trade_api_host()
         self.api_key_id = config.KALSHI_API_KEY_ID
-        self._cutoffs: Optional[HistoricalCutoffs] = None
-        self._cutoffs_fetched_at: Optional[datetime.datetime] = None
-        # Retain a requests.Session for legacy tests that validate retry behavior.
-        # The trading bot itself uses the SDK for all network calls.
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
 
         # Initialize SDK client with defensive logging.
         try:
@@ -266,365 +237,8 @@ class KalshiClient:
             "ConnectionError",
         )
 
-    # ── Legacy request helper (tests rely on this) ─────────────────────────────────────────────
-    def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> dict:
-        """
-        Legacy helper retained for unit tests and a few historical utilities.
-
-        NOTE: Production code paths should prefer SDK methods.
-        """
-        url = (getattr(config, "BASE_URL", self.base_url) or self.base_url) + path
-
-        last_exc: Exception = RuntimeError("No attempts made")
-        max_attempts = 1 + max(0, int(getattr(config, "REQUEST_MAX_RETRIES", 0)))
-        for attempt in range(max_attempts):
-            try:
-                resp = self.session.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json,
-                    timeout=int(getattr(config, "REQUEST_TIMEOUT_SECONDS", 5)),
-                )
-
-                if not resp.ok:
-                    try:
-                        error_data = resp.json()
-                        error_code = error_data.get("error", {}).get("code", "unknown")
-                        error_msg = error_data.get("error", {}).get("message", resp.text)
-                        log.error(
-                            "Kalshi API error %s %s -> HTTP %s: code=%s message=%s",
-                            method, path, resp.status_code, error_code,
-                            _truncate_for_log(str(error_msg)),
-                        )
-                    except Exception:
-                        log.error(
-                            "Kalshi API error %s %s -> HTTP %s: %s",
-                            method, path, resp.status_code, _truncate_for_log(resp.text),
-                        )
-                    resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else 0
-                if status < 500:
-                    raise
-                last_exc = exc
-                log.warning(
-                    "Server error %s %s status=%s (attempt %d/%d)",
-                    method, path, status, attempt + 1, max_attempts,
-                )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                last_exc = exc
-                log.warning(
-                    "Transient error %s %s (attempt %d/%d): %s",
-                    method, path, attempt + 1, max_attempts, exc,
-                )
-
-            if attempt < max_attempts - 1:
-                backoff = random.uniform(0.1, max(0.2, 2 ** attempt))
-                log.info("Retrying in %.2fs...", backoff)
-                time.sleep(backoff)
-
-        log.error(
-            "Kalshi API %s %s failed after %d attempt(s): %s",
-            method, path, max_attempts, last_exc,
-        )
-        raise last_exc
-
-    # ── Historical helpers ───────────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _ensure_utc_datetime(ts: datetime.datetime) -> datetime.datetime:
-        if ts.tzinfo is None:
-            return ts.replace(tzinfo=datetime.timezone.utc)
-        return ts.astimezone(datetime.timezone.utc)
-
-    @classmethod
-    def _parse_datetime_to_utc(cls, raw_ts, field_name: str) -> datetime.datetime:
-        if isinstance(raw_ts, datetime.datetime):
-            return cls._ensure_utc_datetime(raw_ts)
-        if isinstance(raw_ts, (int, float)):
-            return datetime.datetime.fromtimestamp(raw_ts, tz=datetime.timezone.utc)
-        if isinstance(raw_ts, str):
-            cleaned = raw_ts.strip()
-            if cleaned.endswith("Z"):
-                cleaned = cleaned[:-1] + "+00:00"
-            try:
-                parsed = datetime.datetime.fromisoformat(cleaned)
-                return cls._ensure_utc_datetime(parsed)
-            except ValueError:
-                try:
-                    return datetime.datetime.fromtimestamp(float(cleaned), tz=datetime.timezone.utc)
-                except ValueError as exc:
-                    raise ValueError(f"Could not parse datetime field '{field_name}': {raw_ts}") from exc
-        raise ValueError(f"Unsupported datetime type for '{field_name}': {type(raw_ts)}")
-
-    @classmethod
-    def _to_unix_ts(cls, ts: datetime.datetime) -> int:
-        return int(cls._ensure_utc_datetime(ts).timestamp())
-
-    def _fetch_paginated_list(self, fetch_fn, list_key: str, params: dict | None = None) -> list[dict]:
-        """
-        Generic cursor pagination helper for SDK list endpoints.
-
-        fetch_fn should accept **params and return an object/dict with:
-          - list_key: list[dict]
-          - cursor: str | None
-        """
-        out: list[dict] = []
-        req_params = dict(params or {})
-        seen_cursors: set[str] = set()
-
-        while True:
-            raw = fetch_fn(**req_params)
-            data = _to_dict(raw)
-            rows = data.get(list_key, []) or []
-            if isinstance(rows, list):
-                out.extend(rows)
-            cursor = data.get("cursor")
-            if not cursor:
-                break
-            if cursor in seen_cursors:
-                log.warning("Stopping pagination due to repeated cursor '%s'", cursor)
-                break
-            seen_cursors.add(cursor)
-            req_params["cursor"] = cursor
-
-        return out
-
-    def _get_historical_cutoffs(self, force_refresh: bool = False) -> HistoricalCutoffs:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if (
-            not force_refresh
-            and self._cutoffs is not None
-            and self._cutoffs_fetched_at is not None
-            and (now_utc - self._cutoffs_fetched_at) < datetime.timedelta(hours=1)
-        ):
-            return self._cutoffs
-
-        # SDK method naming is stable for this endpoint; normalize to dict regardless.
-        data = _to_dict(self._sdk.get_historical_cutoff())
-        cutoffs = HistoricalCutoffs(
-            market_settled_ts=self._parse_datetime_to_utc(data["market_settled_ts"], "market_settled_ts"),
-            trades_created_ts=self._parse_datetime_to_utc(data["trades_created_ts"], "trades_created_ts"),
-            orders_updated_ts=self._parse_datetime_to_utc(data["orders_updated_ts"], "orders_updated_ts"),
-        )
-        self._cutoffs = cutoffs
-        self._cutoffs_fetched_at = now_utc
-        return cutoffs
-
-    def _fill_time(self, fill: dict) -> datetime.datetime:
-        created_time = fill.get("created_time")
-        if created_time is not None:
-            return self._parse_datetime_to_utc(created_time, "fill.created_time")
-        ts = fill.get("ts")
-        if ts is not None:
-            return self._parse_datetime_to_utc(ts, "fill.ts")
-        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-    def _order_update_time(self, order: dict) -> datetime.datetime:
-        last_update_time = order.get("last_update_time")
-        if last_update_time is not None:
-            return self._parse_datetime_to_utc(last_update_time, "order.last_update_time")
-        updated_time = order.get("updated_time")
-        if updated_time is not None:
-            return self._parse_datetime_to_utc(updated_time, "order.updated_time")
-        updated_ts = order.get("updated_ts")
-        if updated_ts is not None:
-            return self._parse_datetime_to_utc(updated_ts, "order.updated_ts")
-        created_time = order.get("created_time")
-        if created_time is not None:
-            return self._parse_datetime_to_utc(created_time, "order.created_time")
-        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-    def _fetch_live_fills(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        params = {
-            "min_ts": self._to_unix_ts(start_ts),
-            "max_ts": self._to_unix_ts(end_ts),
-            "limit": 200,
-        }
-        return self._fetch_paginated_list(self._sdk.get_fills, "fills", params=params)
-
-    def _fetch_historical_fills(self, end_ts: datetime.datetime) -> list[dict]:
-        params = {"max_ts": self._to_unix_ts(end_ts), "limit": 200}
-        return self._fetch_paginated_list(self._sdk.get_historical_fills, "fills", params=params)
-
-    def _fetch_live_orders(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        params = {
-            "min_ts": self._to_unix_ts(start_ts),
-            "max_ts": self._to_unix_ts(end_ts),
-            "limit": 200,
-        }
-        return self._fetch_paginated_list(self._sdk.get_orders, "orders", params=params)
-
-    def _fetch_historical_orders(self, end_ts: datetime.datetime) -> list[dict]:
-        params = {"max_ts": self._to_unix_ts(end_ts), "limit": 200}
-        return self._fetch_paginated_list(self._sdk.get_historical_orders, "orders", params=params)
-
     # ── Public API methods ────────────────────────────────────────────────────────────────────────
     # New SDK-style public methods (limit-based), plus compatibility shims.
-    def get_fills(self, *args: Any, limit: Optional[int] = None) -> list[dict]:
-        """Return recent fills, or support legacy get_fills(start_ts, end_ts)."""
-        try:
-            if len(args) == 2:
-                start_ts, end_ts = args
-                if not (
-                    isinstance(start_ts, datetime.datetime)
-                    and isinstance(end_ts, datetime.datetime)
-                ):
-                    raise TypeError(
-                        "get_fills(start_ts, end_ts) requires datetime arguments"
-                    )
-                return self.get_fills_in_range(start_ts, end_ts)
-            if len(args) > 1:
-                raise TypeError(
-                    "get_fills accepts either (limit) or (start_ts, end_ts)"
-                )
-
-            effective_limit = limit if limit is not None else (args[0] if args else 100)
-            raw = self._sdk.get_fills(limit=int(effective_limit))
-            data = _to_dict(raw)
-            return data.get("fills", []) or []
-        except Exception as exc:
-            log.error("get_fills failed: %s", exc, exc_info=True)
-            raise
-
-    def get_orders(self, limit: int = 100) -> list[dict]:
-        """Return recent orders (portfolio) as a list of dicts."""
-        try:
-            raw = self._sdk.get_orders(limit=int(limit))
-            data = _to_dict(raw)
-            return data.get("orders", []) or []
-        except Exception as exc:
-            log.error("get_orders failed: %s", exc, exc_info=True)
-            raise
-
-    # Compatibility: keep the previous time-ranged methods available under old names.
-    def get_fills_in_range(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        """
-        Return fills across live + historical data for [start_ts, end_ts].
-        """
-        start_utc = self._ensure_utc_datetime(start_ts)
-        end_utc = self._ensure_utc_datetime(end_ts)
-        if end_utc < start_utc:
-            raise ValueError("end_ts must be greater than or equal to start_ts")
-
-        cutoffs = self._get_historical_cutoffs()
-        cutoff = cutoffs.trades_created_ts
-
-        fills: list[dict] = []
-
-        # Historical segment: [start, min(end, cutoff))
-        hist_end = min(end_utc, cutoff)
-        if start_utc < hist_end:
-            hist_rows = self._fetch_historical_fills(hist_end)
-            fills.extend(
-                f
-                for f in hist_rows
-                if start_utc <= self._fill_time(f) < hist_end
-            )
-
-        # Live segment: [max(start, cutoff), end]
-        live_start = max(start_utc, cutoff)
-        if live_start <= end_utc:
-            live_rows = self._fetch_live_fills(live_start, end_utc)
-            fills.extend(
-                f
-                for f in live_rows
-                if live_start <= self._fill_time(f) <= end_utc
-            )
-
-        fills.sort(key=self._fill_time)
-        return fills
-
-    def get_orders_in_range(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        """
-        Return orders across live + historical data for [start_ts, end_ts].
-        """
-        start_utc = self._ensure_utc_datetime(start_ts)
-        end_utc = self._ensure_utc_datetime(end_ts)
-        if end_utc < start_utc:
-            raise ValueError("end_ts must be greater than or equal to start_ts")
-
-        cutoffs = self._get_historical_cutoffs()
-        cutoff = cutoffs.orders_updated_ts
-
-        orders: list[dict] = []
-
-        # Active/resting orders are always in /portfolio/orders.
-        live_rows = self._fetch_live_orders(start_utc, end_utc)
-        orders.extend(
-            o
-            for o in live_rows
-            if start_utc <= self._order_update_time(o) <= end_utc
-        )
-
-        # Historical orders are canceled/executed orders with update time before cutoff.
-        hist_end = min(end_utc, cutoff)
-        if start_utc < hist_end:
-            hist_rows = self._fetch_historical_orders(hist_end)
-            orders.extend(
-                o
-                for o in hist_rows
-                if start_utc <= self._order_update_time(o) < hist_end
-            )
-
-        # De-duplicate by order_id in case APIs overlap at boundary conditions.
-        # Cache update times to avoid re-parsing timestamps on every comparison.
-        deduped_by_id: dict[str, dict] = {}
-        deduped_update_times: dict[str, datetime.datetime] = {}
-        for order in orders:
-            order_id = order.get("order_id")
-            if order_id:
-                order_time = self._order_update_time(order)
-                if order_id not in deduped_update_times or order_time >= deduped_update_times[order_id]:
-                    deduped_by_id[order_id] = order
-                    deduped_update_times[order_id] = order_time
-                continue
-            deduped_by_id[f"_anon_{len(deduped_by_id)}"] = order
-
-        merged = list(deduped_by_id.values())
-        merged.sort(key=self._order_update_time)
-        return merged
-
-    def get_market_with_history(self, ticker: str) -> dict:
-        """
-        Placeholder: route between live GET /markets/{ticker} and historical
-        market/candle endpoints using GET /historical/cutoff market_settled_ts
-        when the contract is settled. For now this is a thin alias of get_market().
-        """
-        return self.get_market(ticker)
-
-    def debug_historical_cutoffs(self) -> None:
-        """
-        Log current historical cutoffs and run a small fill sample around cutoff.
-        """
-        cutoffs = self._get_historical_cutoffs(force_refresh=True)
-        log.info(
-            "Historical cutoffs: market_settled_ts=%s trades_created_ts=%s orders_updated_ts=%s",
-            cutoffs.market_settled_ts.isoformat(),
-            cutoffs.trades_created_ts.isoformat(),
-            cutoffs.orders_updated_ts.isoformat(),
-        )
-
-        sample_start = cutoffs.trades_created_ts - datetime.timedelta(minutes=5)
-        sample_end = cutoffs.trades_created_ts + datetime.timedelta(minutes=5)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        sample_end = min(sample_end, now_utc)
-
-        if sample_start >= sample_end:
-            return
-
-        try:
-            sample_fills = self.get_fills(sample_start, sample_end)
-            log.info(
-                "Historical cutoff sample fills [%s, %s]: %d rows",
-                sample_start.isoformat(),
-                sample_end.isoformat(),
-                len(sample_fills),
-            )
-        except Exception as exc:
-            log.warning("debug_historical_cutoffs sample fetch failed: %s", exc)
-
     def get_balance(self) -> float:
         """
         Return available balance in dollars.
@@ -888,34 +502,6 @@ class KalshiClient:
             log.error("get_positions failed: %s", exc, exc_info=True)
             raise
 
-    def get_settlements(self, params: Optional[dict] = None) -> list[dict]:
-        """Portfolio settlements (settled positions / payouts). Pass-through query params (pagination, filters) as supported by the API."""
-        req = dict(params or {})
-        req.setdefault("limit", 200)
-        return self._fetch_paginated_list(self._sdk.get_settlements, "settlements", params=req)
-
-    def get_account_limits(self) -> dict:
-        """GET /account/limits — trading / account limits for the authenticated user."""
-        return _to_dict(self._sdk.get_account_limits())
-
-    def get_markets_orderbooks(self, tickers: list[str]) -> dict[str, dict]:
-        """
-        GET /markets/orderbooks for up to 100 tickers per request.
-        Returns ticker -> {"ticker", "orderbook_fp", ...} rows (suitable for orderbook_utils.extract_raw_arrays).
-        """
-        out: dict[str, dict] = {}
-        if not tickers:
-            return out
-        for i in range(0, len(tickers), 100):
-            chunk = tickers[i : i + 100]
-            # SDK expects repeated 'tickers' query params; accept list.
-            data = _to_dict(self._sdk.get_markets_orderbooks(tickers=chunk))
-            for row in (data.get("orderbooks", []) or []):
-                t = row.get("ticker")
-                if t:
-                    out[t] = row
-        return out
-
     def contracts_held_on_side(self, ticker: str, side: str) -> int:
         """
         Return non-negative contract count held on side for ticker, or 0.
@@ -937,28 +523,6 @@ class KalshiClient:
             if side == "no" and pos < 0:
                 return int(abs(pos))
         return 0
-
-    def place_order_yes(
-        self, market_id: str, quantity: int, price: int, dry_run: bool = True
-    ) -> Optional[dict]:
-        return self._place_buy_order(market_id, "yes", quantity, price, dry_run)
-
-    def place_order_no(
-        self, market_id: str, quantity: int, price: int, dry_run: bool = True
-    ) -> Optional[dict]:
-        return self._place_buy_order(market_id, "no", quantity, price, dry_run)
-
-    def _place_buy_order(
-        self, market_id: str, side: str, quantity: int, price: int, dry_run: bool
-    ) -> Optional[dict]:
-        self._ensure_btc_market(market_id)
-        if dry_run:
-            log.info(
-                "[DRY RUN] Would place BUY %s %s x%d @ %dc",
-                side.upper(), market_id, quantity, price
-            )
-            return None
-        return self.buy_yes(market_id, quantity, price, dry_run=False) if side == "yes" else self.buy_no(market_id, quantity, price, dry_run=False)
 
     def sell_position(
         self,

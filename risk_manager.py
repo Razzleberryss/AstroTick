@@ -27,7 +27,7 @@ from kalshi_money import (
 log = logging.getLogger(__name__)
 
 
-def compute_pnl_cents(side: str, entry_price: int, exit_price: int, size: int) -> int:
+def compute_pnl_cents(side: str, entry_price: int, exit_price: int, size: "int | float") -> int:
     """
     Realized PnL in cents for a closed position.
 
@@ -35,9 +35,11 @@ def compute_pnl_cents(side: str, entry_price: int, exit_price: int, size: int) -
     (YES prices for a YES position, NO prices for a NO position), so the PnL
     is (exit - entry) * size for BOTH sides. The *side* parameter is kept so
     call sites stay explicit about which book the prices came from.
+    Size may be fractional (Kalshi fills in 0.01-contract increments); the
+    result is rounded to whole cents.
     """
     del side  # both sides use side-denominated prices; see docstring
-    return (exit_price - entry_price) * size
+    return int(round((exit_price - entry_price) * size))
 
 
 class RiskManager:
@@ -147,7 +149,7 @@ class RiskManager:
         self,
         market: str,
         side: str,
-        size: int,
+        size: "int | float",
         entry_price: int,
     ) -> None:
         # Daily count increment (reset already done in approve_trade)
@@ -168,7 +170,7 @@ class RiskManager:
         self,
         market: str,
         side: str,
-        size: int,
+        size: "int | float",
         entry_price: int,
         exit_price: int,
         exit_reason: str,
@@ -268,7 +270,7 @@ class RiskManager:
         self,
         ticker: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         entry_price: int,
     ) -> None:
         """Record a position opened by this bot so we can manage it later."""
@@ -279,7 +281,7 @@ class RiskManager:
             "entry_price": entry_price,
         }
         log.debug(
-            "Tracking new position: %s %s x%d @ %dc",
+            "Tracking new position: %s %s x%s @ %dc",
             ticker, side, quantity, entry_price,
         )
 
@@ -288,19 +290,19 @@ class RiskManager:
         self._open_positions.pop(ticker, None)
         log.debug("Removed closed position from tracking: %s", ticker)
 
-    def reduce_position(self, ticker: str, closed_quantity: int) -> None:
+    def reduce_position(self, ticker: str, closed_quantity: "int | float") -> None:
         """
         Shrink a tracked position after a partial exit fill; remove it entirely
-        once nothing remains.
+        once less than 0.01 contract (Kalshi's granularity) remains.
         """
         pos = self._open_positions.get(ticker)
         if pos is None:
             return
-        remaining = pos["quantity"] - closed_quantity
-        if remaining > 0:
+        remaining = round(pos["quantity"] - closed_quantity, 2)
+        if remaining >= 0.01:
             pos["quantity"] = remaining
             log.debug(
-                "Reduced tracked position %s by %d; %d remaining",
+                "Reduced tracked position %s by %s; %s remaining",
                 ticker, closed_quantity, remaining,
             )
         else:

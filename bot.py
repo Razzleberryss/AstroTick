@@ -247,19 +247,22 @@ def _record_exit(risk: RiskManager, closed: dict) -> None:
     )
 
 
-def _order_fill_info(envelope: dict, requested: int, submitted_price: int) -> tuple[int, int]:
+def _order_fill_info(envelope: dict, requested: "int | float", submitted_price: int) -> tuple:
     """
     Extract (filled_count, fill_price_cents) from an order envelope.
 
-    Live CreateOrderV2 responses carry the exact IOC fill; dry-run envelopes
-    carry none, so treat them as fully filled at the submitted price.
+    Live CreateOrderV2 responses carry the exact IOC fill, which can be
+    FRACTIONAL (0.01-contract granularity) even for whole-contract orders, so
+    the count is kept as a float — flooring would leave real sub-contract
+    exposure untracked. Dry-run envelopes carry no fill info, so treat them as
+    fully filled at the submitted price.
     """
     result = (envelope or {}).get("result", {}) or {}
     filled = result.get("fill_count")
     if filled is None:
         return requested, submitted_price
     try:
-        filled = int(filled)
+        filled = round(float(filled), 2)
     except (TypeError, ValueError):
         return requested, submitted_price
     price = result.get("average_fill_price_cents") or submitted_price
@@ -439,7 +442,7 @@ def _manage_single_position(
             )
             return
         filled, fill_price = _order_fill_info(_env, count, exit_price)
-        if filled < 1:
+        if filled < 0.01:
             log.warning(
                 "Exit order for %s did not fill (IOC); keeping position tracked for retry",
                 ticker,
@@ -447,7 +450,7 @@ def _manage_single_position(
             return
         pnl_cents = compute_pnl_cents(side, entry_price, fill_price, filled)
         log_trade(
-            "EXIT %s | side=%s | entry=%dc | exit=%dc | filled=%d/%d | pnl=%+dc | reason=%s",
+            "EXIT %s | side=%s | entry=%dc | exit=%dc | filled=%s/%s | pnl=%+dc | reason=%s",
             ticker, side, entry_price, fill_price, filled, count, pnl_cents, exit_reason,
         )
         yield {
@@ -457,7 +460,7 @@ def _manage_single_position(
             "entry_price": entry_price,
             "exit_price": fill_price,
             "exit_reason": exit_reason,
-            "unfilled": max(0, count - filled),
+            "unfilled": max(0.0, round(count - filled, 2)),
         }
 
 # ── Core bot loop ─────────────────────────────────────────────────────────────────────────────
@@ -928,11 +931,11 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     # 8. Track only what actually filled (orders are IOC: the response is final;
     # recording the requested size would create phantom positions on no-fill).
     filled, fill_price = _order_fill_info(envelope, contracts, sig.price_cents)
-    if filled < 1:
+    if filled < 0.01:
         log.info("BUY %s did not fill (IOC) — no position opened this cycle", ticker)
         return False
     if filled < contracts:
-        log.info("BUY %s partially filled: %d/%d contracts", ticker, filled, contracts)
+        log.info("BUY %s partially filled: %s/%s contracts", ticker, filled, contracts)
     risk.record_open_position(ticker, sig.side, filled, fill_price)
     risk.log_entry_trade(ticker, sig.side, filled, fill_price)
     log.debug("Order id: %s", order_id)
@@ -1058,7 +1061,7 @@ def _run_once_time_delay(
         if outcome.action != AgentAction.CONTINUE:
             return False
         filled, fill_price = _order_fill_info(_env, count, exit_price_order)
-        if filled < 1:
+        if filled < 0.01:
             log.warning(
                 "time_delay: exit order for %s did not fill (IOC); retrying next cycle",
                 ticker,
@@ -1066,7 +1069,7 @@ def _run_once_time_delay(
             return False
         pnl_cents = compute_pnl_cents(side, entry_price, fill_price, filled)
         log_trade(
-            "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | filled=%d/%d | pnl=%+dc",
+            "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | filled=%s/%s | pnl=%+dc",
             ticker, side, entry_price, fill_price, filled, count, pnl_cents,
         )
         _record_exit(risk, {
@@ -1076,7 +1079,7 @@ def _run_once_time_delay(
             "entry_price": entry_price,
             "exit_price": fill_price,
             "exit_reason": "time_delay_exit",
-            "unfilled": max(0, count - filled),
+            "unfilled": max(0.0, round(count - filled, 2)),
         })
         if state is not None:
             _pos = risk.get_open_positions().get(ticker)
@@ -1130,7 +1133,7 @@ def _run_once_time_delay(
     order_id = envelope.get("result", {}).get("order_id")
 
     filled, fill_price = _order_fill_info(envelope, contracts, sig_stub.price_cents)
-    if filled < 1:
+    if filled < 0.01:
         log.info("time_delay: BUY %s did not fill (IOC) — no position opened", ticker)
         return False
     risk.record_open_position(ticker, side, filled, fill_price)

@@ -61,7 +61,7 @@ class TestOrderPayloadConstruction(unittest.TestCase):
         )
         self.assertEqual(payload["ticker"], f"{config.BTC_SERIES_TICKER}-TEST")
         self.assertEqual(payload["side"], "bid")
-        self.assertEqual(payload["count"], "3")
+        self.assertEqual(payload["count"], "3.00")
         self.assertEqual(payload["price"], "0.55")
         self.assertEqual(payload["client_order_id"], "cid")
         self.assertEqual(payload["time_in_force"], "immediate_or_cancel")
@@ -182,6 +182,47 @@ class TestSdkCallPaths(unittest.TestCase):
             f"{config.BTC_SERIES_TICKER}-TEST", "no", 1, 40, dry_run=False
         )
         self.assertEqual(resp["order"]["average_fill_price_cents"], 40)
+
+    def test_fractional_fill_is_preserved_not_floored(self):
+        # Kalshi fills in 0.01-contract increments: a 0.50 fill on a 3-contract
+        # IOC order is a REAL position and must not be reported as unfilled.
+        self.sdk.create_order_v2.return_value = {
+            "order_id": "ord-4",
+            "fill_count": "0.50",
+            "remaining_count": "0.00",
+            "average_fill_price": "0.56",
+        }
+        resp = self.client.place_order(
+            f"{config.BTC_SERIES_TICKER}-TEST", "yes", 3, 56, dry_run=False
+        )
+        order = resp["order"]
+        self.assertEqual(order["fill_count"], 0.5)
+        self.assertEqual(order["status"], "executed")
+
+    def test_fractional_partial_fill_status(self):
+        self.sdk.create_order_v2.return_value = {
+            "order_id": "ord-5",
+            "fill_count": "2.57",
+            "remaining_count": "0.43",
+            "average_fill_price": "0.56",
+        }
+        resp = self.client.place_order(
+            f"{config.BTC_SERIES_TICKER}-TEST", "yes", 3, 56, dry_run=False
+        )
+        self.assertEqual(resp["order"]["fill_count"], 2.57)
+        self.assertEqual(resp["order"]["status"], "partially_filled")
+
+    def test_fractional_sell_count_formats_fixed_point(self):
+        # Exiting a fractionally-filled position must submit the exact count.
+        payload = self.client._build_order_payload(
+            ticker=f"{config.BTC_SERIES_TICKER}-TEST",
+            side="yes",
+            action="sell",
+            contracts=2.57,
+            price_cents=40,
+            reduce_only=True,
+        )
+        self.assertEqual(payload["count"], "2.57")
 
     def test_get_orderbook_calls_sdk_market_orderbook(self):
         self.sdk.get_market_orderbook.return_value = {"orderbook": {"yes": [], "no": []}}

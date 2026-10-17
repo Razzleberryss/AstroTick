@@ -95,6 +95,40 @@ class TestExitBandAndDryRunOrdering(unittest.TestCase):
         self.assertEqual(env["code"], "NO_POSITION")
 
 
+class TestFractionalFills(unittest.TestCase):
+    def test_order_fill_info_preserves_fractional_fill(self):
+        from bot import _order_fill_info
+
+        envelope = {"result": {"fill_count": "0.50", "average_fill_price_cents": 56}}
+        filled, price = _order_fill_info(envelope, 3, 55)
+        self.assertEqual(filled, 0.5)
+        self.assertEqual(price, 56)
+
+    def test_reduce_position_keeps_fractional_remainder(self):
+        from risk_manager import RiskManager
+
+        risk = RiskManager()
+        risk.record_open_position("KXBTC15M-TEST", "yes", 3, 55)
+        risk.reduce_position("KXBTC15M-TEST", 2.57)
+        pos = risk.get_open_positions()["KXBTC15M-TEST"]
+        self.assertAlmostEqual(pos["quantity"], 0.43)
+        # Closing the exact remainder removes the position entirely.
+        risk.reduce_position("KXBTC15M-TEST", 0.43)
+        self.assertNotIn("KXBTC15M-TEST", risk.get_open_positions())
+
+    def test_fractional_sell_passes_envelope_validation(self):
+        client = MagicMock()
+        env = sell_envelope(client, "KXBTC15M-TEST", "yes", 0.43, 40, dry_run=True)
+        self.assertTrue(env["ok"])
+        self.assertEqual(env["code"], "SELL_DRY_RUN")
+
+    def test_compute_pnl_rounds_fractional_size_to_cents(self):
+        from risk_manager import compute_pnl_cents
+
+        # 0.43 contracts gaining 30c each = 12.9c -> 13c
+        self.assertEqual(compute_pnl_cents("yes", 40, 70, 0.43), 13)
+
+
 class TestEnvelopeFnException(unittest.TestCase):
     def test_exception_in_envelope_fn_escalates_without_halting(self):
         def _boom():

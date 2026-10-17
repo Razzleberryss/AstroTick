@@ -141,8 +141,10 @@ def sell_envelope(
     side = side.lower()
     if side not in ("yes", "no"):
         return failure_envelope("INVALID_SIDE", "side must be 'yes' or 'no'")
-    if count < 1:
-        return failure_envelope("INVALID_COUNT", "count must be >= 1")
+    # Sells allow fractional counts (Kalshi's 0.01-contract granularity):
+    # a fractionally-filled entry must be exitable in full.
+    if count < 0.01:
+        return failure_envelope("INVALID_COUNT", "count must be >= 0.01")
     # Sells intentionally allow the full 1-99c range: the MIN/MAX_CONTRACT_PRICE
     # band is an ENTRY filter. Applying it to exits would reject exactly the
     # stop-loss (price collapsed below the band) and take-profit (price ran

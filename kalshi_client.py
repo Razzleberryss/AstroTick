@@ -114,14 +114,25 @@ def _price_cents_to_dollars_fp(price_cents: int) -> str:
     return format(d, "f")
 
 
-def _fp_to_int(value: Any, default: int = 0) -> int:
-    """Parse a fixed-point count string like '3.00' into an int (floor)."""
+def _fp_to_count(value: Any, default: float = 0.0) -> float:
+    """
+    Parse a fixed-point count string like '3.00' or '2.57' into a float,
+    rounded to Kalshi's 0.01-contract granularity. Fills CAN be fractional
+    even for whole-contract orders, so counts must never be floored to ints:
+    a '0.50' fill floored to 0 would leave a real position untracked.
+    """
     if value is None:
         return default
     try:
-        return int(float(str(value)))
+        return round(float(str(value)), 2)
     except (TypeError, ValueError):
         return default
+
+
+def _count_to_fp(count: Any) -> str:
+    """Format a contract count for CreateOrderV2's fixed-point 'count' field."""
+    d = Decimal(str(count)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(d, "f")
 
 
 class KalshiClient:
@@ -503,14 +514,15 @@ class KalshiClient:
             log.error("get_positions failed: %s", exc, exc_info=True)
             raise
 
-    def contracts_held_on_side(self, ticker: str, side: str) -> int:
+    def contracts_held_on_side(self, ticker: str, side: str) -> float:
         """
         Return non-negative contract count held on side for ticker, or 0.
 
         Kalshi reports a signed per-market count: positive = long YES,
         negative = long NO. The current API sends it as the fixed-point string
         ``position_fp``; older payloads used the integer ``position``.
-        Fractional holdings are floored so a sell never exceeds the position.
+        Holdings can be fractional (0.01-contract granularity), so the count is
+        returned as-is — flooring would strand sub-contract exposure unsellable.
         """
         side = side.lower()
         if side not in ("yes", "no"):
@@ -520,16 +532,16 @@ class KalshiClient:
                 continue
             pos = position_count(p)
             if side == "yes" and pos > 0:
-                return int(pos)
+                return round(pos, 2)
             if side == "no" and pos < 0:
-                return int(abs(pos))
+                return round(abs(pos), 2)
         return 0
 
     def sell_position(
         self,
         market_id: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         price: int,
         dry_run: bool = True,
     ) -> Optional[dict]:
@@ -542,7 +554,7 @@ class KalshiClient:
         self._ensure_btc_market(market_id)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place SELL %s %s x%d @ %dc",
+                "[DRY RUN] Would place SELL %s %s x%s @ %dc",
                 side.upper(), market_id, quantity, price
             )
             return None
@@ -555,7 +567,7 @@ class KalshiClient:
         ticker: str,
         side: str,
         action: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         reduce_only: bool = False,
         post_only: bool = False,
@@ -582,8 +594,10 @@ class KalshiClient:
         action_l = (action or "").lower()
         if action_l not in ("buy", "sell"):
             raise ValueError("action must be 'buy' or 'sell'")
-        if contracts < 1:
-            raise ValueError("contracts must be >= 1")
+        # Fractional counts (0.01-contract granularity) are valid: exits of
+        # fractionally-filled positions must be able to sell e.g. 2.57.
+        if float(contracts) < 0.01:
+            raise ValueError("contracts must be >= 0.01")
         if not (1 <= int(price_cents) <= 99):
             raise ValueError("price_cents must be 1-99")
 
@@ -598,7 +612,7 @@ class KalshiClient:
             "ticker": ticker,
             "client_order_id": client_order_id or str(uuid.uuid4()),
             "side": book_side,
-            "count": str(int(contracts)),
+            "count": _count_to_fp(contracts),
             "price": _price_cents_to_dollars_fp(book_price_cents),
             "time_in_force": "good_till_canceled" if post_only else "immediate_or_cancel",
             "self_trade_prevention_type": "taker_at_cross",
@@ -625,11 +639,11 @@ class KalshiClient:
             **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
         )
         data = _to_dict(raw)
-        filled = _fp_to_int(data.get("fill_count"))
-        remaining = _fp_to_int(data.get("remaining_count"))
-        if filled > 0 and remaining == 0:
+        filled = _fp_to_count(data.get("fill_count"))
+        remaining = _fp_to_count(data.get("remaining_count"))
+        if filled >= 0.01 and remaining < 0.01:
             status = "executed"
-        elif filled > 0:
+        elif filled >= 0.01:
             status = "partially_filled"
         else:
             status = "unfilled"
@@ -651,7 +665,7 @@ class KalshiClient:
             "average_fee_paid_dollars": data.get("average_fee_paid"),
         }
         if status != "executed":
-            log.warning("Order %s: status=%s filled=%d remaining=%d",
+            log.warning("Order %s: status=%s filled=%.2f remaining=%.2f",
                         order["order_id"], status, filled, remaining)
         return {"order": order, "raw": data}
 
@@ -659,7 +673,7 @@ class KalshiClient:
         self,
         ticker: str,
         side: str,
-        count: int,
+        count: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -671,7 +685,7 @@ class KalshiClient:
         self._ensure_btc_market(ticker)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place %s %s %s x%d @ %dc (reduce_only=%s post_only=%s)",
+                "[DRY RUN] Would place %s %s %s x%s @ %dc (reduce_only=%s post_only=%s)",
                 "BUY" if (side or "").lower() in ("yes", "no") else "ORDER",
                 (side or "").upper(),
                 ticker,
@@ -686,7 +700,7 @@ class KalshiClient:
             ticker=ticker,
             side=side,
             action="buy",
-            contracts=int(count),
+            contracts=count,
             price_cents=int(price_cents),
             reduce_only=bool(reduce_only),
             post_only=bool(post_only),
@@ -698,16 +712,16 @@ class KalshiClient:
             log.error("Order placement failed: %s", exc, exc_info=True)
             raise
 
-    def buy_yes(self, ticker: str, contracts: int, price_cents: int, dry_run: bool = True) -> Optional[dict]:
+    def buy_yes(self, ticker: str, contracts: "int | float", price_cents: int, dry_run: bool = True) -> Optional[dict]:
         return self.place_order(ticker, "yes", contracts, price_cents, dry_run=dry_run)
 
-    def buy_no(self, ticker: str, contracts: int, price_cents: int, dry_run: bool = True) -> Optional[dict]:
+    def buy_no(self, ticker: str, contracts: "int | float", price_cents: int, dry_run: bool = True) -> Optional[dict]:
         return self.place_order(ticker, "no", contracts, price_cents, dry_run=dry_run)
 
     def sell_yes(
         self,
         ticker: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -718,7 +732,7 @@ class KalshiClient:
     def sell_no(
         self,
         ticker: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -730,7 +744,7 @@ class KalshiClient:
         self,
         ticker: str,
         side: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         *,
         dry_run: bool,
@@ -741,7 +755,7 @@ class KalshiClient:
         self._ensure_btc_market(ticker)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place SELL %s %s x%d @ %dc (reduce_only=%s post_only=%s)",
+                "[DRY RUN] Would place SELL %s %s x%s @ %dc (reduce_only=%s post_only=%s)",
                 (side or "").upper(),
                 ticker,
                 contracts,
@@ -755,7 +769,7 @@ class KalshiClient:
             ticker=ticker,
             side=side,
             action="sell",
-            contracts=int(contracts),
+            contracts=contracts,
             price_cents=int(price_cents),
             reduce_only=bool(reduce_only),
             post_only=bool(post_only),
@@ -792,7 +806,7 @@ class KalshiClient:
         self,
         market_id: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         price: int,
         dry_run: bool = True,
     ) -> Optional[dict]:

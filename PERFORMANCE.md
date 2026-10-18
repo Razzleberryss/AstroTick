@@ -43,16 +43,24 @@ The bot is a single-threaded synchronous poll loop (`POLL_INTERVAL_SECONDS`, def
   failures up to `REQUEST_MAX_RETRIES` (default 2). Order placement is deliberately
   never auto-retried.
 
+## Implemented since
+
+- **Settlement-index price source** (was an open idea here): momentum now comes from
+  each event's own CF Benchmarks index via Kalshi's `/live_data/events` endpoint
+  (1-minute candles, cached ~8 s per event in `index_feed.py`), eliminating both the
+  basis mismatch against Yahoo's composite price and the yfinance dependency in the
+  hot path. The spot feed remains as an automatic per-coin fallback.
+- **Multi-series trading**: the loop now discovers and evaluates every series in
+  `SERIES_TICKERS` per cycle, sharing one balance/positions fetch, managing all
+  tracked positions in a single pass, and placing at most one new entry per cycle
+  (the risk estimate uses the cycle's positions snapshot).
+
 ## Open ideas
 
-- **Background momentum refresh**: when the 60 s cache is cold, the yfinance fetch
-  still blocks the loop for the duration of one HTTP round trip. A daemon thread that
-  refreshes the momentum value on its own schedule would take it out of the hot path
-  entirely.
-- **Settlement-index price source**: the markets settle on the CF Benchmarks BRTI
-  index, which Kalshi now streams over WebSocket. Sourcing momentum from that feed
-  instead of Yahoo's composite BTC-USD price would remove both the latency and the
-  basis mismatch. (This is as much a signal-quality change as a performance one.)
+- **Background momentum refresh**: when the fallback feed's 60 s cache is cold, the
+  yfinance fetch still blocks the loop for one HTTP round trip. A daemon thread that
+  refreshes it on its own schedule would take it out of the hot path entirely. (The
+  primary index feed is a single fast Kalshi API call and shares the loop's timeout.)
 
 Speculative items from the earlier documents (async/await refactor, SQLite trade
 history, compiled math, generic "performance monitoring utilities") were dropped:

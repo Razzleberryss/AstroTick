@@ -752,6 +752,9 @@ def main():
     series = getattr(args, "series", os.environ.get("HOURLY_SERIES_TICKER", "KXBTCD"))
     os.environ["BTC_SERIES_TICKER"] = series
     config.BTC_SERIES_TICKER = series
+    # The client's trade-safety check allows any configured series; the CLI
+    # operates on exactly the one passed via --series.
+    config.SERIES_TICKERS = [series]
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.WARNING),

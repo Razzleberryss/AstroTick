@@ -15,7 +15,7 @@ import sys
 from typing import List, Dict, Optional
 
 from kalshi_client import KalshiClient
-from kalshi_money import enrich_market_quotes_from_dollar_fields
+from kalshi_money import enrich_market_quotes_from_dollar_fields, parse_dollars_to_cents_int
 import config
 
 log = logging.getLogger(__name__)
@@ -33,7 +33,8 @@ def fetch_historical_markets(
     Args:
         series_ticker: The series ticker (e.g., "KXBTC15M" or "BTCZ")
         start_date: Start date in YYYY-MM-DD format
-        end_date: End date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format (inclusive: markets closing
+            any time on this day are included)
         client: Optional KalshiClient instance. If not provided, creates a new one.
 
     Returns:
@@ -75,14 +76,18 @@ def fetch_historical_markets(
     if client is None:
         client = KalshiClient()
 
+    # Make the end date inclusive: extend the upper bound to the start of the
+    # following day so markets closing any time on end_date are returned.
+    end_dt_exclusive = end_dt + datetime.timedelta(days=1)
+
     # Fetch markets for the series
     # Kalshi's /markets endpoint accepts min_close_ts and max_close_ts parameters
     # to filter by close time
     params = {
         "series_ticker": series_ticker,
         "min_close_ts": int(start_dt.timestamp()),
-        "max_close_ts": int(end_dt.timestamp()),
-        "limit": 200,  # Max per page
+        "max_close_ts": int(end_dt_exclusive.timestamp()),
+        "limit": 1000,  # Max per page (the /markets endpoint accepts 1-1000)
     }
 
     all_markets = []
@@ -165,7 +170,7 @@ def main():
         "--end",
         type=str,
         required=True,
-        help="End date in YYYY-MM-DD format"
+        help="End date in YYYY-MM-DD format (inclusive: markets closing on this day are included)"
     )
     parser.add_argument(
         "--output",

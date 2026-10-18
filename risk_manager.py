@@ -18,9 +18,28 @@ from typing import Optional
 
 import config
 from strategy import Signal
-from kalshi_money import position_average_price_cents
+from kalshi_money import (
+    position_average_price_cents,
+    position_count,
+    position_exposure_dollars,
+)
 
 log = logging.getLogger(__name__)
+
+
+def compute_pnl_cents(side: str, entry_price: int, exit_price: int, size: "int | float") -> int:
+    """
+    Realized PnL in cents for a closed position.
+
+    Entry and exit prices are both denominated in the position's own side
+    (YES prices for a YES position, NO prices for a NO position), so the PnL
+    is (exit - entry) * size for BOTH sides. The *side* parameter is kept so
+    call sites stay explicit about which book the prices came from.
+    Size may be fractional (Kalshi fills in 0.01-contract increments); the
+    result is rounded to whole cents.
+    """
+    del side  # both sides use side-denominated prices; see docstring
+    return int(round((exit_price - entry_price) * size))
 
 
 class RiskManager:
@@ -130,7 +149,7 @@ class RiskManager:
         self,
         market: str,
         side: str,
-        size: int,
+        size: "int | float",
         entry_price: int,
     ) -> None:
         # Daily count increment (reset already done in approve_trade)
@@ -151,13 +170,15 @@ class RiskManager:
         self,
         market: str,
         side: str,
-        size: int,
+        size: "int | float",
         entry_price: int,
         exit_price: int,
         exit_reason: str,
     ) -> int:
-        pnl_cents = (exit_price - entry_price) * size if side.lower() == "yes" else (entry_price - exit_price) * size
-        # PnL update (reset not needed here, done once per cycle)
+        pnl_cents = compute_pnl_cents(side, entry_price, exit_price, size)
+        # Roll the daily window before accounting, so an exit logged just after
+        # midnight lands in the new day's totals rather than yesterday's.
+        self._reset_daily_if_needed()
         self._daily_realized_pnl_cents += pnl_cents
         row = {
             "timestamp": self._get_current_datetime().isoformat(),
@@ -249,7 +270,7 @@ class RiskManager:
         self,
         ticker: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         entry_price: int,
     ) -> None:
         """Record a position opened by this bot so we can manage it later."""
@@ -260,7 +281,7 @@ class RiskManager:
             "entry_price": entry_price,
         }
         log.debug(
-            "Tracking new position: %s %s x%d @ %dc",
+            "Tracking new position: %s %s x%s @ %dc",
             ticker, side, quantity, entry_price,
         )
 
@@ -268,6 +289,24 @@ class RiskManager:
         """Remove a position from tracking after it has been closed."""
         self._open_positions.pop(ticker, None)
         log.debug("Removed closed position from tracking: %s", ticker)
+
+    def reduce_position(self, ticker: str, closed_quantity: "int | float") -> None:
+        """
+        Shrink a tracked position after a partial exit fill; remove it entirely
+        once less than 0.01 contract (Kalshi's granularity) remains.
+        """
+        pos = self._open_positions.get(ticker)
+        if pos is None:
+            return
+        remaining = round(pos["quantity"] - closed_quantity, 2)
+        if remaining >= 0.01:
+            pos["quantity"] = remaining
+            log.debug(
+                "Reduced tracked position %s by %s; %s remaining",
+                ticker, closed_quantity, remaining,
+            )
+        else:
+            self.record_closed_position(ticker)
 
     def get_open_positions(self) -> dict[str, dict]:
         """Return a deep snapshot of positions opened by this bot instance."""
@@ -278,13 +317,18 @@ class RiskManager:
     @staticmethod
     def _estimate_deployed(positions: list) -> float:
         """Rough estimate of total dollars currently at risk in open positions."""
-        total_cents = 0
+        total_dollars = 0.0
         for pos in positions:
-            # Kalshi position: quantity * average cost (API v2: average_price_dollars)
-            qty = abs(pos.get("position", 0))
+            # Prefer the API's own exposure figure (market_exposure_dollars);
+            # fall back to |position| * average cost for older payloads.
+            exposure = position_exposure_dollars(pos)
+            if exposure is not None:
+                total_dollars += abs(exposure)
+                continue
+            qty = abs(position_count(pos))
             avg_price = position_average_price_cents(pos, default_cents=99)
-            total_cents += qty * avg_price
-        return total_cents / 100
+            total_dollars += qty * avg_price / 100
+        return total_dollars
 
     def _ensure_log_file(self):
         """Create the CSV with headers if it doesn't already exist."""

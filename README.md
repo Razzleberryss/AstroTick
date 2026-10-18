@@ -1,65 +1,160 @@
 # AstroTick
 
-A rule-based Python trading bot for Kalshi's BTC Up/Down 15-minute prediction markets. Trades using the official Kalshi REST API v2 with RSA-PSS authentication. Now integrates with **OpenClaw Agent Trading** for autonomous, AI-driven signal enrichment and trade execution.
+A rule-based Python trading bot for Kalshi's BTC Up/Down 15-minute prediction markets
+(series `KXBTC15M`). It polls the market every few seconds, generates a signal from BTC
+spot momentum and orderbook skew, filters it through a fee-aware expected-value check
+and a risk manager, and places immediate-or-cancel limit orders through the official
+Kalshi Trade API v2 (`CreateOrderV2`).
+
+The bot is dry-run by default and has two independent gates that must both be opened
+before it can place a real order (see [Live trading](#live-trading-two-gates)).
 
 ---
 
-## New Features
+## How it works
 
-### 🤖 OpenClaw / Agent Trading Integration *(New)*
-The bot now natively integrates with **OpenClaw Agent Trading**, enabling autonomous AI-driven market analysis and trade execution on top of the existing rule-based strategy.
+Every `POLL_INTERVAL_SECONDS` (default 10 s) the bot:
 
-- **AI-Powered Signal Enrichment:** OpenClaw's agent layer cross-references Kalshi orderbook data with external momentum signals, sentiment feeds, and multi-timeframe BTC price context to score trade confidence more accurately.
-- **Autonomous Agent Mode:** When `OPENCLAW_AGENT_MODE=true`, the OpenClaw agent can independently decide whether to act on a signal based on configurable risk thresholds — no manual approval needed.
-- **Orderbook Intelligence:** Pulls enriched market depth data from OpenClaw's data layer to supplement Kalshi's native orderbook, providing tighter spread analysis and better entry timing.
-- **Seamless Pipeline Integration:** Plugs directly into `strategy.py` — the existing momentum + orderbook skew logic feeds into OpenClaw's scoring model, and the agent returns an enriched composite signal back to `bot.py`.
-- **Configurable Agent Autonomy:** Set `OPENCLAW_CONFIDENCE_THRESHOLD` to control at what confidence level the agent auto-executes vs. defers to the rule-based fallback.
+1. Finds the active `KXBTC15M` market (a new one opens every 15 minutes).
+2. Fetches the orderbook — from the REST API, or from a WebSocket stream when
+   `USE_WEBSOCKET_ORDERBOOK=true` (with staleness detection and automatic REST fallback).
+3. Manages every tracked open position: stop-loss, take-profit, signal-reversal and
+   expiry exits, plus settlement reconciliation for positions whose market has closed.
+4. Generates a signal, risk-checks it, and places an entry order if everything passes.
+5. Writes a snapshot to `dashboard_state.json` for the local dashboard, flushes the
+   trade log, and sleeps.
 
----
+### Strategies
 
-### Early Exit Logic
-The bot actively manages open positions before expiry to lock in gains and cut losses:
+`STRATEGY_MODE` selects one of two strategies:
 
-- **Stop-Loss:** Automatically sells a position if the contract price drops below your entry price by a set amount.
-- **Take-Profit:** Automatically sells a position if the contract price rises above your entry price by a set amount.
-- **Signal Reversal:** Sells an open position if the latest strategy signal flips against your current holding (e.g., holding YES but signal becomes NO).
-- **Daily Risk Limits:** Blocks new entries after hitting `MAX_DAILY_LOSS_CENTS` or `MAX_DAILY_TRADES`, while continuing to manage/exit open positions.
-- **Strict Market Scope:** Discovery and order placement are restricted to `BTC_SERIES_TICKER` markets only.
+- **`fee_aware_model`** (default) — momentum + orderbook skew:
+  - Short-term BTC momentum from yfinance 1-minute bars (`MOMENTUM_LOOKBACK_BARS`,
+    cached for 60 s).
+  - Orderbook skew: relative YES vs NO bid liquidity over the top levels of the book.
+  - The composite signal shifts a model probability off the market mid. A trade is
+    only taken when the mispricing is at least `MIN_EDGE_PCT`, the YES price is outside
+    the forbidden band (`FORBIDDEN_PRICE_LOW`–`FORBIDDEN_PRICE_HIGH`, where fees bite
+    hardest), and the expected net value per contract **after** open and worst-case
+    close taker fees clears `MIN_EXPECTED_NET_PER_CONTRACT`. Fees use Kalshi's
+    standard quadratic schedule, `ceil(KALSHI_FEE_RATE × contracts × P × (1−P))`
+    in cents, with `KALSHI_FEE_RATE` defaulting to 0.07 (matching `KXBTC15M`'s
+    `fee_type=quadratic`, `fee_multiplier=1`).
+  - Position size scales with edge from `BASE_SIZE` up to `MAX_SIZE` contracts
+    (full size at `MAX_EDGE_PCT` mispricing).
+  - Liquidity filters: side-aware minimum orderbook depth (`MIN_YES_DEPTH` /
+    `MIN_NO_DEPTH`), maximum slippage (`MAX_SLIPPAGE`), ghost-book detection, and a
+    plausibility cap on the model-vs-mid deviation (`MAX_PRICE_DEVIATION`).
 
-### Cursor Plugin Support
-This project is fully optimized for development inside **Cursor** with AI-assisted coding enabled:
+- **`reddit_time_delay`** — a late-window price-trigger strategy: it arms only when
+  `TRIGGER_MINUTE_REMAINING` minutes or fewer remain in the window, enters the side
+  whose price has reached `TRIGGER_POINT_PRICE`, exits early if the position's price
+  falls to `EXIT_POINT_PRICE`, and takes at most `MAX_TRADES_PER_WINDOW` entries per
+  15-minute window.
 
-- `.cursor` config included for instant project context — no manual setup needed.
-- AI-aware file structure and inline comments make Copilot/Cursor suggestions faster and more accurate.
-- Modular design means Cursor can autocomplete, refactor, and reason about `bot.py`, `strategy.py`, and `risk_manager.py` independently.
-- Faster, cleaner code iteration directly from your editor with context-aware suggestions tailored to this trading bot's architecture.
+### Orders and fills
 
-### Performance & Code Quality
-- Refactored async loop in `bot.py` for lower latency between signal generation and order placement.
-- Cleaner separation of concerns across all modules — easier to extend or swap out strategy logic.
-- Improved logging with structured output for faster debugging and trade review.
-- Reduced boilerplate in `kalshi_client.py` for a leaner, more readable API wrapper.
+All orders are **immediate-or-cancel limit orders** placed through the Kalshi
+`CreateOrderV2` endpoint (single-book model: a YES buy is a bid, a NO buy is an ask at
+the complementary price; sells are reduce-only). Because orders are IOC, the API
+response is final and reports the exact fill: the bot records **only what actually
+filled** — an order that misses entirely records no position, and partial fills reduce
+the tracked position and book PnL at the actual average fill price. Order placement is
+never auto-retried; read-only API calls retry transient failures with the configured
+timeout.
 
----
+### Position management and early exits
 
-## Project Structure
+Open positions are actively managed every cycle, including positions left over from
+earlier 15-minute windows:
+
+- **Stop-loss** — sell when the contract price drops `STOP_LOSS_CENTS` below entry.
+- **Take-profit** — sell when the price rises `TAKE_PROFIT_CENTS` above entry.
+- **Signal reversal** — sell when the latest signal flips against the holding with
+  confidence of at least `MIN_EDGE_THRESHOLD` (`SIGNAL_REVERSAL_EXIT=true`).
+- **Expiry exit** — sell `EXPIRY_EXIT_SECONDS` before the market's close time.
+- **Settlement reconciliation** — a position that could not be exited before close is
+  reconciled once the market settles (at 100c or 0c, `exit_reason=settled`), so
+  settlement losses count against the daily-loss limit instead of silently vanishing.
+
+Exit orders accept the full 1–99c price range; the `MIN_CONTRACT_PRICE_CENTS` /
+`MAX_CONTRACT_PRICE_CENTS` band (default 10–90c) is an entry-only filter.
+
+### Risk manager
+
+`risk_manager.py` gates every entry and keeps the books:
+
+- Per-trade cap (`MAX_TRADE_DOLLARS`), open-position count (`MAX_OPEN_POSITIONS`),
+  total exposure (`MAX_TOTAL_EXPOSURE`), and one position per market.
+- Daily limits: after `MAX_DAILY_LOSS_CENTS` of realized loss or `MAX_DAILY_TRADES`
+  entries in a UTC day, new entries are blocked while open positions continue to be
+  managed and exited.
+- Every entry and exit is appended to a CSV trade log (`TRADE_LOG_FILE`, default
+  `trades.csv` in the project root). Daily stats are rebuilt from this file on
+  restart, so the daily-loss gate survives a bot restart.
+
+### Decision-engine envelope layer
+
+Every order — whether placed by the bot or by the manual CLI — goes through a shared
+envelope layer:
+
+- `kalshi_inprocess_orders.py` builds buy/sell orders and returns a structured JSON
+  envelope (`{ok, code, result/error, ...}`) with three decision flags: `retryable`,
+  `halt_trading`, `requires_human_review`.
+- `kalshi_agent_envelope.py` is the single source of truth for envelope shapes and
+  the `DECISION_POLICY` mapping each response code to those flags.
+- `agent_decision_engine.py` deterministically maps an envelope to one action:
+  `CONTINUE`, `RETRY`, `RETRY_AND_ESCALATE`, `ESCALATE_TO_HUMAN`, or `HALT_TRADING`.
+  Malformed envelopes fail closed to `HALT_TRADING`.
+- `cli_executor.py` executes orders through this engine; a `HALT_TRADING` outcome
+  writes the `STOP_TRADING` file and stops the bot.
+
+## Safety gates
+
+Three gates are enforced in code, in both the bot and the CLI:
+
+1. **`DRY_RUN`** (default `true`) — orders are logged and simulated, never sent.
+2. **`KALSHI_TRADING_LIVE=1`** — even with `DRY_RUN=false`, the envelope layer
+   rejects every real order (`LIVE_TRADING_BLOCKED`) unless this environment
+   variable is set to exactly `1`.
+3. **The `STOP_TRADING` halt file** — if `~/.openclaw/workspace/STOP_TRADING`
+   exists (path overridable via `OPENCLAW_STOP_FILE`), all order placement halts
+   immediately. The decision engine writes this file itself on a `HALT_TRADING`
+   outcome; remove the file to resume trading.
+
+On top of these, `KALSHI_ENV` selects the demo (paper-money) or prod environment, and
+the bot prints a prominent warning banner at startup when running live on prod.
+
+## Project structure
 
 ```
 .
-├── bot.py              # Main loop - manages positions and enters trades
-├── kalshi_client.py    # Kalshi API wrapper (auth, orders, positions, selling)
-├── strategy.py         # Signal generation (momentum + orderbook skew + OpenClaw)
-├── openclaw_client.py  # OpenClaw agent interface (signal enrichment + agent mode)
-├── risk_manager.py     # Risk checks, position sizing, CSV trade log
-├── config.py           # Config loader (reads from .env)
-├── .env.example        # Copy to .env and fill in your keys
-├── requirements.txt    # Python dependencies
-└── .gitignore
+├── bot.py                      # Main loop: market discovery, position management, entries
+├── strategy.py                 # Signal generation (momentum + orderbook skew, fee-aware EV filter)
+├── risk_manager.py             # Trade gating, position tracking, PnL, CSV trade log
+├── kalshi_client.py            # Kalshi SDK wrapper (auth, CreateOrderV2 orders, positions, orderbooks)
+├── kalshi_money.py             # Fixed-point dollar/_fp field parsing helpers (API v2 shapes)
+├── orderbook_utils.py          # Shared orderbook parsing (bids, depth, weighted liquidity)
+├── websocket_client.py         # Streaming orderbook client (resubscribe, staleness, seq gaps)
+├── kalshi_agent_envelope.py    # JSON envelope builders + DECISION_POLICY (shared by bot and CLI)
+├── kalshi_inprocess_orders.py  # In-process buy/sell envelope builders used by the bot and CLI
+├── agent_decision_engine.py    # Deterministic envelope -> action interpreter (fail-closed)
+├── cli_executor.py             # Executes orders through the decision engine; STOP_TRADING handling
+├── openclaw_kalshi.py          # Manual CLI: status / markets / orderbook / buy / sell
+├── dashboard.py                # Local Flask dashboard (reads dashboard_state.json)
+├── historical.py               # Historical market fetcher for backtesting/analysis
+├── config.py                   # Config loader: every env var, defaults, validation
+├── tests/                      # pytest suite
+├── .github/workflows/          # CI: pytest, Bandit, CodeQL
+├── .env.example                # Copy to .env and fill in your keys
+└── requirements.txt
 ```
 
-## Quick Start
+## Quick start
 
-### 1. Clone and set up environment
+### 1. Clone and set up the environment
+
+Requires Python 3.13 or newer (the Kalshi SDK's minimum).
 
 ```bash
 git clone https://github.com/Razzleberryss/AstroTick.git
@@ -70,150 +165,95 @@ source venv/bin/activate          # Mac/Linux
 pip install -r requirements.txt
 ```
 
-### 2. Configure your credentials
+### 2. Configure credentials
 
 ```bash
 cp .env.example .env
 ```
 
-Edit `.env` and provide your Kalshi API details:
+Edit `.env` and provide your Kalshi API details (create a key at
+kalshi.com → Profile → API management):
 
-- `KALSHI_API_KEY_ID`: Your API Key ID
-- `KALSHI_PRIVATE_KEY_PATH`: Path to your RSA private key (e.g., `./kalshi_private_key.pem`)
-- `KALSHI_ENV`: `demo` or `prod`
-- `STOP_LOSS_CENTS`: Max cents to lose before exiting (default: 20)
-- `TAKE_PROFIT_CENTS`: Target profit cents before exiting (default: 30)
-- `MAX_DAILY_LOSS_CENTS`: Max realized daily loss before stopping new entries (default: 1000)
-- `MAX_DAILY_TRADES`: Max new entries per day (default: 20)
+- `KALSHI_API_KEY_ID` — your API key ID
+- `KALSHI_PRIVATE_KEY_PATH` — path to the private key file (e.g. `./kalshi_private_key.pem`)
+- `KALSHI_ENV` — `demo` (paper trading) or `prod` (real money)
+
+The SDK accepts both RSA and Ed25519 keys for REST calls; the optional WebSocket
+client signs with RSA-PSS, so choose an RSA key if you plan to enable
+`USE_WEBSOCKET_ORDERBOOK`.
+
+All other settings have working defaults — `.env.example` documents every variable
+`config.py` reads. Sanity-check your configuration with:
+
+```bash
+python config.py
+```
 
 ### 3. Run the bot
 
 ```bash
-# Default runs in DRY_RUN mode (logs trades but doesn't place them)
-python bot.py
-
-# To trade for real
-DRY_RUN=false python bot.py
-```
-
-When running with `DRY_RUN=false` and `KALSHI_ENV=prod`, the bot logs a prominent live-trading warning banner at startup.
-
----
-
-## OpenClaw / Agent Trading Setup
-
-### Step 1: Get your OpenClaw API key
-
-1. Sign up or log in at [openclaw.io](https://openclaw.io) (or your OpenClaw instance URL).
-2. Navigate to **Settings → API Keys** and generate a new key.
-3. Copy the key — you'll add it to `.env` in the next step.
-
-### Step 2: Add OpenClaw credentials to `.env`
-
-Open your `.env` file and add the following variables:
-
-```env
-# OpenClaw / Agent Trading
-OPENCLAW_API_KEY=your_openclaw_api_key_here
-OPENCLAW_BASE_URL=https://api.openclaw.io/v1   # Update if self-hosting
-OPENCLAW_AGENT_MODE=false                       # Set true to enable autonomous agent execution
-OPENCLAW_CONFIDENCE_THRESHOLD=0.72              # Agent auto-executes only above this confidence (0.0–1.0)
-```
-
-> **Note:** Keep `OPENCLAW_AGENT_MODE=false` while testing. In agent mode, OpenClaw can place trades autonomously — only enable it once you've validated signal quality in dry-run.
-
-### Step 3: Install the OpenClaw client dependency
-
-The OpenClaw client is included via `requirements.txt`. If you need to install it manually:
-
-```bash
-pip install openclaw-sdk
-```
-
-Or if OpenClaw is accessed via direct HTTP (no SDK):
-
-```bash
-pip install httpx  # already included in requirements.txt
-```
-
-### Step 4: Verify the connection
-
-Run the connection test to confirm your API key and endpoint are working:
-
-```bash
-python -c "from openclaw_client import OpenClawClient; c = OpenClawClient(); print(c.ping())"
-```
-
-Expected output:
-
-```
-✅ OpenClaw connected — agent ready.
-```
-
-If you see an authentication error, double-check `OPENCLAW_API_KEY` and `OPENCLAW_BASE_URL` in `.env`.
-
-### Step 5: Run the bot with OpenClaw enabled
-
-```bash
-# Dry run with OpenClaw signal enrichment active
-python bot.py
-
-# Live trading with OpenClaw enrichment (agent mode off)
-DRY_RUN=false python bot.py
-
-# Live trading with full autonomous agent mode
-DRY_RUN=false OPENCLAW_AGENT_MODE=true python bot.py
-```
-
-### How the OpenClaw integration works
-
-```
-Kalshi Orderbook
-      │
-      ▼
- strategy.py  ──► momentum score + orderbook skew
-      │
-      ▼
-openclaw_client.py  ──► enriches signal with AI context, cross-refs external BTC data
-      │
-      ├─ AGENT_MODE=false: returns enriched composite_signal → bot.py decides
-      └─ AGENT_MODE=true:  agent evaluates confidence → auto-executes if above threshold
-```
-
-### OpenClaw `.env` reference
-
-| Variable | Default | Description |
-|---|---|---|
-| `OPENCLAW_API_KEY` | *(required)* | Your OpenClaw API key |
-| `OPENCLAW_BASE_URL` | `https://api.openclaw.io/v1` | API base URL (update if self-hosted) |
-| `OPENCLAW_AGENT_MODE` | `false` | Enable autonomous agent trade execution |
-| `OPENCLAW_CONFIDENCE_THRESHOLD` | `0.72` | Min confidence score for agent auto-execution |
-
----
-
-## Local Web Dashboard
-
-A simple browser dashboard lets you monitor the bot in real time without reading log files.
-
-### How it works
-
-After every bot cycle `bot.py` writes a small JSON snapshot to `dashboard_state.json` in the project root. `dashboard.py` is a tiny Flask server that reads that file and renders an auto-refreshing HTML page.
-
-### Run the dashboard
-
-**Terminal 1 – start the bot:**
-
-```bash
+# Dry run (the default): full decision loop, simulated orders
 python bot.py
 ```
 
-**Terminal 2 – start the dashboard:**
+### Live trading (two gates)
+
+Live orders require **both** `DRY_RUN=false` **and** `KALSHI_TRADING_LIVE=1`.
+Setting only `DRY_RUN=false` runs the bot live-armed, but the envelope layer rejects
+every order with `LIVE_TRADING_BLOCKED`.
 
 ```bash
+# Paper money, real order flow (Kalshi demo environment)
+KALSHI_ENV=demo DRY_RUN=false KALSHI_TRADING_LIVE=1 python bot.py
+
+# Real money
+KALSHI_ENV=prod DRY_RUN=false KALSHI_TRADING_LIVE=1 python bot.py
+```
+
+To stop all trading immediately without touching the bot process:
+
+```bash
+mkdir -p ~/.openclaw/workspace && touch ~/.openclaw/workspace/STOP_TRADING
+```
+
+Remove the file to resume. The bot also creates this file itself when the decision
+engine halts trading (e.g. after an order failure that is unsafe to retry).
+
+## Manual CLI
+
+`openclaw_kalshi.py` is a standalone command-line tool for inspecting and trading
+Kalshi BTC markets by hand (or from an agent/script). All output is a single JSON
+envelope per invocation; add `--human` for readable output.
+
+```bash
+python openclaw_kalshi.py status                 # balance, positions, active market
+python openclaw_kalshi.py markets                # open markets in the series
+python openclaw_kalshi.py orderbook              # orderbook for the best live market
+python openclaw_kalshi.py buy yes 5 45 --dry-run # buy 5 YES @ 45c (simulated)
+python openclaw_kalshi.py sell yes 5 60          # sell 5 YES @ 60c (live: needs KALSHI_TRADING_LIVE=1)
+```
+
+The CLI defaults to the **hourly** BTC series `KXBTCD` (override with `--series` or
+the `HOURLY_SERIES_TICKER` env var; use `--series KXBTC15M` to target the bot's
+15-minute series). `--ticker` targets an exact market; without it, commands
+auto-resolve the best live market from the series. Buy and sell delegate to the same
+in-process envelope builders the bot uses, so all three safety gates and all config
+risk limits apply identically.
+
+## Local web dashboard
+
+After every cycle the bot writes a JSON snapshot to `dashboard_state.json`.
+`dashboard.py` is a small Flask server that renders it as an auto-refreshing page.
+
+```bash
+# Terminal 1
+python bot.py
+
+# Terminal 2
 python dashboard.py
 ```
 
-Open **http://127.0.0.1:8000** in your browser. The page auto-refreshes every 5 seconds and shows:
+Open **http://127.0.0.1:8000**. The page refreshes every 5 seconds and shows:
 
 | Field | Description |
 |---|---|
@@ -222,13 +262,59 @@ Open **http://127.0.0.1:8000** in your browser. The page auto-refreshes every 5 
 | Mid price | Midpoint of the YES spread |
 | Spread | YES ask − YES bid (in cents) |
 | Signal composite / momentum / skew / confidence | Strategy signal components |
-| OpenClaw enriched confidence | AI-enriched confidence score from OpenClaw agent |
 | Position size | Contracts currently held |
 | Realized PnL today | Today's closed-trade P&L in cents |
 
-> Errors writing or reading `dashboard_state.json` are logged at DEBUG level and **never** crash the bot or the dashboard.
+Errors writing or reading `dashboard_state.json` are logged at DEBUG level and never
+crash the bot or the dashboard.
 
----
+## Historical data
+
+`historical.py` fetches settled markets for a series and date range (inclusive) as
+JSON, for backtesting and analysis:
+
+```bash
+python -m historical --series KXBTC15M --start 2025-12-01 --end 2025-12-31 --output markets.json
+```
+
+## Tests and CI
+
+```bash
+python -m pytest tests/
+```
+
+GitHub Actions runs the pytest suite on every push and pull request (Python 3.13, the
+project's minimum version), alongside Bandit and CodeQL security scans. See
+`.github/workflows/`.
+
+## Logs and output files
+
+| File | What it is |
+|---|---|
+| `trades.csv` | CSV trade log (entries and exits); rebuilds daily-loss stats on restart. Path: `TRADE_LOG_FILE`. |
+| `dashboard_state.json` | Per-cycle snapshot for the dashboard. |
+| `~/.openclaw/workspace/STOP_TRADING` | Halt file: its presence stops all order placement. Path: `OPENCLAW_STOP_FILE`. |
+
+Console log verbosity is controlled by `LOG_LEVEL` (default `INFO`).
+
+## What's new (Oct 2026 refresh)
+
+The codebase was modernized against the current Kalshi API and cleaned up:
+
+- Order placement migrated to `CreateOrderV2` (the legacy order endpoint is sunsetting);
+  orders are IOC and the bot records only actual fills, including partial fills.
+- Market/position parsing updated to the current API shapes (`*_dollars` / `*_fp`
+  fields; the old integer-cent fields are gone from responses).
+- Money-path fixes: correct fee scaling in the EV filter (configurable via
+  `KALSHI_FEE_RATE`), correct NO-side PnL sign, exits freed from the entry price band,
+  dry-run exits no longer require live positions.
+- All tracked positions are managed every cycle, with settlement reconciliation for
+  markets that closed before an exit filled.
+- WebSocket client hardened: resubscribe after reconnect, staleness detection,
+  sequence-gap recovery, fixed backoff.
+- Dead code removed (including the unused `performance.py` and a broken subprocess
+  order path); the CLI now shares the bot's envelope builders.
+- CI test workflow added; the suite currently has 400+ tests.
 
 ## Disclaimer
 

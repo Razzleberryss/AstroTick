@@ -597,7 +597,9 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
 
     # ── Sell price validation ──────────────────────────────────────────────────
 
-    def test_sell_rejects_price_outside_config_range(self):
+    def test_sell_allows_price_outside_entry_band(self):
+        """The MIN/MAX_CONTRACT_PRICE band is an entry filter: a stop-loss or
+        take-profit sell must go through even when the price has left the band."""
         client = MagicMock()
         client.contracts_held_on_side.return_value = 10
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", price=15)
@@ -605,8 +607,19 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
         with patch.object(cli.config, "MIN_CONTRACT_PRICE_CENTS", 20), patch.object(
             cli.config, "MAX_CONTRACT_PRICE_CENTS", 80
         ):
-            with patch("sys.stdout", buf), self.assertRaises(SystemExit):
+            with patch("sys.stdout", buf):
                 cli.cmd_sell(client, args)
+        _assert_success_envelope(self, json.loads(buf.getvalue()), "SELL_DRY_RUN")
+
+    def test_buy_rejects_price_outside_config_range(self):
+        client = MagicMock()
+        args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", price=15)
+        buf = io.StringIO()
+        with patch.object(cli.config, "MIN_CONTRACT_PRICE_CENTS", 20), patch.object(
+            cli.config, "MAX_CONTRACT_PRICE_CENTS", 80
+        ):
+            with patch("sys.stdout", buf), self.assertRaises(SystemExit):
+                cli.cmd_buy(client, args)
         _assert_failure_envelope(
             self, json.loads(buf.getvalue()), "PRICE_OUTSIDE_CONFIG_RANGE"
         )
@@ -614,12 +627,17 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
     # ── Sell position semantics ────────────────────────────────────────────────
 
     def test_sell_no_position_hard_failure(self):
-        """Selling with zero held contracts is ok:false / NO_POSITION."""
+        """A live sell with zero held contracts is ok:false / NO_POSITION.
+        (Dry-run sells never consult live positions, so this is live-only.)"""
         client = MagicMock()
         client.contracts_held_on_side.return_value = 0
-        args = self._make_args(ticker="KXBTCD-28MAR2615-B85000")
+        args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", dry_run=False)
         buf = io.StringIO()
-        with patch("sys.stdout", buf), self.assertRaises(SystemExit) as ctx:
+        with (
+            patch("sys.stdout", buf),
+            patch.dict(os.environ, {"KALSHI_TRADING_LIVE": "1"}, clear=False),
+            self.assertRaises(SystemExit) as ctx,
+        ):
             cli.cmd_sell(client, args)
         self.assertEqual(ctx.exception.code, 1)
         err = json.loads(buf.getvalue())
@@ -628,9 +646,8 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
         client.sell_position.assert_not_called()
 
     def test_sell_within_held_amount_success_no_warnings(self):
-        """Selling <= held contracts: ok:true, SELL_DRY_RUN, warnings=[]."""
+        """Dry-run sells succeed without consulting live positions."""
         client = MagicMock()
-        client.contracts_held_on_side.return_value = 10
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=3, dry_run=True)
         buf = io.StringIO()
         with patch("sys.stdout", buf):
@@ -639,16 +656,17 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
         _assert_success_envelope(self, out, "SELL_DRY_RUN")
         self.assertEqual(out["result"]["count"], 3)
         self.assertEqual(out["result"]["requested_count"], 3)
-        self.assertEqual(out["result"]["position_held"], 10)
         self.assertIsNone(out["result"]["order_id"])
         self.assertIsNone(out["result"]["order_status"])
         self.assertEqual(out["warnings"], [])
         client.sell_position.assert_not_called()
+        # Dry-run buys never create live positions, so the dry-run sell must
+        # not depend on a live position lookup (it used to NO_POSITION here).
+        client.contracts_held_on_side.assert_not_called()
 
     def test_sell_exact_held_amount_success_no_warnings(self):
-        """Selling exactly the held amount: ok:true, SELL_DRY_RUN, warnings=[]."""
+        """Selling exactly the requested amount in dry run: ok:true, warnings=[]."""
         client = MagicMock()
-        client.contracts_held_on_side.return_value = 5
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=5, dry_run=True)
         buf = io.StringIO()
         with patch("sys.stdout", buf):
@@ -660,23 +678,21 @@ class TestCmdBuySellEnvelope(unittest.TestCase):
         self.assertEqual(out["result"]["position_held"], 5)
         self.assertEqual(out["warnings"], [])
 
-    def test_sell_clamps_dry_run_success_with_warning(self):
-        """Requesting more than held in dry run: ok:true, SELL_CLAMPED, warning."""
+    def test_sell_dry_run_does_not_clamp(self):
+        """Dry-run sells no longer consult live positions, so no clamping occurs:
+        the requested count is echoed back and no API lookup is made."""
         client = MagicMock()
-        client.contracts_held_on_side.return_value = 2
         args = self._make_args(ticker="KXBTCD-28MAR2615-B85000", count=5, dry_run=True)
         buf = io.StringIO()
         with patch("sys.stdout", buf):
             cli.cmd_sell(client, args)
         out = json.loads(buf.getvalue())
-        _assert_success_envelope(self, out, "SELL_CLAMPED")
-        self.assertEqual(out["result"]["count"], 2)
+        _assert_success_envelope(self, out, "SELL_DRY_RUN")
+        self.assertEqual(out["result"]["count"], 5)
         self.assertEqual(out["result"]["requested_count"], 5)
-        self.assertEqual(out["result"]["position_held"], 2)
         self.assertIsNone(out["result"]["order_id"])
-        self.assertEqual(len(out["warnings"]), 1)
-        self.assertEqual(out["warnings"][0]["code"], "POSITION_CLAMPED")
-        self.assertIn("clamped", out["warnings"][0]["message"].lower())
+        self.assertEqual(out["warnings"], [])
+        client.contracts_held_on_side.assert_not_called()
         client.sell_position.assert_not_called()
 
     def test_sell_clamps_live_success_with_warning_and_api_call(self):
@@ -947,21 +963,31 @@ class TestDecisionPolicyCoverage(unittest.TestCase):
     without decision semantics."""
 
     def test_all_emitted_codes_have_policy_entries(self):
-        source = inspect.getsource(cli)
-        direct = re.findall(r'_(?:success|failure|die)\(\s*"([A-Z][A-Z_]+)"', source)
+        import kalshi_inprocess_orders
+        from kalshi_agent_envelope import DECISION_POLICY
+
+        # The CLI delegates buys/sells to kalshi_inprocess_orders, so scan both
+        # modules for emitted codes.
+        source = inspect.getsource(cli) + inspect.getsource(kalshi_inprocess_orders)
+        direct = re.findall(
+            r'(?:_success|_failure|_die|success_envelope|failure_envelope)\(\s*\n?\s*"([A-Z][A-Z_]+)"',
+            source,
+        )
         assigned = re.findall(r'\bcode\s*=\s*"([A-Z][A-Z_]+)"', source)
         emitted = set(direct + assigned)
         self.assertGreaterEqual(
             len(emitted), 10, "suspiciously few codes found in source"
         )
-        missing = emitted - set(cli.DECISION_POLICY.keys())
+        missing = emitted - set(DECISION_POLICY.keys())
         self.assertEqual(
             missing, set(),
             f"Response codes emitted by CLI but missing from DECISION_POLICY: {missing}",
         )
 
     def test_policy_keys_are_well_formed(self):
-        for code, values in cli.DECISION_POLICY.items():
+        from kalshi_agent_envelope import DECISION_POLICY
+
+        for code, values in DECISION_POLICY.items():
             self.assertIsInstance(code, str, f"policy key must be str: {code!r}")
             self.assertEqual(code, code.upper(), f"policy key must be uppercase: {code}")
             self.assertEqual(len(values), 3, f"policy tuple must be 3-tuple: {code}")

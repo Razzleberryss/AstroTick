@@ -106,10 +106,8 @@ import logging
 import os
 import re
 import sys
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
 
 STOP_FILE = Path(os.environ.get("OPENCLAW_STOP_FILE", str(Path.home() / ".openclaw" / "workspace" / "STOP_TRADING")))
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -127,11 +125,10 @@ from kalshi_money import enrich_market_quotes_from_dollar_fields  # noqa: E402
 log = logging.getLogger("openclaw_kalshi")
 
 from kalshi_agent_envelope import (  # noqa: E402
-    DECISION_POLICY,
-    DECISION_POLICY,
     failure_envelope as _failure,
     success_envelope as _success,
 )
+from kalshi_inprocess_orders import buy_envelope, sell_envelope  # noqa: E402
 
 
 def _stop_file() -> Path:
@@ -145,19 +142,6 @@ def _check_stop_file():
             "STOP_TRADING",
             f"STOP_TRADING file exists at {stop_file}. Remove it to resume trading.",
         )
-
-
-def _check_live_gate(args):
-    """Refuse real orders unless KALSHI_TRADING_LIVE=1 or --dry-run."""
-    if getattr(args, "dry_run", False):
-        return True
-    if os.environ.get("KALSHI_TRADING_LIVE") != "1":
-        _die(
-            "LIVE_TRADING_BLOCKED",
-            "Real trading blocked. Set KALSHI_TRADING_LIVE=1 to enable, "
-            "or pass --dry-run.",
-        )
-    return False
 
 
 def _die(code: str, error: str, *, details: dict = None, exit_code: int = 1):
@@ -327,13 +311,20 @@ def resolve_live_market_ticker(
             detail_lines.append(f"  ... and {len(filtered_out) - 10} more")
         raise RuntimeError("\n".join(detail_lines))
 
-    candidates.sort(key=lambda m: (m.get("close_time", ""), -(m.get("volume", 0) or 0)))
+    def _volume(m: dict) -> float:
+        # Current API sends fixed-point string volume_fp; 'volume' is legacy.
+        try:
+            return float(m.get("volume_fp") or m.get("volume") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    candidates.sort(key=lambda m: (m.get("close_time", ""), -_volume(m)))
     chosen = candidates[0]
     chosen_ticker = chosen["ticker"]
 
     _debug_print(
         f"RESOLVED: {chosen_ticker} (close_time={chosen.get('close_time')}, "
-        f"volume={chosen.get('volume', 0)}, out of {len(candidates)} candidates)",
+        f"volume={_volume(chosen)}, out of {len(candidates)} candidates)",
         debug,
     )
 
@@ -410,7 +401,7 @@ def cmd_markets(client: KalshiClient, args):
                 "no_ask": m.get("no_ask"),
                 "no_bid": m.get("no_bid"),
                 "last_price": m.get("last_price"),
-                "volume": m.get("volume"),
+                "volume": m.get("volume_fp") or m.get("volume"),
             }
         )
 
@@ -639,145 +630,43 @@ def cmd_orderbook(client: KalshiClient, args):
     _out(_success("ORDERBOOK_OK", result, warnings or None), args.human)
 
 
+def _emit_envelope(envelope: dict, human: bool):
+    """Print an order envelope and exit non-zero on failure (CLI contract)."""
+    _out(envelope, human)
+    if not envelope.get("ok"):
+        sys.exit(1)
+
+
 def cmd_buy(client: KalshiClient, args):
+    """Place a buy. Validation, gating, and API calls live in the shared
+    in-process envelope builder (kalshi_inprocess_orders.buy_envelope); this
+    command only resolves the ticker and formats the output."""
     _check_stop_file()
-    dry_run = _check_live_gate(args)
-
     ticker = _resolve_ticker_from_args(client, args, caller="buy")
-    side = args.side.lower()
-    count = args.count
-    price_cents = args.price
-
-    if side not in ("yes", "no"):
-        _die("INVALID_SIDE", "side must be 'yes' or 'no'")
-    if count < 1:
-        _die("INVALID_COUNT", "count must be >= 1")
-    if not (1 <= price_cents <= 99):
-        _die("INVALID_PRICE_RANGE", "price must be 1-99 (cents)")
-    if not (
-        config.MIN_CONTRACT_PRICE_CENTS
-        <= price_cents
-        <= config.MAX_CONTRACT_PRICE_CENTS
-    ):
-        _die(
-            "PRICE_OUTSIDE_CONFIG_RANGE",
-            f"price {price_cents}c outside allowed range "
-            f"[{config.MIN_CONTRACT_PRICE_CENTS}, {config.MAX_CONTRACT_PRICE_CENTS}]",
-        )
-
-    cost_dollars = count * price_cents / 100
-    if cost_dollars > config.MAX_TRADE_DOLLARS:
-        _die(
-            "EXCEEDS_MAX_TRADE_DOLLARS",
-            f"Order cost ${cost_dollars:.2f} exceeds MAX_TRADE_DOLLARS "
-            f"${config.MAX_TRADE_DOLLARS:.2f}",
-        )
-
-    client_order_id = str(uuid.uuid4())
-    mode = "DRY_RUN" if dry_run else "LIVE"
-
-    audit = {
-        "action": "BUY",
-        "ticker": ticker,
-        "side": side,
-        "count": count,
-        "price_cents": price_cents,
-        "cost_dollars": cost_dollars,
-        "client_order_id": client_order_id,
-        "mode": mode,
-        "order_id": None,
-        "order_status": None,
-    }
-
-    if dry_run:
-        _out(_success("BUY_DRY_RUN", audit), args.human)
-        return
-
-    api_result = client.place_order(ticker, side, count, price_cents, dry_run=False)
-    order = api_result.get("order", {}) if api_result else {}
-    audit["order_id"] = order.get("order_id")
-    audit["order_status"] = order.get("status")
-    _out(_success("BUY_PLACED", audit), args.human)
+    envelope = buy_envelope(
+        client,
+        ticker,
+        args.side.lower(),
+        args.count,
+        args.price,
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    _emit_envelope(envelope, args.human)
 
 
 def cmd_sell(client: KalshiClient, args):
+    """Place a sell via the shared in-process envelope builder."""
     _check_stop_file()
-    dry_run = _check_live_gate(args)
-
     ticker = _resolve_ticker_from_args(client, args, caller="sell")
-    side = args.side.lower()
-    count = args.count
-    price_cents = args.price
-
-    if side not in ("yes", "no"):
-        _die("INVALID_SIDE", "side must be 'yes' or 'no'")
-    if count < 1:
-        _die("INVALID_COUNT", "count must be >= 1")
-    if not (1 <= price_cents <= 99):
-        _die("INVALID_PRICE_RANGE", "price must be 1-99 (cents)")
-    if not (
-        config.MIN_CONTRACT_PRICE_CENTS
-        <= price_cents
-        <= config.MAX_CONTRACT_PRICE_CENTS
-    ):
-        _die(
-            "PRICE_OUTSIDE_CONFIG_RANGE",
-            f"price {price_cents}c outside allowed range "
-            f"[{config.MIN_CONTRACT_PRICE_CENTS}, {config.MAX_CONTRACT_PRICE_CENTS}]",
-        )
-
-    requested_count = count
-    held = client.contracts_held_on_side(ticker, side)
-    if held == 0:
-        _die(
-            "NO_POSITION",
-            f"No open {side.upper()} contracts for {ticker}. "
-            f"Use status to inspect positions (YES = long YES, NO = long NO).",
-        )
-
-    sell_count = min(requested_count, held)
-    clamped = sell_count < requested_count
-
-    client_order_id = str(uuid.uuid4())
-    mode = "DRY_RUN" if dry_run else "LIVE"
-
-    audit = {
-        "action": "SELL",
-        "ticker": ticker,
-        "side": side,
-        "count": sell_count,
-        "requested_count": requested_count,
-        "price_cents": price_cents,
-        "position_held": held,
-        "client_order_id": client_order_id,
-        "mode": mode,
-        "order_id": None,
-        "order_status": None,
-    }
-
-    warnings = []
-    if clamped:
-        warnings.append({
-            "code": "POSITION_CLAMPED",
-            "message": (
-                f"Requested sell of {requested_count} contracts exceeds "
-                f"{side.upper()} position of {held}; clamped to {sell_count}."
-            ),
-        })
-
-    if dry_run:
-        code = "SELL_CLAMPED" if clamped else "SELL_DRY_RUN"
-        _out(_success(code, audit, warnings), args.human)
-        return
-
-    api_result = client.sell_position(
-        ticker, side, sell_count, price_cents, dry_run=False,
+    envelope = sell_envelope(
+        client,
+        ticker,
+        args.side.lower(),
+        args.count,
+        args.price,
+        dry_run=bool(getattr(args, "dry_run", False)),
     )
-    order = api_result.get("order", {}) if api_result else {}
-    audit["order_id"] = order.get("order_id")
-    audit["order_status"] = order.get("status")
-    code = "SELL_CLAMPED" if clamped else "SELL_PLACED"
-    _out(_success(code, audit, warnings), args.human)
+    _emit_envelope(envelope, args.human)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────

@@ -274,11 +274,16 @@ def decide_trade_fee_aware(
     # ── 4. Fee and net EV check ────────────────────────────────────────────────
     # P_exit=0.5 is intentionally the worst-case (maximum-fee) assumption:
     # P*(1-P) peaks at P=0.5, so using 0.5 maximises the estimated close fee,
-    # making the EV filter more conservative and harder to pass.
+    # making the EV filter more conservative and harder to pass. (A position held
+    # to settlement pays no close fee at all, so this over- rather than
+    # under-estimates costs.)
     P_exit = 0.5
-    # Fees are in cents (ceil of formula); convert to dollars for EV comparison
-    fee_open_cents = math.ceil(0.07 * C * P * (1.0 - P))
-    fee_close_cents = math.ceil(0.07 * C * P_exit * (1.0 - P_exit))
+    # Kalshi fee schedule: ceil(rate * C * P * (1-P)) rounded up to the next
+    # cent. rate * C * P * (1-P) is in dollars, so multiply by 100 before
+    # ceiling to get whole cents.
+    fee_rate = getattr(cfg, "KALSHI_FEE_RATE", 0.07)
+    fee_open_cents = math.ceil(fee_rate * C * P * (1.0 - P) * 100.0)
+    fee_close_cents = math.ceil(fee_rate * C * P_exit * (1.0 - P_exit) * 100.0)
     ev_net_per_contract = ev_gross - (fee_open_cents + fee_close_cents) / 100.0 / C
 
     if ev_net_per_contract < cfg.MIN_EXPECTED_NET_PER_CONTRACT:
@@ -439,64 +444,19 @@ def _extract_best_bid_depth(raw_array) -> tuple:
     """
     Return ``(best_bid_price_dollars, best_bid_count)`` from a raw orderbook side.
 
-    Each entry may be one of:
-      - ``[price, count]`` where *price* is a string dollar (``"0.55"``),
-        a float dollar (``0.55``), or an integer cent value (``55``).
-      - A dict with ``"price"`` / ``"price_dollars"`` and ``"size"`` / ``"count"`` keys.
-
-    Returns ``(None, 0)`` when the array is empty or completely unparseable.
+    Thin wrapper around the shared orderbook_utils parser (one parser for all
+    modules); zero-size levels are skipped. Returns ``(None, 0)`` when the
+    array is empty or completely unparseable.
     """
     if not raw_array or not isinstance(raw_array, list):
         return None, 0
 
-    best_price: Optional[float] = None
-    best_count: int = 0
+    from orderbook_utils import parse_bid_array
 
-    for entry in raw_array:
-        price = None
-        count = 0
-
-        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
-            price, count = entry[0], entry[1]
-        elif isinstance(entry, dict):
-            price = entry.get("price") or entry.get("price_dollars")
-            count = entry.get("size") if entry.get("size") is not None else entry.get("count", 0)
-        else:
-            continue
-
-        # Convert price to the 0-1 dollar range
-        try:
-            if isinstance(price, str):
-                price_d = float(price)
-                if price_d > 1.0:       # treat as cents by mistake
-                    price_d /= 100.0
-            elif isinstance(price, float):
-                price_d = price if price <= 1.0 else price / 100.0
-            elif isinstance(price, int):
-                # Integer prices from Kalshi are always in cents (1=1¢, 99=99¢).
-                # Always divide by 100 to convert to dollars.
-                price_d = price / 100.0
-            else:
-                price_d = float(price)
-                if price_d > 1.0:
-                    price_d /= 100.0
-        except (TypeError, ValueError):
-            continue
-
-        try:
-            count_i = int(float(count))
-        except (TypeError, ValueError):
-            count_i = 0
-
-        if count_i <= 0:
-            continue
-
-        # Keep the highest-priced (best bid) level
-        if best_price is None or price_d > best_price:
-            best_price = price_d
-            best_count = count_i
-
-    return best_price, best_count
+    for price_cents, count in parse_bid_array(raw_array):
+        if count > 0:
+            return price_cents / 100.0, count
+    return None, 0
 
 
 def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
@@ -584,7 +544,7 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     yes_raw, no_raw = _extract_raw(orderbook)
 
     yes_bid_price, yes_depth = _extract_best_bid_depth(yes_raw)
-    no_bid_price, _          = _extract_best_bid_depth(no_raw)
+    no_bid_price, no_depth   = _extract_best_bid_depth(no_raw)
 
     # YES ask = 1 − best NO bid (standard Kalshi complementary pricing).
     # Fall back to the market-dict value when the NO side is empty.
@@ -630,19 +590,23 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
         )
         return None
 
-    # ── YES depth check ───────────────────────────────────────────────────────
-    if yes_depth < config.MIN_YES_DEPTH:
+    # ── Depth check on the entry side ─────────────────────────────────────────
+    # A position is exited into its own side's bids, so require depth on the
+    # side we are about to enter (MIN_YES_DEPTH for YES, MIN_NO_DEPTH for NO).
+    side_depth = yes_depth if side == "yes" else no_depth
+    side_min_depth = config.MIN_YES_DEPTH if side == "yes" else config.MIN_NO_DEPTH
+    if side_depth < side_min_depth:
         log.info(
-            "YES depth %d < MIN_YES_DEPTH %d — skipping cycle",
-            yes_depth, config.MIN_YES_DEPTH,
+            "%s depth %d < MIN_%s_DEPTH %d — skipping cycle",
+            side.upper(), side_depth, side.upper(), side_min_depth,
         )
         return None
 
     log.info(
         "Liquidity OK: spread=%.4f ($%.2fc) <= MAX_SLIPPAGE %.4f, "
-        "yes_depth=%d >= MIN_YES_DEPTH %d — proceeding",
+        "%s_depth=%d >= MIN_%s_DEPTH %d — proceeding",
         effective_spread, effective_spread * 100, config.MAX_SLIPPAGE,
-        yes_depth, config.MIN_YES_DEPTH,
+        side, side_depth, side.upper(), side_min_depth,
     )
 
     # Map composite score to a model probability estimate.

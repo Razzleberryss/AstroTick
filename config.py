@@ -7,7 +7,6 @@ Import this module everywhere instead of calling os.getenv() directly.
 import os
 import logging
 from pathlib import Path
-from typing import Optional
 from dotenv import load_dotenv
 
 # -- Load .env file from project root ----------------------------------------
@@ -89,9 +88,10 @@ BTC_SERIES_TICKER: str = os.getenv("BTC_SERIES_TICKER", "KXBTC15M")
 BTC_TICKER: str = os.getenv("BTC_TICKER", "BTC-USD")  # yfinance symbol
 MOMENTUM_LOOKBACK_BARS: int = int(os.getenv("MOMENTUM_LOOKBACK_BARS", "5"))
 # Period passed to yfinance when fetching BTC 1-minute bars for momentum.
-# Default of "60m" keeps downloads small (~60 bars) while covering the lookback.
-# Increase (e.g. "1d") only in environments where recent bars are frequently missing.
-BTC_MOMENTUM_HISTORY_PERIOD: str = os.getenv("BTC_MOMENTUM_HISTORY_PERIOD", "60m")
+# Must be a valid yfinance period ("1d", "5d", ...): minute-style values like
+# "60m" are rejected by yfinance and would leave the momentum signal empty.
+# "1d" is the smallest period that reliably covers the lookback window.
+BTC_MOMENTUM_HISTORY_PERIOD: str = os.getenv("BTC_MOMENTUM_HISTORY_PERIOD", "1d")
 
 # USE_ORDERBOOK_PRICES: When True, fetch quotes from the orderbook instead of
 # the /markets API response. Defaults to True (new behavior). Set
@@ -104,18 +104,19 @@ USE_ORDERBOOK_PRICES: bool = os.getenv("USE_ORDERBOOK_PRICES", "true").lower() =
 USE_WEBSOCKET_ORDERBOOK: bool = os.getenv("USE_WEBSOCKET_ORDERBOOK", "false").lower() == "true"
 
 # Trading threshold parameters - tunable for more/less aggressive trading
+# MIN_EDGE_THRESHOLD: minimum signal confidence required before a signal
+# reversal is allowed to exit an open position (see manage_positions in bot.py).
 MIN_EDGE_THRESHOLD: float = float(os.getenv("MIN_EDGE_THRESHOLD", "0.02"))
 MIN_CONFIDENCE: float = float(os.getenv("MIN_CONFIDENCE", "0.003"))
-MAX_PRICE_DEVIATION: float = float(os.getenv("MAX_PRICE_DEVIATION", "0.12"))
+# Maximum |model_p_yes - market_mid| before a signal is discarded as implausible.
+# Must comfortably exceed MIN_EDGE_PCT, otherwise the deviation filter rejects
+# exactly the high-conviction signals that pass the edge gate (validated below).
+MAX_PRICE_DEVIATION: float = float(os.getenv("MAX_PRICE_DEVIATION", "0.20"))
 MAX_SLIPPAGE: float = float(os.getenv("MAX_SLIPPAGE", "0.20"))
 
 # =============================================================================
 # Liquidity Filters
 # =============================================================================
-# Maximum allowed spread (in probability terms, 0.0-1.0) before skipping trade
-# Example: 0.12 means 12 cents or 12 percentage points spread
-MAX_SPREAD: float = float(os.getenv("MAX_SPREAD", "0.55"))
-
 # Minimum orderbook depth at best YES/NO bid level.
 # Lowered from 50 to 5 so the bot trades on thin-but-real books;
 # raise via MIN_YES_DEPTH / MIN_NO_DEPTH env vars to be more selective.
@@ -129,6 +130,12 @@ DEPTH_BAND: float = float(os.getenv("DEPTH_BAND", "0.20"))
 # =============================================================================
 # Fee-Aware Entry Parameters
 # =============================================================================
+# Kalshi taker fee rate used in the fee-aware EV filter. The standard schedule
+# is ceil(rate * contracts * P * (1-P)) in cents with rate=0.07; the KXBTC15M
+# series reports fee_type=quadratic / fee_multiplier=1, which matches.
+# Override here if Kalshi changes the schedule for this series.
+KALSHI_FEE_RATE: float = float(os.getenv("KALSHI_FEE_RATE", "0.07"))
+
 # Minimum probability mispricing (in percentage points) required to place a
 # trade.  E.g. 0.10 means model must be at least 10 pp above/below market.
 MIN_EDGE_PCT: float = float(os.getenv("MIN_EDGE_PCT", "0.10"))
@@ -151,17 +158,6 @@ MAX_SIZE: int = int(os.getenv("MAX_SIZE", "10"))
 # At this mispricing level (and above) the sizer uses MAX_SIZE contracts.
 MAX_EDGE_PCT: float = float(os.getenv("MAX_EDGE_PCT", "0.30"))
 
-# Optional fractional position sizing (in fixed-point contract counts)
-# If set, overrides BASE_SIZE/MAX_SIZE for position sizing
-# Example: ORDER_SIZE_FP=5 means always trade 5 contracts
-ORDER_SIZE_FP: Optional[int] = None
-_order_size_fp_str = os.getenv("ORDER_SIZE_FP", "")
-if _order_size_fp_str:
-    try:
-        ORDER_SIZE_FP = int(_order_size_fp_str)
-    except ValueError:
-        pass
-
 # =============================================================================
 # API Client
 # =============================================================================
@@ -183,11 +179,6 @@ LOOP_INTERVAL_SECONDS: int = POLL_INTERVAL_SECONDS  # alias used in bot.py
 
 # How many seconds before contract close_time to trigger the expiry exit
 EXPIRY_EXIT_SECONDS: int = int(os.getenv("EXPIRY_EXIT_SECONDS", "120"))
-
-# =============================================================================
-# When True, bot buy/sell uses kalshi_inprocess_orders (same envelopes as CLI)
-# instead of spawning openclaw_kalshi.py per order.
-INPROCESS_KALSHI_ORDERS: bool = os.getenv("INPROCESS_KALSHI_ORDERS", "true").lower() == "true"
 
 # Skip writing dashboard_state.json if unchanged and last write was within this
 # many seconds (0 = write every cycle).
@@ -240,6 +231,13 @@ def validate() -> None:
         errors.append("MIN_CONFIDENCE must be between 0 and 1")
     if not (0.0 < MAX_PRICE_DEVIATION <= 1.0):
         errors.append("MAX_PRICE_DEVIATION must be between 0 (exclusive) and 1 (inclusive)")
+    if MAX_PRICE_DEVIATION < MIN_EDGE_PCT + 0.05:
+        errors.append(
+            "MAX_PRICE_DEVIATION must be at least MIN_EDGE_PCT + 0.05, otherwise the "
+            "deviation filter rejects the signals that pass the edge gate"
+        )
+    if not (0.0 < KALSHI_FEE_RATE < 1.0):
+        errors.append("KALSHI_FEE_RATE must be between 0 and 1")
     if not (0.0 < MAX_SLIPPAGE <= 1.0):
         errors.append("MAX_SLIPPAGE must be between 0 (exclusive) and 1 (inclusive)")
     if not (0.0 < MIN_EDGE_PCT < 1.0):
@@ -285,16 +283,12 @@ def validate() -> None:
     if MAX_TRADES_PER_WINDOW < 1:
         errors.append("MAX_TRADES_PER_WINDOW must be >= 1")
     # Liquidity filter validations
-    if not (0.0 <= MAX_SPREAD <= 1.0):
-        errors.append("MAX_SPREAD must be between 0 and 1")
     if MIN_YES_DEPTH < 0:
         errors.append("MIN_YES_DEPTH must be >= 0")
     if MIN_NO_DEPTH < 0:
         errors.append("MIN_NO_DEPTH must be >= 0")
     if not (0.0 <= DEPTH_BAND <= 1.0):
         errors.append("DEPTH_BAND must be between 0 and 1")
-    if ORDER_SIZE_FP is not None and ORDER_SIZE_FP < 1:
-        errors.append("ORDER_SIZE_FP must be >= 1 when set")
     if errors:
         raise EnvironmentError(
             "Config validation failed:\n" + "\n".join(f"  - {e}" for e in errors)

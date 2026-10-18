@@ -49,10 +49,17 @@ class BotRequirementsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             client._ensure_btc_market("NOTBTC-TEST")
 
-    def test_no_side_pnl_is_side_aware(self):
+    def test_no_side_pnl_uses_side_denominated_prices(self):
+        # NO entry and exit prices are both NO-denominated, so a NO position
+        # entered at 60c and sold at 40c lost 20c per contract.
         risk = RiskManager()
-        pnl = risk.log_exit_trade("BTCZ-TEST", "no", 2, 60, 40, "take profit")
-        self.assertEqual(pnl, 40)
+        pnl = risk.log_exit_trade("BTCZ-TEST", "no", 2, 60, 40, "stop loss")
+        self.assertEqual(pnl, -40)
+
+    def test_no_side_pnl_gain_when_no_price_rises(self):
+        risk = RiskManager()
+        pnl = risk.log_exit_trade("BTCZ-TEST", "no", 2, 40, 70, "take profit")
+        self.assertEqual(pnl, 60)
 
 
 class TestComputeTradeContracts(unittest.TestCase):

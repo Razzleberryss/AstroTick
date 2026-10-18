@@ -30,7 +30,7 @@ import colorlog
 
 import config
 from kalshi_client import KalshiClient
-from risk_manager import RiskManager
+from risk_manager import RiskManager, compute_pnl_cents
 from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
 from agent_decision_engine import AgentAction
 import cli_executor
@@ -203,54 +203,180 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # ── CLI execution wrappers ────────────────────────────────────────────────────────────────────
 
 def _cli_buy(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
-    """Execute a buy via in-process envelope or CLI subprocess + decision engine."""
-    if config.INPROCESS_KALSHI_ORDERS:
-        from kalshi_inprocess_orders import buy_envelope
+    """Execute a buy via an in-process order envelope + decision engine.
 
-        def _fn():
-            return buy_envelope(
-                client, ticker, side, count, price_cents, dry_run=dry_run,
-            )
+    (The old alternative — spawning openclaw_kalshi.py per order — was removed:
+    it resolved tickers against its own default series, so every bot order was
+    rejected with INVALID_TICKER. openclaw_kalshi.py remains as a manual CLI.)
+    """
+    from kalshi_inprocess_orders import buy_envelope
 
-        return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
-    args = ["buy", "--ticker", ticker, side, str(count), str(price_cents)]
-    if dry_run:
-        args.append("--dry-run")
-    return cli_executor.execute_with_decision_engine(args)
+    def _fn():
+        return buy_envelope(
+            client, ticker, side, count, price_cents, dry_run=dry_run,
+        )
+
+    return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
 
 
 def _cli_sell(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
-    """Execute a sell via in-process envelope or CLI subprocess + decision engine."""
-    if config.INPROCESS_KALSHI_ORDERS:
-        from kalshi_inprocess_orders import sell_envelope
+    """Execute a sell via an in-process order envelope + decision engine."""
+    from kalshi_inprocess_orders import sell_envelope
 
-        def _fn():
-            return sell_envelope(
-                client, ticker, side, count, price_cents, dry_run=dry_run,
-            )
+    def _fn():
+        return sell_envelope(
+            client, ticker, side, count, price_cents, dry_run=dry_run,
+        )
 
-        return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
-    args = ["sell", "--ticker", ticker, side, str(count), str(price_cents)]
-    if dry_run:
-        args.append("--dry-run")
-    return cli_executor.execute_with_decision_engine(args)
+    return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
 
 # ── Position Management ────────────────────────────────────────────────────────────────────────
+def _record_exit(risk: RiskManager, closed: dict) -> None:
+    """Record a (possibly partial) exit yielded by manage_positions."""
+    if closed.get("unfilled"):
+        risk.reduce_position(closed["market"], closed["size"])
+    else:
+        risk.record_closed_position(closed["market"])
+    risk.log_exit_trade(
+        market=closed["market"],
+        side=closed["side"],
+        size=closed["size"],
+        entry_price=closed["entry_price"],
+        exit_price=closed["exit_price"],
+        exit_reason=closed["exit_reason"],
+    )
+
+
+def _order_fill_info(envelope: dict, requested: "int | float", submitted_price: int) -> tuple:
+    """
+    Extract (filled_count, fill_price_cents) from an order envelope.
+
+    Live CreateOrderV2 responses carry the exact IOC fill, which can be
+    FRACTIONAL (0.01-contract granularity) even for whole-contract orders, so
+    the count is kept as a float — flooring would leave real sub-contract
+    exposure untracked. Dry-run envelopes carry no fill info, so treat them as
+    fully filled at the submitted price.
+    """
+    result = (envelope or {}).get("result", {}) or {}
+    filled = result.get("fill_count")
+    if filled is None:
+        return requested, submitted_price
+    try:
+        filled = round(float(filled), 2)
+    except (TypeError, ValueError):
+        return requested, submitted_price
+    price = result.get("average_fill_price_cents") or submitted_price
+    return filled, int(price)
+
+
+def _market_for_stale_position(client: KalshiClient, ticker: str):
+    """
+    Fetch market data for a tracked position whose market is no longer the
+    active one (the bot moved to a newer 15-minute window).
+
+    Returns (market_dict, settled_result):
+      - (dict, None)  — market still trades; dict carries orderbook quotes
+      - (None, 'yes'|'no') — market settled with that result
+      - (None, None)  — no usable data this cycle (closed-not-settled, API error)
+    """
+    try:
+        data = client.get_market(ticker)
+    except Exception as exc:
+        log.error("Could not fetch market for tracked position %s: %s", ticker, exc)
+        return None, None
+
+    mkt = data.get("market") if isinstance(data.get("market"), dict) else data
+    if not isinstance(mkt, dict) or not mkt.get("ticker"):
+        return None, None
+
+    result = (mkt.get("result") or "").lower()
+    status = (mkt.get("status") or "").lower()
+    if result in ("yes", "no"):
+        return None, result
+    if status not in ("open", "active"):
+        # Closed but not yet settled: retry on a later cycle.
+        return None, None
+
+    try:
+        orderbook = client.get_orderbook(ticker)
+        quotes = _quotes_from_orderbook(orderbook)
+        mkt.update(quotes)
+        for new_field, legacy_field in (
+            ("best_yes_bid", "yes_bid"),
+            ("best_yes_ask", "yes_ask"),
+            ("best_no_bid", "no_bid"),
+            ("best_no_ask", "no_ask"),
+        ):
+            if quotes.get(new_field) is not None:
+                mkt[legacy_field] = quotes[new_field]
+    except Exception as exc:
+        log.debug("Could not fetch orderbook for stale position %s: %s", ticker, exc)
+    return mkt, None
+
+
 def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, current_signal=None):
     """
-    Check positions opened by this bot for stop-loss, take-profit, signal reversal, or expiry.
-    Only positions recorded via risk.record_open_position() are managed here, so pre-existing
-    positions from other bots on the same account are never touched.
-    Yields a dict for every position that is exited.
+    Check every position opened by this bot for stop-loss, take-profit, signal
+    reversal, expiry, or settlement. Only positions recorded via
+    risk.record_open_position() are managed here, so pre-existing positions
+    from other bots on the same account are never touched.
+
+    The active market's position is evaluated against the already-fetched
+    *market* dict; positions left over from earlier windows get their market
+    data fetched on demand, and settled markets are reconciled at the
+    settlement value so their PnL reaches the daily-loss accounting instead of
+    silently bypassing it. Yields a dict for every position (or part) exited.
     """
+    active_ticker = market["ticker"]
+
+    for ticker, pos in risk.get_open_positions().items():
+        if _halt_trading:
+            return
+
+        if ticker == active_ticker:
+            yield from _manage_single_position(
+                client, market, risk, pos, current_signal=current_signal,
+            )
+            continue
+
+        stale_market, settled_result = _market_for_stale_position(client, ticker)
+        if stale_market is not None:
+            yield from _manage_single_position(
+                client, stale_market, risk, pos, current_signal=None,
+            )
+        elif settled_result is not None:
+            # Settled: each contract pays 100c if the result matches the held
+            # side, else 0c. No order is needed — this is pure accounting.
+            exit_price = 100 if settled_result == pos["side"] else 0
+            pnl_cents = compute_pnl_cents(
+                pos["side"], pos["entry_price"], exit_price, pos["quantity"],
+            )
+            log_trade(
+                "EXIT %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc | reason=settled",
+                ticker, pos["side"], pos["entry_price"], exit_price, pnl_cents,
+            )
+            yield {
+                "market": ticker,
+                "side": pos["side"],
+                "size": pos["quantity"],
+                "entry_price": pos["entry_price"],
+                "exit_price": exit_price,
+                "exit_reason": "settled",
+                "unfilled": 0,
+            }
+        else:
+            log.debug(
+                "Tracked position %s: market closed but not yet settled; will retry",
+                ticker,
+            )
+
+
+def _manage_single_position(
+    client: KalshiClient, market: dict, risk: RiskManager, pos: dict, current_signal=None
+):
+    """Evaluate one tracked position against its market dict; yield an exit record."""
     global _halt_trading
     ticker = market["ticker"]
-    bot_positions = risk.get_open_positions()
-
-    if ticker not in bot_positions:
-        return
-
-    pos = bot_positions[ticker]
     side = pos["side"]
     count = pos["quantity"]
     entry_price = pos["entry_price"]
@@ -303,15 +429,6 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
 
     if exit_reason:
         exit_price = max(1, current_price - 1)  # aggressive limit sell
-        pnl_cents = (
-            (exit_price - entry_price) * count
-            if side == "yes"
-            else (entry_price - exit_price) * count
-        )
-        log_trade(
-            "EXIT %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc | reason=%s",
-            ticker, side, entry_price, exit_price, pnl_cents, exit_reason,
-        )
         outcome, _env = _cli_sell(
             client, ticker, side, count, exit_price, dry_run=config.DRY_RUN,
         )
@@ -324,13 +441,26 @@ def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, curr
                 outcome.action.value, outcome.code,
             )
             return
+        filled, fill_price = _order_fill_info(_env, count, exit_price)
+        if filled < 0.01:
+            log.warning(
+                "Exit order for %s did not fill (IOC); keeping position tracked for retry",
+                ticker,
+            )
+            return
+        pnl_cents = compute_pnl_cents(side, entry_price, fill_price, filled)
+        log_trade(
+            "EXIT %s | side=%s | entry=%dc | exit=%dc | filled=%s/%s | pnl=%+dc | reason=%s",
+            ticker, side, entry_price, fill_price, filled, count, pnl_cents, exit_reason,
+        )
         yield {
             "market": ticker,
             "side": side,
-            "size": count,
+            "size": filled,
             "entry_price": entry_price,
-            "exit_price": exit_price,
+            "exit_price": fill_price,
             "exit_reason": exit_reason,
+            "unfilled": max(0.0, round(count - filled, 2)),
         }
 
 # ── Core bot loop ─────────────────────────────────────────────────────────────────────────────
@@ -547,6 +677,10 @@ def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
     try:
         return _run_once_impl(client, risk, ws_client, state)
     finally:
+        # Centralized end-of-cycle bookkeeping: clearing the datetime cache and
+        # flushing the trade-log buffer here covers every return/exception path
+        # (the per-path calls this replaces leaked on several of them).
+        risk._clear_datetime_cache()
         write_dashboard_state(state)
 
 
@@ -558,13 +692,11 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     market = client.get_active_btc_market()
     if not market:
         log.warning("No active BTC 15-min market found. Skipping cycle.")
-        risk._clear_datetime_cache()
         return False
 
     ticker = market["ticker"]
     if not ticker.startswith(f"{config.BTC_SERIES_TICKER}-"):
         log.error("Refusing non-BTC-series market: %s", ticker)
-        risk._clear_datetime_cache()
         return False
 
     if state is not None:
@@ -607,7 +739,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
             positions = fut_pos.result()
     except Exception as exc:
         log.error("API fetch error: %s", exc)
-        risk._clear_datetime_cache()
         return False
 
     # 2b. Populate market dict with orderbook-based quotes if enabled
@@ -658,7 +789,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                 yes_raw,
                 no_raw,
             )
-            risk._clear_datetime_cache()
             return False
 
         # Hard orderbook sanity validation before strategy evaluation.
@@ -686,7 +816,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                 yes_raw,
                 no_raw,
             )
-            risk._clear_datetime_cache()
             return False
     else:
         # Use old market data fields
@@ -746,27 +875,17 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     exit_error = False
     try:
         for closed in manage_positions(client, market, risk, current_signal=sig) or []:
-            risk.record_closed_position(closed["market"])
-            risk.log_exit_trade(
-                market=closed["market"],
-                side=closed["side"],
-                size=closed["size"],
-                entry_price=closed["entry_price"],
-                exit_price=closed["exit_price"],
-                exit_reason=closed["exit_reason"],
-            )
+            _record_exit(risk, closed)
     except Exception as exc:
         log.error("Error while managing positions: %s", exc, exc_info=True)
         exit_error = True
 
     if _halt_trading:
-        risk._clear_datetime_cache()
         return False
 
     # If position management failed, skip new entries to avoid trading with
     # unrecorded/un-exited positions.
     if exit_error:
-        risk._clear_datetime_cache()
         return False
 
     # 5. Risk check for NEW trade
@@ -774,7 +893,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     # filters) but still returned a directional Signal for reversal-exit
     # purposes; skip entry.
     if sig is None or sig.size == 0:
-        risk._clear_datetime_cache()
         return False
         
     approved, reason = risk.approve_trade(sig, balance, positions, ticker)
@@ -782,7 +900,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         # Don't log "Already have position" as an error, it's normal if we didn't exit
         if "Already have" not in reason:
             log.info("New trade rejected by risk manager: %s", reason)
-        risk._clear_datetime_cache()
         return False
 
     # 6. Size the trade
@@ -792,7 +909,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     contracts = _compute_trade_contracts(sig.size, budget_contracts)
     if contracts < 1:
         log.warning("Contract count is 0 — price too high for budget. Skipping.")
-        risk._clear_datetime_cache()
         return False
 
     log_trade(
@@ -807,16 +923,21 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     )
     if outcome.action == AgentAction.HALT_TRADING:
         _halt_trading = True
-        risk._clear_datetime_cache()
         return False
     if outcome.action != AgentAction.CONTINUE:
-        risk._clear_datetime_cache()
         return False
     order_id = envelope.get("result", {}).get("order_id")
 
-    # 8. Log to CSV and track the open position
-    risk.record_open_position(ticker, sig.side, contracts, sig.price_cents)
-    risk.log_entry_trade(ticker, sig.side, contracts, sig.price_cents)
+    # 8. Track only what actually filled (orders are IOC: the response is final;
+    # recording the requested size would create phantom positions on no-fill).
+    filled, fill_price = _order_fill_info(envelope, contracts, sig.price_cents)
+    if filled < 0.01:
+        log.info("BUY %s did not fill (IOC) — no position opened this cycle", ticker)
+        return False
+    if filled < contracts:
+        log.info("BUY %s partially filled: %s/%s contracts", ticker, filled, contracts)
+    risk.record_open_position(ticker, sig.side, filled, fill_price)
+    risk.log_entry_trade(ticker, sig.side, filled, fill_price)
     log.debug("Order id: %s", order_id)
 
     # Refresh dashboard position size after new trade is recorded
@@ -825,7 +946,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         state["position_size"] = _pos["quantity"] if _pos else 0
 
     # Clear datetime cache at end of cycle
-    risk._clear_datetime_cache()
     return True
 
 
@@ -855,24 +975,14 @@ def _run_once_time_delay(
     exit_error = False
     try:
         for closed in manage_positions(client, market, risk) or []:
-            risk.record_closed_position(closed["market"])
-            risk.log_exit_trade(
-                market=closed["market"],
-                side=closed["side"],
-                size=closed["size"],
-                entry_price=closed["entry_price"],
-                exit_price=closed["exit_price"],
-                exit_reason=closed["exit_reason"],
-            )
+            _record_exit(risk, closed)
     except Exception as exc:
         log.error("Error while managing positions (time_delay): %s", exc, exc_info=True)
         exit_error = True
 
     if exit_error:
-        risk._clear_datetime_cache()
         return False
     if _halt_trading:
-        risk._clear_datetime_cache()
         return False
 
     # 2. Compute window context
@@ -889,10 +999,18 @@ def _run_once_time_delay(
     # and exit prices from bid (the price we can realistically sell at).
     # Support both old field names (yes_ask, yes_bid) and new (best_yes_ask, best_yes_bid)
     # Consolidate market data lookups to avoid redundant dictionary access
-    yes_ask_cents = market.get("best_yes_ask") or market.get("yes_ask", 50)
-    no_ask_cents = market.get("best_no_ask") or market.get("no_ask", 50)
-    yes_bid_cents = market.get("best_yes_bid") or market.get("yes_bid", 50)
-    no_bid_cents = market.get("best_no_bid") or market.get("no_bid", 50)
+    yes_ask_cents = market.get("best_yes_ask") or market.get("yes_ask")
+    no_ask_cents = market.get("best_no_ask") or market.get("no_ask")
+    yes_bid_cents = market.get("best_yes_bid") or market.get("yes_bid")
+    no_bid_cents = market.get("best_no_bid") or market.get("no_bid")
+    if None in (yes_ask_cents, no_ask_cents, yes_bid_cents, no_bid_cents):
+        # Never trade on invented quotes: the old 50c fallback could trigger
+        # entries/exits at prices unrelated to the actual book.
+        log.warning(
+            "time_delay: incomplete quotes for %s (yes %s/%s no %s/%s) — skipping cycle",
+            ticker, yes_bid_cents, yes_ask_cents, no_bid_cents, no_ask_cents,
+        )
+        return False
     up_price = float(yes_ask_cents) / 100.0   # ask — used for entry trigger
     down_price = float(no_ask_cents) / 100.0  # ask — used for entry trigger
     up_bid = float(yes_bid_cents) / 100.0     # bid — used for stop-loss exit
@@ -934,15 +1052,6 @@ def _run_once_time_delay(
         entry_price = bot_pos["entry_price"]
         current_price = market.get(f"{side}_bid", entry_price)
         exit_price_order = max(1, current_price - 1)
-        pnl_cents = (
-            (exit_price_order - entry_price) * count
-            if side == "yes"
-            else (entry_price - exit_price_order) * count
-        )
-        log_trade(
-            "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | pnl=%+dc",
-            ticker, side, entry_price, exit_price_order, pnl_cents,
-        )
         outcome, _env = _cli_sell(
             client, ticker, side, count, exit_price_order, dry_run=config.DRY_RUN,
         )
@@ -951,23 +1060,35 @@ def _run_once_time_delay(
             return False
         if outcome.action != AgentAction.CONTINUE:
             return False
-        risk.record_closed_position(ticker)
-        risk.log_exit_trade(
-            market=ticker,
-            side=side,
-            size=count,
-            entry_price=entry_price,
-            exit_price=exit_price_order,
-            exit_reason="time_delay_exit",
+        filled, fill_price = _order_fill_info(_env, count, exit_price_order)
+        if filled < 0.01:
+            log.warning(
+                "time_delay: exit order for %s did not fill (IOC); retrying next cycle",
+                ticker,
+            )
+            return False
+        pnl_cents = compute_pnl_cents(side, entry_price, fill_price, filled)
+        log_trade(
+            "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | filled=%s/%s | pnl=%+dc",
+            ticker, side, entry_price, fill_price, filled, count, pnl_cents,
         )
+        _record_exit(risk, {
+            "market": ticker,
+            "side": side,
+            "size": filled,
+            "entry_price": entry_price,
+            "exit_price": fill_price,
+            "exit_reason": "time_delay_exit",
+            "unfilled": max(0.0, round(count - filled, 2)),
+        })
         if state is not None:
-            state["position_size"] = 0
+            _pos = risk.get_open_positions().get(ticker)
+            state["position_size"] = _pos["quantity"] if _pos else 0
             state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
         return True
 
     # 5. Handle new entries
     if action not in ("ENTER_YES", "ENTER_NO"):
-        risk._clear_datetime_cache()
         return False
 
     side = "yes" if action == "ENTER_YES" else "no"
@@ -987,14 +1108,12 @@ def _run_once_time_delay(
     if not approved:
         if "Already have" not in reason:
             log.info("time_delay trade rejected by risk manager: %s", reason)
-        risk._clear_datetime_cache()
         return False
 
     budget_contracts = risk.calculate_contracts(sig_stub.price_cents)
     contracts = _compute_trade_contracts(sig_stub.size, budget_contracts)
     if contracts < 1:
         log.warning("time_delay: contract count is 0 — price too high for budget. Skipping.")
-        risk._clear_datetime_cache()
         return False
 
     log_trade(
@@ -1008,15 +1127,17 @@ def _run_once_time_delay(
     )
     if outcome.action == AgentAction.HALT_TRADING:
         _halt_trading = True
-        risk._clear_datetime_cache()
         return False
     if outcome.action != AgentAction.CONTINUE:
-        risk._clear_datetime_cache()
         return False
     order_id = envelope.get("result", {}).get("order_id")
 
-    risk.record_open_position(ticker, side, contracts, sig_stub.price_cents)
-    risk.log_entry_trade(ticker, side, contracts, sig_stub.price_cents)
+    filled, fill_price = _order_fill_info(envelope, contracts, sig_stub.price_cents)
+    if filled < 0.01:
+        log.info("time_delay: BUY %s did not fill (IOC) — no position opened", ticker)
+        return False
+    risk.record_open_position(ticker, side, filled, fill_price)
+    risk.log_entry_trade(ticker, side, filled, fill_price)
     _last_trade_window_id = current_window_id
     _trades_in_current_window += 1
     log.debug("time_delay order id: %s", order_id)
@@ -1028,7 +1149,6 @@ def _run_once_time_delay(
         state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
 
     # Clear datetime cache at end of cycle
-    risk._clear_datetime_cache()
     return True
 
 def main():
@@ -1045,7 +1165,6 @@ def main():
     log.info(" Max Daily Loss : %sc", config.MAX_DAILY_LOSS_CENTS)
     log.info(" Max Daily Trades: %s", config.MAX_DAILY_TRADES)
     log.info(" Use WebSocket: %s", config.USE_WEBSOCKET_ORDERBOOK)
-    log.info(" In-process orders: %s", config.INPROCESS_KALSHI_ORDERS)
     log.info("=" * 60)
     if config.KALSHI_ENV == "prod" and not config.DRY_RUN:
         log.warning("!" * 60)
@@ -1099,6 +1218,9 @@ def main():
             log.info("Shutting down WebSocket client...")
             ws_client.stop()
         _shutdown_fetch_executor()
+        # Don't lose buffered trade rows on halt/shutdown: restart accounting
+        # (daily loss limit) is rebuilt from this file.
+        risk._flush_trade_log_buffer()
 
     log.info("Bot stopped cleanly.")
 

@@ -109,18 +109,12 @@ def index():
     def fmt4(v):
         return "N/A" if v is None else f"{v:.4f}"
 
-    def pnl_cls(v):
-        if v is None or v == 0:
-            return ""
-        return "pos" if v > 0 else "neg"
-
     return render_template_string(
         _HTML,
         state=state,
         error=error,
         fmt=fmt,
         fmt4=fmt4,
-        pnl_cls=pnl_cls,
     )
 
 

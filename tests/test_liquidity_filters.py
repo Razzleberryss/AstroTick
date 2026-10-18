@@ -113,7 +113,6 @@ class TestLiquidityFilters(unittest.TestCase):
 
     def setUp(self):
         """Save original config values."""
-        self.original_max_spread = config.MAX_SPREAD
         self.original_min_yes_depth = config.MIN_YES_DEPTH
         self.original_min_no_depth = config.MIN_NO_DEPTH
         self.original_min_confidence = config.MIN_CONFIDENCE
@@ -122,7 +121,6 @@ class TestLiquidityFilters(unittest.TestCase):
 
     def tearDown(self):
         """Restore original config values."""
-        config.MAX_SPREAD = self.original_max_spread
         config.MIN_YES_DEPTH = self.original_min_yes_depth
         config.MIN_NO_DEPTH = self.original_min_no_depth
         config.MIN_CONFIDENCE = self.original_min_confidence
@@ -187,18 +185,18 @@ class TestLiquidityFilters(unittest.TestCase):
 
     @patch('strategy.get_btc_momentum')
     @patch('strategy.get_orderbook_skew')
-    def test_low_no_depth_does_not_block_trade(self, mock_skew, mock_momentum):
-        """NO depth is no longer a blocking filter; only YES depth matters."""
+    def test_low_no_depth_does_not_block_yes_trade(self, mock_skew, mock_momentum):
+        """A YES entry only requires YES-side depth; thin NO depth is irrelevant."""
         mock_momentum.return_value = 0.5
         mock_skew.return_value = 0.3
 
         config.MIN_CONFIDENCE = 0.001
         config.MAX_SLIPPAGE = 0.20
         config.MIN_YES_DEPTH = 5   # Low threshold → YES depth will satisfy this
-        config.MIN_NO_DEPTH = 100  # High threshold, but no longer enforced
+        config.MIN_NO_DEPTH = 100  # High threshold, irrelevant for a YES entry
 
-        # YES depth = 100 (satisfies MIN_YES_DEPTH=5), NO depth = 1 (would have
-        # failed the old MIN_NO_DEPTH=100 check, but that check is removed).
+        # YES depth = 100 (satisfies MIN_YES_DEPTH=5); NO depth = 1 does not
+        # matter because the signal side is YES.
         market = {
             "best_yes_bid": 48,
             "best_yes_ask": 52,
@@ -210,17 +208,41 @@ class TestLiquidityFilters(unittest.TestCase):
             "orderbook": {"yes": [[48, 100]], "no": [[48, 1]]}
         }
 
-        # generate_signal is not mocked for decide_trade_fee_aware here — it may
-        # return None due to the fee/band filters, but it must NOT return None
-        # solely because NO depth is low.  We verify by asserting the signal
-        # is not blocked at the NO-depth stage (price/fee filters may still kick in).
-        # We mock decide_trade to force a tradeable signal.
         with unittest.mock.patch('strategy.decide_trade_fee_aware', return_value=("BUY_YES", 5)):
             config.MAX_PRICE_DEVIATION = 0.50
             signal = generate_signal(market, orderbook)
 
-        # Signal should not be None because NO depth is not a blocking filter any more
         self.assertIsNotNone(signal)
+
+    @patch('strategy.get_btc_momentum')
+    @patch('strategy.get_orderbook_skew')
+    def test_low_no_depth_blocks_no_trade(self, mock_skew, mock_momentum):
+        """A NO entry requires NO-side depth >= MIN_NO_DEPTH (exit liquidity)."""
+        mock_momentum.return_value = -0.5
+        mock_skew.return_value = -0.3
+
+        config.MIN_CONFIDENCE = 0.001
+        config.MAX_SLIPPAGE = 0.20
+        config.MIN_YES_DEPTH = 1
+        config.MIN_NO_DEPTH = 100  # NO side is too thin for a NO entry
+
+        market = {
+            "best_yes_bid": 48,
+            "best_yes_ask": 52,
+            "best_no_bid": 48,
+            "best_no_ask": 52,
+        }
+
+        orderbook = {
+            "orderbook": {"yes": [[48, 100]], "no": [[48, 1]]}
+        }
+
+        with unittest.mock.patch('strategy.decide_trade_fee_aware', return_value=("BUY_NO", 5)):
+            config.MAX_PRICE_DEVIATION = 0.50
+            signal = generate_signal(market, orderbook)
+
+        # Blocked at the NO-depth stage: NO depth (1) < MIN_NO_DEPTH (100)
+        self.assertIsNone(signal)
 
     @patch('strategy.get_btc_momentum')
     @patch('strategy.get_orderbook_skew')
@@ -232,7 +254,6 @@ class TestLiquidityFilters(unittest.TestCase):
         mock_decide.return_value = ("BUY_YES", 5)
 
         config.MIN_CONFIDENCE = 0.001
-        config.MAX_SPREAD = 0.10
         config.MIN_YES_DEPTH = 50
         config.MIN_NO_DEPTH = 50
         config.MAX_SLIPPAGE = 0.10  # Allow up to 10 cent spread for MAX_SLIPPAGE filter
@@ -244,7 +265,7 @@ class TestLiquidityFilters(unittest.TestCase):
             "best_yes_ask": 52,
             "best_no_bid": 48,
             "best_no_ask": 52,
-            "spread": 0.04,  # Within MAX_SPREAD
+            "spread": 0.04,
             "yes_depth_near_mid": 100,  # Above MIN_YES_DEPTH
             "no_depth_near_mid": 100,  # Above MIN_NO_DEPTH
         }

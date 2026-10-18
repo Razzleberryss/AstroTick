@@ -13,19 +13,21 @@ blast radius while migrating from a hand-rolled REST client to:
 
 from __future__ import annotations
 
-import datetime
 import logging
 import random
 import time
 import uuid
-from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Optional
 
 import config
-from kalshi_money import enrich_market_quotes_from_dollar_fields, fmt_cents
-import requests
+from kalshi_money import (
+    enrich_market_quotes_from_dollar_fields,
+    fmt_cents,
+    parse_dollars_to_cents_int,
+    position_count,
+)
 
 try:
     from kalshi_python_sync import Configuration as _SdkConfiguration
@@ -44,31 +46,6 @@ class _NoopSdk:
         )
 
 log = logging.getLogger(__name__)
-
-# Order create responses: Kalshi removed "pending" from the public status enum.
-_ORDER_CREATE_OK_STATUSES = frozenset(
-    {"resting", "queued", "open", "executed", "filled", "partially_filled"}
-)
-
-_LOG_BODY_MAX_LEN = 500
-
-
-def _truncate_for_log(text: Optional[str], max_len: int = _LOG_BODY_MAX_LEN) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    if len(text) <= max_len:
-        return text
-    return text[:max_len] + f"... [truncated, {len(text)} chars]"
-
-
-@dataclass
-class HistoricalCutoffs:
-    # Retained for backward compatibility. The SDK supports historical endpoints,
-    # but this repo only uses these cutoffs in optional debug helpers.
-    market_settled_ts: datetime.datetime
-    trades_created_ts: datetime.datetime
-    orders_updated_ts: datetime.datetime
 
 
 def _pick_trade_api_host() -> str:
@@ -124,8 +101,8 @@ def _get_first_present(d: dict, *keys: str) -> Any:
 
 def _price_cents_to_dollars_fp(price_cents: int) -> str:
     """
-    Convert integer cents (1-99) to a dollars fixed-point string for SDK fields.
-    Prefer 4dp ("0.5500") to align with *_dollars_fp conventions.
+    Convert integer cents (1-99) to a fixed-point dollars string for the
+    CreateOrderV2 'price' field (2 decimals, e.g. "0.55").
     """
     try:
         cents = int(price_cents)
@@ -133,7 +110,28 @@ def _price_cents_to_dollars_fp(price_cents: int) -> str:
         raise ValueError(f"price_cents must be an int, got {price_cents!r}")
     if not (0 <= cents <= 100):
         raise ValueError(f"price_cents out of range 0-100: {cents}")
-    d = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+    d = (Decimal(cents) / Decimal(100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return format(d, "f")
+
+
+def _fp_to_count(value: Any, default: float = 0.0) -> float:
+    """
+    Parse a fixed-point count string like '3.00' or '2.57' into a float,
+    rounded to Kalshi's 0.01-contract granularity. Fills CAN be fractional
+    even for whole-contract orders, so counts must never be floored to ints:
+    a '0.50' fill floored to 0 would leave a real position untracked.
+    """
+    if value is None:
+        return default
+    try:
+        return round(float(str(value)), 2)
+    except (TypeError, ValueError):
+        return default
+
+
+def _count_to_fp(count: Any) -> str:
+    """Format a contract count for CreateOrderV2's fixed-point 'count' field."""
+    d = Decimal(str(count)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     return format(d, "f")
 
 
@@ -147,12 +145,6 @@ class KalshiClient:
     def __init__(self):
         self.base_url = _pick_trade_api_host()
         self.api_key_id = config.KALSHI_API_KEY_ID
-        self._cutoffs: Optional[HistoricalCutoffs] = None
-        self._cutoffs_fetched_at: Optional[datetime.datetime] = None
-        # Retain a requests.Session for legacy tests that validate retry behavior.
-        # The trading bot itself uses the SDK for all network calls.
-        self.session = requests.Session()
-        self.session.headers.update({"Content-Type": "application/json"})
 
         # Initialize SDK client with defensive logging.
         try:
@@ -208,365 +200,57 @@ class KalshiClient:
         # Backward-compatibility shim: some unit tests patch this symbol.
         return None
 
-    # ── Legacy request helper (tests rely on this) ─────────────────────────────────────────────
-    def _request(self, method: str, path: str, params: dict = None, json: dict = None) -> dict:
+    # ── SDK call wrapper (timeout + transient-error retry) ────────────────────────────────────
+    def _sdk_get(self, method_name: str, **params) -> Any:
         """
-        Legacy helper retained for unit tests and a few historical utilities.
+        Call a read-only SDK method with the configured request timeout,
+        retrying transient failures (5xx / connection problems) with backoff.
 
-        NOTE: Production code paths should prefer SDK methods.
+        Order placement deliberately does NOT go through this helper: blindly
+        retrying a create-order call can double-submit.
         """
-        url = (getattr(config, "BASE_URL", self.base_url) or self.base_url) + path
-
-        last_exc: Exception = RuntimeError("No attempts made")
+        fn = getattr(self._sdk, method_name)
         max_attempts = 1 + max(0, int(getattr(config, "REQUEST_MAX_RETRIES", 0)))
+        last_exc: Exception = RuntimeError("No attempts made")
         for attempt in range(max_attempts):
             try:
-                resp = self.session.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json,
-                    timeout=int(getattr(config, "REQUEST_TIMEOUT_SECONDS", 5)),
-                )
-
-                if not resp.ok:
-                    try:
-                        error_data = resp.json()
-                        error_code = error_data.get("error", {}).get("code", "unknown")
-                        error_msg = error_data.get("error", {}).get("message", resp.text)
-                        log.error(
-                            "Kalshi API error %s %s -> HTTP %s: code=%s message=%s",
-                            method, path, resp.status_code, error_code,
-                            _truncate_for_log(str(error_msg)),
-                        )
-                    except Exception:
-                        log.error(
-                            "Kalshi API error %s %s -> HTTP %s: %s",
-                            method, path, resp.status_code, _truncate_for_log(resp.text),
-                        )
-                    resp.raise_for_status()
-                return resp.json()
-            except requests.exceptions.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else 0
-                if status < 500:
+                return fn(**params, _request_timeout=config.REQUEST_TIMEOUT_SECONDS)
+            except Exception as exc:
+                if not self._is_transient_sdk_error(exc):
                     raise
                 last_exc = exc
                 log.warning(
-                    "Server error %s %s status=%s (attempt %d/%d)",
-                    method, path, status, attempt + 1, max_attempts,
+                    "Transient Kalshi API error in %s (attempt %d/%d): %s",
+                    method_name, attempt + 1, max_attempts, exc,
                 )
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
-                last_exc = exc
-                log.warning(
-                    "Transient error %s %s (attempt %d/%d): %s",
-                    method, path, attempt + 1, max_attempts, exc,
-                )
-
-            if attempt < max_attempts - 1:
-                backoff = random.uniform(0.1, max(0.2, 2 ** attempt))
-                log.info("Retrying in %.2fs...", backoff)
-                time.sleep(backoff)
-
+                if attempt < max_attempts - 1:
+                    # Backoff jitter, not a cryptographic use of randomness.
+                    time.sleep(random.uniform(0.1, max(0.2, 2 ** attempt)))  # nosec B311
         log.error(
-            "Kalshi API %s %s failed after %d attempt(s): %s",
-            method, path, max_attempts, last_exc,
+            "Kalshi API %s failed after %d attempt(s): %s",
+            method_name, max_attempts, last_exc,
         )
         raise last_exc
 
-    # ── Historical helpers ───────────────────────────────────────────────────────────────────────
     @staticmethod
-    def _ensure_utc_datetime(ts: datetime.datetime) -> datetime.datetime:
-        if ts.tzinfo is None:
-            return ts.replace(tzinfo=datetime.timezone.utc)
-        return ts.astimezone(datetime.timezone.utc)
-
-    @classmethod
-    def _parse_datetime_to_utc(cls, raw_ts, field_name: str) -> datetime.datetime:
-        if isinstance(raw_ts, datetime.datetime):
-            return cls._ensure_utc_datetime(raw_ts)
-        if isinstance(raw_ts, (int, float)):
-            return datetime.datetime.fromtimestamp(raw_ts, tz=datetime.timezone.utc)
-        if isinstance(raw_ts, str):
-            cleaned = raw_ts.strip()
-            if cleaned.endswith("Z"):
-                cleaned = cleaned[:-1] + "+00:00"
-            try:
-                parsed = datetime.datetime.fromisoformat(cleaned)
-                return cls._ensure_utc_datetime(parsed)
-            except ValueError:
-                try:
-                    return datetime.datetime.fromtimestamp(float(cleaned), tz=datetime.timezone.utc)
-                except ValueError as exc:
-                    raise ValueError(f"Could not parse datetime field '{field_name}': {raw_ts}") from exc
-        raise ValueError(f"Unsupported datetime type for '{field_name}': {type(raw_ts)}")
-
-    @classmethod
-    def _to_unix_ts(cls, ts: datetime.datetime) -> int:
-        return int(cls._ensure_utc_datetime(ts).timestamp())
-
-    def _fetch_paginated_list(self, fetch_fn, list_key: str, params: dict | None = None) -> list[dict]:
-        """
-        Generic cursor pagination helper for SDK list endpoints.
-
-        fetch_fn should accept **params and return an object/dict with:
-          - list_key: list[dict]
-          - cursor: str | None
-        """
-        out: list[dict] = []
-        req_params = dict(params or {})
-        seen_cursors: set[str] = set()
-
-        while True:
-            raw = fetch_fn(**req_params)
-            data = _to_dict(raw)
-            rows = data.get(list_key, []) or []
-            if isinstance(rows, list):
-                out.extend(rows)
-            cursor = data.get("cursor")
-            if not cursor:
-                break
-            if cursor in seen_cursors:
-                log.warning("Stopping pagination due to repeated cursor '%s'", cursor)
-                break
-            seen_cursors.add(cursor)
-            req_params["cursor"] = cursor
-
-        return out
-
-    def _get_historical_cutoffs(self, force_refresh: bool = False) -> HistoricalCutoffs:
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if (
-            not force_refresh
-            and self._cutoffs is not None
-            and self._cutoffs_fetched_at is not None
-            and (now_utc - self._cutoffs_fetched_at) < datetime.timedelta(hours=1)
-        ):
-            return self._cutoffs
-
-        # SDK method naming is stable for this endpoint; normalize to dict regardless.
-        data = _to_dict(self._sdk.get_historical_cutoff())
-        cutoffs = HistoricalCutoffs(
-            market_settled_ts=self._parse_datetime_to_utc(data["market_settled_ts"], "market_settled_ts"),
-            trades_created_ts=self._parse_datetime_to_utc(data["trades_created_ts"], "trades_created_ts"),
-            orders_updated_ts=self._parse_datetime_to_utc(data["orders_updated_ts"], "orders_updated_ts"),
+    def _is_transient_sdk_error(exc: Exception) -> bool:
+        """True for errors worth retrying: HTTP 5xx/429 and connection-level failures."""
+        status = getattr(exc, "status", None)
+        if isinstance(status, int):
+            return status >= 500 or status == 429
+        # urllib3 / socket-level errors surface without a status attribute.
+        return exc.__class__.__name__ in (
+            "MaxRetryError",
+            "NewConnectionError",
+            "ConnectTimeoutError",
+            "ReadTimeoutError",
+            "ProtocolError",
+            "TimeoutError",
+            "ConnectionError",
         )
-        self._cutoffs = cutoffs
-        self._cutoffs_fetched_at = now_utc
-        return cutoffs
-
-    def _fill_time(self, fill: dict) -> datetime.datetime:
-        created_time = fill.get("created_time")
-        if created_time is not None:
-            return self._parse_datetime_to_utc(created_time, "fill.created_time")
-        ts = fill.get("ts")
-        if ts is not None:
-            return self._parse_datetime_to_utc(ts, "fill.ts")
-        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-    def _order_update_time(self, order: dict) -> datetime.datetime:
-        last_update_time = order.get("last_update_time")
-        if last_update_time is not None:
-            return self._parse_datetime_to_utc(last_update_time, "order.last_update_time")
-        updated_time = order.get("updated_time")
-        if updated_time is not None:
-            return self._parse_datetime_to_utc(updated_time, "order.updated_time")
-        updated_ts = order.get("updated_ts")
-        if updated_ts is not None:
-            return self._parse_datetime_to_utc(updated_ts, "order.updated_ts")
-        created_time = order.get("created_time")
-        if created_time is not None:
-            return self._parse_datetime_to_utc(created_time, "order.created_time")
-        return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
-
-    def _fetch_live_fills(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        params = {
-            "min_ts": self._to_unix_ts(start_ts),
-            "max_ts": self._to_unix_ts(end_ts),
-            "limit": 200,
-        }
-        return self._fetch_paginated_list(self._sdk.get_fills, "fills", params=params)
-
-    def _fetch_historical_fills(self, end_ts: datetime.datetime) -> list[dict]:
-        params = {"max_ts": self._to_unix_ts(end_ts), "limit": 200}
-        return self._fetch_paginated_list(self._sdk.get_historical_fills, "fills", params=params)
-
-    def _fetch_live_orders(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        params = {
-            "min_ts": self._to_unix_ts(start_ts),
-            "max_ts": self._to_unix_ts(end_ts),
-            "limit": 200,
-        }
-        return self._fetch_paginated_list(self._sdk.get_orders, "orders", params=params)
-
-    def _fetch_historical_orders(self, end_ts: datetime.datetime) -> list[dict]:
-        params = {"max_ts": self._to_unix_ts(end_ts), "limit": 200}
-        return self._fetch_paginated_list(self._sdk.get_historical_orders, "orders", params=params)
 
     # ── Public API methods ────────────────────────────────────────────────────────────────────────
     # New SDK-style public methods (limit-based), plus compatibility shims.
-    def get_fills(self, *args: Any, limit: Optional[int] = None) -> list[dict]:
-        """Return recent fills, or support legacy get_fills(start_ts, end_ts)."""
-        try:
-            if len(args) == 2:
-                start_ts, end_ts = args
-                if not (
-                    isinstance(start_ts, datetime.datetime)
-                    and isinstance(end_ts, datetime.datetime)
-                ):
-                    raise TypeError(
-                        "get_fills(start_ts, end_ts) requires datetime arguments"
-                    )
-                return self.get_fills_in_range(start_ts, end_ts)
-            if len(args) > 1:
-                raise TypeError(
-                    "get_fills accepts either (limit) or (start_ts, end_ts)"
-                )
-
-            effective_limit = limit if limit is not None else (args[0] if args else 100)
-            raw = self._sdk.get_fills(limit=int(effective_limit))
-            data = _to_dict(raw)
-            return data.get("fills", []) or []
-        except Exception as exc:
-            log.error("get_fills failed: %s", exc, exc_info=True)
-            raise
-
-    def get_orders(self, limit: int = 100) -> list[dict]:
-        """Return recent orders (portfolio) as a list of dicts."""
-        try:
-            raw = self._sdk.get_orders(limit=int(limit))
-            data = _to_dict(raw)
-            return data.get("orders", []) or []
-        except Exception as exc:
-            log.error("get_orders failed: %s", exc, exc_info=True)
-            raise
-
-    # Compatibility: keep the previous time-ranged methods available under old names.
-    def get_fills_in_range(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        """
-        Return fills across live + historical data for [start_ts, end_ts].
-        """
-        start_utc = self._ensure_utc_datetime(start_ts)
-        end_utc = self._ensure_utc_datetime(end_ts)
-        if end_utc < start_utc:
-            raise ValueError("end_ts must be greater than or equal to start_ts")
-
-        cutoffs = self._get_historical_cutoffs()
-        cutoff = cutoffs.trades_created_ts
-
-        fills: list[dict] = []
-
-        # Historical segment: [start, min(end, cutoff))
-        hist_end = min(end_utc, cutoff)
-        if start_utc < hist_end:
-            hist_rows = self._fetch_historical_fills(hist_end)
-            fills.extend(
-                f
-                for f in hist_rows
-                if start_utc <= self._fill_time(f) < hist_end
-            )
-
-        # Live segment: [max(start, cutoff), end]
-        live_start = max(start_utc, cutoff)
-        if live_start <= end_utc:
-            live_rows = self._fetch_live_fills(live_start, end_utc)
-            fills.extend(
-                f
-                for f in live_rows
-                if live_start <= self._fill_time(f) <= end_utc
-            )
-
-        fills.sort(key=self._fill_time)
-        return fills
-
-    def get_orders_in_range(self, start_ts: datetime.datetime, end_ts: datetime.datetime) -> list[dict]:
-        """
-        Return orders across live + historical data for [start_ts, end_ts].
-        """
-        start_utc = self._ensure_utc_datetime(start_ts)
-        end_utc = self._ensure_utc_datetime(end_ts)
-        if end_utc < start_utc:
-            raise ValueError("end_ts must be greater than or equal to start_ts")
-
-        cutoffs = self._get_historical_cutoffs()
-        cutoff = cutoffs.orders_updated_ts
-
-        orders: list[dict] = []
-
-        # Active/resting orders are always in /portfolio/orders.
-        live_rows = self._fetch_live_orders(start_utc, end_utc)
-        orders.extend(
-            o
-            for o in live_rows
-            if start_utc <= self._order_update_time(o) <= end_utc
-        )
-
-        # Historical orders are canceled/executed orders with update time before cutoff.
-        hist_end = min(end_utc, cutoff)
-        if start_utc < hist_end:
-            hist_rows = self._fetch_historical_orders(hist_end)
-            orders.extend(
-                o
-                for o in hist_rows
-                if start_utc <= self._order_update_time(o) < hist_end
-            )
-
-        # De-duplicate by order_id in case APIs overlap at boundary conditions.
-        # Cache update times to avoid re-parsing timestamps on every comparison.
-        deduped_by_id: dict[str, dict] = {}
-        deduped_update_times: dict[str, datetime.datetime] = {}
-        for order in orders:
-            order_id = order.get("order_id")
-            if order_id:
-                order_time = self._order_update_time(order)
-                if order_id not in deduped_update_times or order_time >= deduped_update_times[order_id]:
-                    deduped_by_id[order_id] = order
-                    deduped_update_times[order_id] = order_time
-                continue
-            deduped_by_id[f"_anon_{len(deduped_by_id)}"] = order
-
-        merged = list(deduped_by_id.values())
-        merged.sort(key=self._order_update_time)
-        return merged
-
-    def get_market_with_history(self, ticker: str) -> dict:
-        """
-        Placeholder: route between live GET /markets/{ticker} and historical
-        market/candle endpoints using GET /historical/cutoff market_settled_ts
-        when the contract is settled. For now this is a thin alias of get_market().
-        """
-        return self.get_market(ticker)
-
-    def debug_historical_cutoffs(self) -> None:
-        """
-        Log current historical cutoffs and run a small fill sample around cutoff.
-        """
-        cutoffs = self._get_historical_cutoffs(force_refresh=True)
-        log.info(
-            "Historical cutoffs: market_settled_ts=%s trades_created_ts=%s orders_updated_ts=%s",
-            cutoffs.market_settled_ts.isoformat(),
-            cutoffs.trades_created_ts.isoformat(),
-            cutoffs.orders_updated_ts.isoformat(),
-        )
-
-        sample_start = cutoffs.trades_created_ts - datetime.timedelta(minutes=5)
-        sample_end = cutoffs.trades_created_ts + datetime.timedelta(minutes=5)
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        sample_end = min(sample_end, now_utc)
-
-        if sample_start >= sample_end:
-            return
-
-        try:
-            sample_fills = self.get_fills(sample_start, sample_end)
-            log.info(
-                "Historical cutoff sample fills [%s, %s]: %d rows",
-                sample_start.isoformat(),
-                sample_end.isoformat(),
-                len(sample_fills),
-            )
-        except Exception as exc:
-            log.warning("debug_historical_cutoffs sample fetch failed: %s", exc)
-
     def get_balance(self) -> float:
         """
         Return available balance in dollars.
@@ -575,7 +259,7 @@ class KalshiClient:
         The legacy integer-cents 'balance' field is deprecated.
         """
         try:
-            raw = self._sdk.get_balance()
+            raw = self._sdk_get("get_balance")
             data = _to_dict(raw)
             # Prefer *_dollars string if present.
             bal_dollars = _get_first_present(data, "balance_dollars", "available_balance_dollars")
@@ -610,7 +294,7 @@ class KalshiClient:
             "status": "open",
             "limit": 10,
         }
-        data = _to_dict(self._sdk.get_markets(**params))
+        data = _to_dict(self._sdk_get("get_markets", **params))
         markets = data.get("markets", []) or []
         if not markets:
             log.warning("No open BTC 15-min markets found for series %s", config.BTC_SERIES_TICKER)
@@ -647,7 +331,7 @@ class KalshiClient:
         params: dict = {"series_ticker": series_ticker, "limit": limit}
         if status is not None:
             params["status"] = status
-        data = _to_dict(self._sdk.get_markets(**params))
+        data = _to_dict(self._sdk_get("get_markets", **params))
         return data.get("markets", []) or []
 
     def list_markets(
@@ -672,17 +356,12 @@ class KalshiClient:
         list_markets / get_markets when you only need the markets list.
         """
         # Preserve existing shape used by historical.py: includes cursor for pagination.
-        return _to_dict(self._sdk.get_markets(**(params or {})))
+        return _to_dict(self._sdk_get("get_markets", **(params or {})))
 
     def get_orderbook(self, ticker: str, depth: int = 10) -> dict:
         """Return the full orderbook dict for a market ticker."""
         try:
-            # SDK exposes get_market_orderbook per provided facts.
-            raw = self._sdk.get_market_orderbook(ticker=ticker, depth=int(depth))
-            return _to_dict(raw)
-        except TypeError:
-            # Some generated clients use positional args.
-            raw = self._sdk.get_market_orderbook(ticker, int(depth))
+            raw = self._sdk_get("get_market_orderbook", ticker=ticker, depth=int(depth))
             return _to_dict(raw)
         except Exception as exc:
             log.error("get_orderbook failed for %s: %s", ticker, exc, exc_info=True)
@@ -827,7 +506,7 @@ class KalshiClient:
         get_fills() for historical P&L and closed positions.
         """
         try:
-            data = _to_dict(self._sdk.get_positions())
+            data = _to_dict(self._sdk_get("get_positions"))
             # API v2 uses "market_positions" but some clients use "positions".
             rows = _get_first_present(data, "market_positions", "positions")
             return rows or []
@@ -835,40 +514,15 @@ class KalshiClient:
             log.error("get_positions failed: %s", exc, exc_info=True)
             raise
 
-    def get_settlements(self, params: Optional[dict] = None) -> list[dict]:
-        """Portfolio settlements (settled positions / payouts). Pass-through query params (pagination, filters) as supported by the API."""
-        req = dict(params or {})
-        req.setdefault("limit", 200)
-        return self._fetch_paginated_list(self._sdk.get_settlements, "settlements", params=req)
-
-    def get_account_limits(self) -> dict:
-        """GET /account/limits — trading / account limits for the authenticated user."""
-        return _to_dict(self._sdk.get_account_limits())
-
-    def get_markets_orderbooks(self, tickers: list[str]) -> dict[str, dict]:
-        """
-        GET /markets/orderbooks for up to 100 tickers per request.
-        Returns ticker -> {"ticker", "orderbook_fp", ...} rows (suitable for orderbook_utils.extract_raw_arrays).
-        """
-        out: dict[str, dict] = {}
-        if not tickers:
-            return out
-        for i in range(0, len(tickers), 100):
-            chunk = tickers[i : i + 100]
-            # SDK expects repeated 'tickers' query params; accept list.
-            data = _to_dict(self._sdk.get_markets_orderbooks(tickers=chunk))
-            for row in (data.get("orderbooks", []) or []):
-                t = row.get("ticker")
-                if t:
-                    out[t] = row
-        return out
-
-    def contracts_held_on_side(self, ticker: str, side: str) -> int:
+    def contracts_held_on_side(self, ticker: str, side: str) -> float:
         """
         Return non-negative contract count held on side for ticker, or 0.
 
-        Kalshi uses a signed ``position`` per market: positive = long YES,
-        negative = long NO.
+        Kalshi reports a signed per-market count: positive = long YES,
+        negative = long NO. The current API sends it as the fixed-point string
+        ``position_fp``; older payloads used the integer ``position``.
+        Holdings can be fractional (0.01-contract granularity), so the count is
+        returned as-is — flooring would strand sub-contract exposure unsellable.
         """
         side = side.lower()
         if side not in ("yes", "no"):
@@ -876,40 +530,18 @@ class KalshiClient:
         for p in self.get_positions():
             if p.get("ticker") != ticker:
                 continue
-            pos = int(p.get("position", 0) or 0)
+            pos = position_count(p)
             if side == "yes" and pos > 0:
-                return pos
+                return round(pos, 2)
             if side == "no" and pos < 0:
-                return abs(pos)
+                return round(abs(pos), 2)
         return 0
-
-    def place_order_yes(
-        self, market_id: str, quantity: int, price: int, dry_run: bool = True
-    ) -> Optional[dict]:
-        return self._place_buy_order(market_id, "yes", quantity, price, dry_run)
-
-    def place_order_no(
-        self, market_id: str, quantity: int, price: int, dry_run: bool = True
-    ) -> Optional[dict]:
-        return self._place_buy_order(market_id, "no", quantity, price, dry_run)
-
-    def _place_buy_order(
-        self, market_id: str, side: str, quantity: int, price: int, dry_run: bool
-    ) -> Optional[dict]:
-        self._ensure_btc_market(market_id)
-        if dry_run:
-            log.info(
-                "[DRY RUN] Would place BUY %s %s x%d @ %dc",
-                side.upper(), market_id, quantity, price
-            )
-            return None
-        return self.buy_yes(market_id, quantity, price, dry_run=False) if side == "yes" else self.buy_no(market_id, quantity, price, dry_run=False)
 
     def sell_position(
         self,
         market_id: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         price: int,
         dry_run: bool = True,
     ) -> Optional[dict]:
@@ -922,31 +554,39 @@ class KalshiClient:
         self._ensure_btc_market(market_id)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place SELL %s %s x%d @ %dc",
+                "[DRY RUN] Would place SELL %s %s x%s @ %dc",
                 side.upper(), market_id, quantity, price
             )
             return None
         return self.sell_yes(market_id, quantity, price, dry_run=False) if side == "yes" else self.sell_no(market_id, quantity, price, dry_run=False)
 
-    # ── SDK-backed wrapper methods (required by migration task) ─────────────────────────────────
+    # ── SDK-backed order methods (CreateOrderV2) ──────────────────────────────────────────────
     def _build_order_payload(
         self,
         *,
         ticker: str,
         side: str,
         action: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         reduce_only: bool = False,
         post_only: bool = False,
         client_order_id: str | None = None,
     ) -> dict:
         """
-        Single private helper for SDK order creation.
+        Build CreateOrderV2 request kwargs from the bot's (side, action, cents)
+        order vocabulary.
 
-        - Converts cents → dollars-string fields (yes_price_dollars/no_price_dollars)
-        - Uses count_fp (repo convention)
-        - Sets cancel_order_on_pause=True by default
+        CreateOrderV2 uses a single-book model: every order is a bid or ask on
+        the YES book at a YES-denominated dollar price. The mapping is:
+          buy  yes @ P  -> bid @ P
+          sell yes @ P  -> ask @ P
+          buy  no  @ P  -> ask @ (1 - P)   (buying NO == selling YES)
+          sell no  @ P  -> bid @ (1 - P)
+
+        Orders are immediate-or-cancel so the response reports the exact fill
+        and nothing rests on the book un-tracked; post_only orders rest
+        good-till-canceled instead (IOC + post_only is contradictory).
         """
         side_l = (side or "").lower()
         if side_l not in ("yes", "no"):
@@ -954,37 +594,86 @@ class KalshiClient:
         action_l = (action or "").lower()
         if action_l not in ("buy", "sell"):
             raise ValueError("action must be 'buy' or 'sell'")
-        if contracts < 1:
-            raise ValueError("contracts must be >= 1")
+        # Fractional counts (0.01-contract granularity) are valid: exits of
+        # fractionally-filled positions must be able to sell e.g. 2.57.
+        if float(contracts) < 0.01:
+            raise ValueError("contracts must be >= 0.01")
         if not (1 <= int(price_cents) <= 99):
             raise ValueError("price_cents must be 1-99")
 
-        coid = client_order_id or str(uuid.uuid4())
+        if side_l == "yes":
+            book_price_cents = int(price_cents)
+            book_side = "bid" if action_l == "buy" else "ask"
+        else:
+            book_price_cents = 100 - int(price_cents)
+            book_side = "ask" if action_l == "buy" else "bid"
+
         payload: dict[str, Any] = {
             "ticker": ticker,
-            "side": side_l,
-            "action": action_l,
-            # Keep order type explicit and stable (limit).
-            "type": "limit",
-            "count": int(contracts),
-            "count_fp": f"{int(contracts)}.00",
-            "client_order_id": coid,
-            "reduce_only": bool(reduce_only),
-            "post_only": bool(post_only),
-            "cancel_order_on_pause": True,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+            "side": book_side,
+            "count": _count_to_fp(contracts),
+            "price": _price_cents_to_dollars_fp(book_price_cents),
+            "time_in_force": "good_till_canceled" if post_only else "immediate_or_cancel",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        price_dollars = _price_cents_to_dollars_fp(int(price_cents))
-        if side_l == "yes":
-            payload["yes_price_dollars"] = price_dollars
-        else:
-            payload["no_price_dollars"] = price_dollars
+        if post_only:
+            payload["post_only"] = True
+            payload["cancel_order_on_pause"] = True
+        if reduce_only and not post_only:
+            # reduce_only is only valid with immediate_or_cancel orders.
+            payload["reduce_only"] = True
         return payload
+
+    def _submit_order(self, payload: dict, *, order_side: str) -> dict:
+        """
+        Submit a CreateOrderV2 request and normalize the response to the
+        {"order": {...}} shape the envelope layer consumes, including fill
+        information (orders are IOC, so the response is final):
+          fill_count / remaining_count      - integers
+          average_fill_price_cents          - denominated in *order_side* prices
+          status                            - executed | partially_filled | unfilled
+        """
+        log.info("Placing order via SDK (CreateOrderV2): %s", payload)
+        raw = self._sdk.create_order_v2(
+            **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
+        )
+        data = _to_dict(raw)
+        filled = _fp_to_count(data.get("fill_count"))
+        remaining = _fp_to_count(data.get("remaining_count"))
+        if filled >= 0.01 and remaining < 0.01:
+            status = "executed"
+        elif filled >= 0.01:
+            status = "partially_filled"
+        else:
+            status = "unfilled"
+
+        # average_fill_price is YES-book-denominated; convert back to the
+        # order's own side for callers that think in side prices.
+        avg_yes_cents = parse_dollars_to_cents_int(data.get("average_fill_price"))
+        avg_side_cents = None
+        if avg_yes_cents is not None:
+            avg_side_cents = avg_yes_cents if order_side == "yes" else 100 - avg_yes_cents
+
+        order = {
+            "order_id": data.get("order_id"),
+            "client_order_id": data.get("client_order_id"),
+            "status": status,
+            "fill_count": filled,
+            "remaining_count": remaining,
+            "average_fill_price_cents": avg_side_cents,
+            "average_fee_paid_dollars": data.get("average_fee_paid"),
+        }
+        if status != "executed":
+            log.warning("Order %s: status=%s filled=%.2f remaining=%.2f",
+                        order["order_id"], status, filled, remaining)
+        return {"order": order, "raw": data}
 
     def place_order(
         self,
         ticker: str,
         side: str,
-        count: int,
+        count: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -996,7 +685,7 @@ class KalshiClient:
         self._ensure_btc_market(ticker)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place %s %s %s x%d @ %dc (reduce_only=%s post_only=%s)",
+                "[DRY RUN] Would place %s %s %s x%s @ %dc (reduce_only=%s post_only=%s)",
                 "BUY" if (side or "").lower() in ("yes", "no") else "ORDER",
                 (side or "").upper(),
                 ticker,
@@ -1011,38 +700,28 @@ class KalshiClient:
             ticker=ticker,
             side=side,
             action="buy",
-            contracts=int(count),
+            contracts=count,
             price_cents=int(price_cents),
             reduce_only=bool(reduce_only),
             post_only=bool(post_only),
             client_order_id=client_order_id,
         )
-        log.info("Placing order via SDK: %s", payload)
         try:
-            raw = self._sdk.create_order(**payload)
-            resp = _to_dict(raw)
-            order = resp.get("order", resp)
-            status = (order or {}).get("status") if isinstance(order, dict) else None
-            if status and status not in _ORDER_CREATE_OK_STATUSES:
-                log.warning(
-                    "Order placed but status=%s (expected one of %s): %s",
-                    status, sorted(_ORDER_CREATE_OK_STATUSES), _truncate_for_log(order),
-                )
-            return resp
+            return self._submit_order(payload, order_side=(side or "").lower())
         except Exception as exc:
             log.error("Order placement failed: %s", exc, exc_info=True)
             raise
 
-    def buy_yes(self, ticker: str, contracts: int, price_cents: int, dry_run: bool = True) -> Optional[dict]:
+    def buy_yes(self, ticker: str, contracts: "int | float", price_cents: int, dry_run: bool = True) -> Optional[dict]:
         return self.place_order(ticker, "yes", contracts, price_cents, dry_run=dry_run)
 
-    def buy_no(self, ticker: str, contracts: int, price_cents: int, dry_run: bool = True) -> Optional[dict]:
+    def buy_no(self, ticker: str, contracts: "int | float", price_cents: int, dry_run: bool = True) -> Optional[dict]:
         return self.place_order(ticker, "no", contracts, price_cents, dry_run=dry_run)
 
     def sell_yes(
         self,
         ticker: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -1053,7 +732,7 @@ class KalshiClient:
     def sell_no(
         self,
         ticker: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         dry_run: bool = True,
         *,
@@ -1065,7 +744,7 @@ class KalshiClient:
         self,
         ticker: str,
         side: str,
-        contracts: int,
+        contracts: "int | float",
         price_cents: int,
         *,
         dry_run: bool,
@@ -1076,7 +755,7 @@ class KalshiClient:
         self._ensure_btc_market(ticker)
         if dry_run:
             log.info(
-                "[DRY RUN] Would place SELL %s %s x%d @ %dc (reduce_only=%s post_only=%s)",
+                "[DRY RUN] Would place SELL %s %s x%s @ %dc (reduce_only=%s post_only=%s)",
                 (side or "").upper(),
                 ticker,
                 contracts,
@@ -1090,28 +769,24 @@ class KalshiClient:
             ticker=ticker,
             side=side,
             action="sell",
-            contracts=int(contracts),
+            contracts=contracts,
             price_cents=int(price_cents),
             reduce_only=bool(reduce_only),
             post_only=bool(post_only),
             client_order_id=client_order_id,
         )
-        log.info("Placing SELL via SDK: %s", payload)
         try:
-            raw = self._sdk.create_order(**payload)
-            resp = _to_dict(raw)
-            return resp
+            return self._submit_order(payload, order_side=(side or "").lower())
         except Exception as exc:
             log.error("Sell placement failed: %s", exc, exc_info=True)
             raise
 
     def cancel_order(self, order_id: str) -> dict:
-        """Cancel an open order by ID."""
+        """Cancel an open order by ID (the SDK only exposes cancel_order_v2 now)."""
         try:
-            raw = self._sdk.cancel_order(order_id=order_id)
-            return _to_dict(raw)
-        except TypeError:
-            raw = self._sdk.cancel_order(order_id)
+            raw = self._sdk.cancel_order_v2(
+                order_id=order_id, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
+            )
             return _to_dict(raw)
         except Exception as exc:
             log.error("cancel_order failed for %s: %s", order_id, exc, exc_info=True)
@@ -1131,7 +806,7 @@ class KalshiClient:
         self,
         market_id: str,
         side: str,
-        quantity: int,
+        quantity: "int | float",
         price: int,
         dry_run: bool = True,
     ) -> Optional[dict]:

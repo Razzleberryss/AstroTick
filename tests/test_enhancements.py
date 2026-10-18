@@ -15,7 +15,6 @@ import unittest
 from unittest.mock import MagicMock, patch, call
 from pathlib import Path
 
-import requests
 
 os.environ.setdefault(
     "OPENCLAW_STOP_FILE",
@@ -68,100 +67,65 @@ def _make_market(ticker=_TICKER, yes_bid=55, no_bid=45, close_time=None):
 
 # ── KalshiClient retry logic ───────────────────────────────────────────────────
 
-class TestKalshiClientRetries(unittest.TestCase):
-    """Verify that _request retries on transient errors but not on 4xx."""
+class _FakeApiError(Exception):
+    """Mimics kalshi_python_sync.ApiException: carries an HTTP status."""
+
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+class TestKalshiClientSdkRetries(unittest.TestCase):
+    """Verify that _sdk_get retries transient errors but not client errors."""
 
     def _make_client(self):
         client = object.__new__(KalshiClient)
         client.base_url = config.BASE_URL
         client.api_key_id = "test-key"
-        client.session = MagicMock()
-        client._private_key = MagicMock()
-        client._auth_headers = MagicMock(return_value={})
+        client._sdk = MagicMock()
         return client
 
-    def _ok_response(self, payload=None):
-        resp = MagicMock()
-        resp.ok = True
-        resp.json.return_value = payload or {}
-        resp.raise_for_status.return_value = None
-        return resp
-
-    def _error_response(self, status_code: int):
-        resp = MagicMock()
-        resp.ok = False
-        resp.status_code = status_code
-        resp.text = "error"
-        http_err = requests.exceptions.HTTPError(response=resp)
-        resp.raise_for_status.side_effect = http_err
-        return resp
-
-    def test_succeeds_on_first_attempt(self):
+    def test_succeeds_on_first_attempt_and_passes_timeout(self):
         client = self._make_client()
-        client.session.request.return_value = self._ok_response({"key": "value"})
-
-        result = client._request("GET", "/test")
-
-        self.assertEqual(result, {"key": "value"})
-        self.assertEqual(client.session.request.call_count, 1)
+        client._sdk.get_balance.return_value = {"balance_dollars": "10.00"}
+        orig_timeout = config.REQUEST_TIMEOUT_SECONDS
+        config.REQUEST_TIMEOUT_SECONDS = 7
+        try:
+            out = client._sdk_get("get_balance")
+        finally:
+            config.REQUEST_TIMEOUT_SECONDS = orig_timeout
+        self.assertEqual(out, {"balance_dollars": "10.00"})
+        self.assertEqual(client._sdk.get_balance.call_count, 1)
+        kwargs = client._sdk.get_balance.call_args.kwargs
+        self.assertEqual(kwargs.get("_request_timeout"), 7)
 
     @patch("time.sleep", return_value=None)
-    @patch("kalshi_client.random.uniform", return_value=1.0)
-    def test_retries_on_timeout(self, mock_uniform, mock_sleep):
+    def test_retries_on_5xx_then_succeeds(self, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
         try:
-            ok = self._ok_response({"ok": True})
-            client.session.request.side_effect = [
-                requests.exceptions.Timeout("timed out"),
-                ok,
+            client._sdk.get_positions.side_effect = [
+                _FakeApiError(503),
+                {"market_positions": []},
             ]
-
-            result = client._request("GET", "/test")
-
-            self.assertEqual(result, {"ok": True})
-            self.assertEqual(client.session.request.call_count, 2)
-            # random.uniform is called with (0.1, max(0.2, 2**0)) = (0.1, 1.0)
-            mock_uniform.assert_called_once_with(0.1, 1.0)
-            mock_sleep.assert_called_once_with(1.0)
+            out = client._sdk_get("get_positions")
+            self.assertEqual(out, {"market_positions": []})
+            self.assertEqual(client._sdk.get_positions.call_count, 2)
         finally:
             config.REQUEST_MAX_RETRIES = orig_retries
 
     @patch("time.sleep", return_value=None)
-    @patch("kalshi_client.random.uniform", return_value=0.5)
-    def test_retries_on_connection_error(self, mock_uniform, mock_sleep):
+    def test_raises_after_max_retries_exceeded(self, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
         try:
-            ok = self._ok_response({"ok": True})
-            client.session.request.side_effect = [
-                requests.exceptions.ConnectionError("refused"),
-                ok,
-            ]
-
-            result = client._request("GET", "/test")
-
-            self.assertEqual(result, {"ok": True})
-            self.assertEqual(client.session.request.call_count, 2)
-        finally:
-            config.REQUEST_MAX_RETRIES = orig_retries
-
-    @patch("time.sleep", return_value=None)
-    @patch("kalshi_client.random.uniform", return_value=0.5)
-    def test_raises_after_max_retries_exceeded(self, mock_uniform, mock_sleep):
-        client = self._make_client()
-        orig_retries = config.REQUEST_MAX_RETRIES
-        config.REQUEST_MAX_RETRIES = 3
-        try:
-            client.session.request.side_effect = requests.exceptions.Timeout("always")
-
-            with self.assertRaises(requests.exceptions.Timeout):
-                client._request("GET", "/test")
-
+            client._sdk.get_positions.side_effect = _FakeApiError(503)
+            with self.assertRaises(_FakeApiError):
+                client._sdk_get("get_positions")
             # 1 initial attempt + 3 retries = 4 total attempts
-            self.assertEqual(client.session.request.call_count, 4)
+            self.assertEqual(client._sdk.get_positions.call_count, 4)
         finally:
             config.REQUEST_MAX_RETRIES = orig_retries
 
@@ -170,80 +134,47 @@ class TestKalshiClientRetries(unittest.TestCase):
         orig_retries = config.REQUEST_MAX_RETRIES
         config.REQUEST_MAX_RETRIES = 3
         try:
-            client.session.request.return_value = self._error_response(400)
-
-            with self.assertRaises(requests.exceptions.HTTPError):
-                client._request("GET", "/test")
-
-            # 4xx must not retry — exactly 1 attempt expected
-            self.assertEqual(client.session.request.call_count, 1)
+            client._sdk.get_positions.side_effect = _FakeApiError(401)
+            with self.assertRaises(_FakeApiError):
+                client._sdk_get("get_positions")
+            self.assertEqual(client._sdk.get_positions.call_count, 1)
         finally:
             config.REQUEST_MAX_RETRIES = orig_retries
 
     @patch("time.sleep", return_value=None)
-    @patch("kalshi_client.random.uniform", return_value=0.5)
-    def test_retries_on_5xx_server_error(self, mock_uniform, mock_sleep):
+    def test_retries_on_429_rate_limit(self, mock_sleep):
         client = self._make_client()
         orig_retries = config.REQUEST_MAX_RETRIES
-        config.REQUEST_MAX_RETRIES = 3
+        config.REQUEST_MAX_RETRIES = 2
         try:
-            ok = self._ok_response({"ok": True})
-            bad = self._error_response(503)
-            client.session.request.side_effect = [bad, ok]
-
-            result = client._request("GET", "/test")
-
-            self.assertEqual(result, {"ok": True})
-            self.assertEqual(client.session.request.call_count, 2)
+            client._sdk.get_markets.side_effect = [
+                _FakeApiError(429),
+                {"markets": []},
+            ]
+            out = client._sdk_get("get_markets", limit=1)
+            self.assertEqual(out, {"markets": []})
+            self.assertEqual(client._sdk.get_markets.call_count, 2)
         finally:
             config.REQUEST_MAX_RETRIES = orig_retries
 
-    def test_uses_config_timeout(self):
-        """_request must pass REQUEST_TIMEOUT_SECONDS to session.request."""
-        client = self._make_client()
-        orig_timeout = config.REQUEST_TIMEOUT_SECONDS
-        config.REQUEST_TIMEOUT_SECONDS = 7
-        try:
-            client.session.request.return_value = self._ok_response()
 
-            client._request("GET", "/test")
+class TestTradeApiHostSelection(unittest.TestCase):
+    """_pick_trade_api_host routes by KALSHI_ENV."""
 
-            _, kwargs = client.session.request.call_args
-            self.assertEqual(kwargs.get("timeout"), 7)
-        finally:
-            config.REQUEST_TIMEOUT_SECONDS = orig_timeout
+    def test_prod_host(self):
+        from kalshi_client import _pick_trade_api_host
+        with patch.object(config, "KALSHI_ENV", "prod"):
+            self.assertEqual(
+                _pick_trade_api_host(),
+                "https://api.elections.kalshi.com/trade-api/v2",
+            )
 
-    def test_url_uses_demo_host_when_env_is_demo(self):
-        """URL must target demo-api.kalshi.co when BASE_URL is the demo endpoint."""
-        client = self._make_client()
-        orig_base_url = config.BASE_URL
-        config.BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-        try:
-            client.session.request.return_value = self._ok_response()
-
-            client._request("GET", "/test")
-
-            pos_args, _ = client.session.request.call_args
-            url = pos_args[1]
-            self.assertIn("demo-api.kalshi.co", url)
-        finally:
-            config.BASE_URL = orig_base_url
-
-    def test_url_uses_prod_host_when_env_is_prod(self):
-        """URL must target trading-api.kalshi.com when BASE_URL is the prod endpoint."""
-        client = self._make_client()
-        orig_base_url = config.BASE_URL
-        config.BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
-        try:
-            client.session.request.return_value = self._ok_response()
-
-            client._request("GET", "/test")
-
-            pos_args, _ = client.session.request.call_args
-            url = pos_args[1]
-            self.assertIn("trading-api.kalshi.com", url)
-        finally:
-            config.BASE_URL = orig_base_url
+    def test_demo_host(self):
+        from kalshi_client import _pick_trade_api_host
+        with patch.object(config, "KALSHI_ENV", "demo"), patch.object(
+            config, "BASE_URL", "https://demo-api.kalshi.co/trade-api/v2"
+        ):
+            self.assertIn("demo-api.kalshi.co", _pick_trade_api_host())
 
 
 # ── Daily limit boundary tests ─────────────────────────────────────────────────

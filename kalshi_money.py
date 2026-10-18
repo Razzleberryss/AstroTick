@@ -36,53 +36,47 @@ def parse_dollars_to_cents_int(value: Any) -> Optional[int]:
     return int(cents)
 
 
-def get_fill_price_cents(fill: dict, side: str) -> Optional[int]:
-    """Best-effort fill price in cents using yes_price_dollars / no_price_dollars, then legacy int fields."""
-    side_l = (side or "").lower()
-    if side_l == "yes":
-        c = parse_dollars_to_cents_int(fill.get("yes_price_dollars"))
-        if c is not None:
-            return c
-        p = fill.get("yes_price")
-        if p is not None:
-            try:
-                return int(p)
-            except (TypeError, ValueError):
-                return None
-        return None
-    if side_l == "no":
-        c = parse_dollars_to_cents_int(fill.get("no_price_dollars"))
-        if c is not None:
-            return c
-        p = fill.get("no_price")
-        if p is not None:
-            try:
-                return int(p)
-            except (TypeError, ValueError):
-                return None
-        return None
-    return None
+def position_count(pos: dict) -> float:
+    """
+    Signed contract count for a market_positions row.
 
-
-def fill_fee_cents(fill: dict) -> Optional[int]:
-    """Parse fee_cost / fee_cost_dollars on a fill if present (whole cents)."""
-    d = parse_dollars_to_cents_int(fill.get("fee_cost_dollars"))
-    if d is not None:
-        return d
-    fc = fill.get("fee_cost")
-    if fc is None:
-        return None
+    The current API reports the fixed-point string ``position_fp`` ("3.00",
+    possibly fractional and negative for NO exposure); older payloads used the
+    signed integer ``position``. Positive = long YES, negative = long NO.
+    """
+    fp = pos.get("position_fp")
+    if fp is not None:
+        try:
+            return float(str(fp))
+        except (TypeError, ValueError):
+            pass
     try:
-        return int(fc)
+        return float(pos.get("position", 0) or 0)
     except (TypeError, ValueError):
-        c = parse_dollars_to_cents_int(fc)
-        return c
+        return 0.0
+
+
+def position_exposure_dollars(pos: dict) -> Optional[float]:
+    """Current market exposure in dollars for a market_positions row, if reported."""
+    d = parse_dollars_to_decimal(pos.get("market_exposure_dollars"))
+    if d is not None:
+        return float(d)
+    exposure_cents = pos.get("market_exposure")
+    if exposure_cents is not None:
+        try:
+            return int(exposure_cents) / 100.0
+        except (TypeError, ValueError):
+            pass
+    return None
 
 
 def position_average_price_cents(pos: dict, default_cents: int = 99) -> int:
     """
     Average entry price in cents for a market_positions row.
-    Prefer *_dollars fields from the API; fall back to legacy integer average_price.
+
+    Prefer explicit *_dollars average-price fields (older payloads); the
+    current API no longer sends one, so estimate from total_traded_dollars
+    over the contract count before falling back to the conservative default.
     """
     for key in ("average_price_dollars", "avg_price_dollars", "avg_entry_price_dollars"):
         c = parse_dollars_to_cents_int(pos.get(key))
@@ -94,12 +88,15 @@ def position_average_price_cents(pos: dict, default_cents: int = 99) -> int:
             return int(ap)
         except (TypeError, ValueError):
             pass
+    traded = parse_dollars_to_decimal(pos.get("total_traded_dollars"))
+    count = abs(position_count(pos))
+    if traded is not None and count > 0:
+        cents = (traded / Decimal(str(count)) * 100).quantize(
+            Decimal("1"), rounding=ROUND_HALF_UP
+        )
+        if 0 < int(cents) <= 100:
+            return int(cents)
     return default_cents
-
-
-def fmt_cents(v: "int | None") -> str:
-    """Format a cent-valued integer for logging; returns 'NA' when the value is None."""
-    return "NA" if v is None else str(v)
 
 
 def enrich_market_quotes_from_dollar_fields(market: dict) -> dict:

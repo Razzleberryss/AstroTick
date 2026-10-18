@@ -282,26 +282,28 @@ class KalshiClient:
             log.error("get_balance failed: %s", exc, exc_info=True)
             raise
 
-    def get_active_btc_market(self) -> Optional[dict]:
+    def get_active_market(self, series_ticker: Optional[str] = None) -> Optional[dict]:
         """
-        Find the currently open 15-minute BTC market.
-        Returns the first active market dict or None.
+        Find the currently open market for *series_ticker* (default: the first
+        configured series). Returns the soonest-closing active market dict or
+        None.
 
         Filters out provisional markets (is_provisional=True) as they may be removed.
         """
+        series = series_ticker or config.SERIES_TICKERS[0]
         params = {
-            "series_ticker": config.BTC_SERIES_TICKER,
+            "series_ticker": series,
             "status": "open",
             "limit": 10,
         }
         data = _to_dict(self._sdk_get("get_markets", **params))
         markets = data.get("markets", []) or []
         if not markets:
-            log.warning("No open BTC 15-min markets found for series %s", config.BTC_SERIES_TICKER)
+            log.warning("No open markets found for series %s", series)
             return None
-        markets = [m for m in markets if self._is_btc_series_market(m.get("ticker", ""))]
+        markets = [m for m in markets if m.get("ticker", "").startswith(f"{series}-")]
         if not markets:
-            log.warning("No open markets matched BTC series prefix %s-", config.BTC_SERIES_TICKER)
+            log.warning("No open markets matched series prefix %s-", series)
             return None
         # Filter out provisional markets (API v2: is_provisional may be True/False/missing)
         markets = [m for m in markets if not m.get("is_provisional", False)]
@@ -310,6 +312,10 @@ class KalshiClient:
             return None
         markets.sort(key=lambda m: m.get("close_time", ""))
         return enrich_market_quotes_from_dollar_fields(markets[0])
+
+    def get_active_btc_market(self) -> Optional[dict]:
+        """Legacy alias: active market of the first configured series."""
+        return self.get_active_market()
 
     def get_markets(
         self,
@@ -497,6 +503,17 @@ class KalshiClient:
                 "yes_depth_near_mid": 0,
                 "no_depth_near_mid": 0,
             }
+
+    def get_event_live_data(self, event_ticker: str, range: Optional[str] = None) -> dict:
+        """
+        GET /live_data/events/{event_ticker} — the underlying settlement index
+        for an event (for crypto series: CF Benchmarks 1-minute candlesticks,
+        a 1-second timeseries, the coin, and the window's maturity timestamp).
+        """
+        params: dict = {"event_ticker": event_ticker}
+        if range is not None:
+            params["range"] = range
+        return _to_dict(self._sdk_get("get_event_live_data", **params))
 
     def get_positions(self) -> list:
         """
@@ -794,12 +811,18 @@ class KalshiClient:
 
     @staticmethod
     def _is_btc_series_market(market_id: str) -> bool:
-        return market_id.startswith(f"{config.BTC_SERIES_TICKER}-")
+        """True when *market_id* belongs to one of the configured series.
+
+        (Name kept for backward compatibility; the safety check now covers
+        every series in config.SERIES_TICKERS, not only BTC.)
+        """
+        return any(market_id.startswith(f"{s}-") for s in config.SERIES_TICKERS)
 
     def _ensure_btc_market(self, market_id: str) -> None:
         if not self._is_btc_series_market(market_id):
             raise ValueError(
-                f"Refusing to trade non-BTC-series market '{market_id}'. Expected prefix {config.BTC_SERIES_TICKER}-"
+                f"Refusing to trade market '{market_id}' outside the configured "
+                f"series {config.SERIES_TICKERS}"
             )
 
     def close_position(

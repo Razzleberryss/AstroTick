@@ -81,11 +81,20 @@ MAX_TRADES_PER_WINDOW: int = int(os.getenv("MAX_TRADES_PER_WINDOW", "1"))
 # =============================================================================
 # Strategy / Signal
 # =============================================================================
-# BTC_SERIES_TICKER: Kalshi 15-min BTC Up/Down series.
-# The live series ticker= KXBTC15M
-# Override in .env if Kalshi changes the series name.
+# BTC_SERIES_TICKER: legacy single-series setting (the 15-min BTC Up/Down
+# series, live ticker KXBTC15M). Still honored when SERIES_TICKERS is unset.
 BTC_SERIES_TICKER: str = os.getenv("BTC_SERIES_TICKER", "KXBTC15M")
-BTC_TICKER: str = os.getenv("BTC_TICKER", "BTC-USD")  # yfinance symbol
+
+# SERIES_TICKERS: comma-separated list of crypto Up/Down series to trade in
+# parallel, e.g. "KXBTC15M,KXETH15M,KXSOL15M". All series share the same
+# mechanics and fee schedule; momentum is computed per series from its own
+# settlement index. Defaults to just BTC_SERIES_TICKER.
+_series_raw = os.getenv("SERIES_TICKERS", "")
+SERIES_TICKERS: list[str] = list(dict.fromkeys(
+    s.strip().upper() for s in _series_raw.split(",") if s.strip()
+)) or [BTC_SERIES_TICKER]
+
+BTC_TICKER: str = os.getenv("BTC_TICKER", "BTC-USD")  # yfinance fallback symbol
 MOMENTUM_LOOKBACK_BARS: int = int(os.getenv("MOMENTUM_LOOKBACK_BARS", "5"))
 # Period passed to yfinance when fetching BTC 1-minute bars for momentum.
 # Must be a valid yfinance period ("1d", "5d", ...): minute-style values like
@@ -225,6 +234,11 @@ def validate() -> None:
         errors.append("MIN_CONTRACT_PRICE_CENTS must be < MAX_CONTRACT_PRICE_CENTS")
     if MOMENTUM_LOOKBACK_BARS < 1:
         errors.append("MOMENTUM_LOOKBACK_BARS must be >= 1")
+    if not SERIES_TICKERS:
+        errors.append("SERIES_TICKERS must name at least one series")
+    for _series in SERIES_TICKERS:
+        if not _series.replace("_", "").isalnum():
+            errors.append(f"SERIES_TICKERS entry '{_series}' is not a valid series ticker")
     if not (0.0 < MIN_EDGE_THRESHOLD < 1.0):
         errors.append("MIN_EDGE_THRESHOLD must be between 0 and 1")
     if not (0.0 < MIN_CONFIDENCE < 1.0):

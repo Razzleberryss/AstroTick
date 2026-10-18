@@ -1,10 +1,18 @@
 # AstroTick
 
-A rule-based Python trading bot for Kalshi's BTC Up/Down 15-minute prediction markets
-(series `KXBTC15M`). It polls the market every few seconds, generates a signal from BTC
-spot momentum and orderbook skew, filters it through a fee-aware expected-value check
-and a risk manager, and places immediate-or-cancel limit orders through the official
-Kalshi Trade API v2 (`CreateOrderV2`).
+A rule-based Python trading bot for Kalshi's crypto Up/Down 15-minute prediction
+markets — BTC by default (`KXBTC15M`), with optional parallel trading of the ETH and
+SOL series (`SERIES_TICKERS=KXBTC15M,KXETH15M,KXSOL15M`). It polls each market every
+few seconds, generates a per-series signal from settlement-index momentum and
+orderbook skew, filters it through a fee-aware expected-value check and a risk
+manager, and places immediate-or-cancel limit orders through the official Kalshi
+Trade API v2 (`CreateOrderV2`).
+
+Momentum is computed from the **settlement index itself**: Kalshi's
+`/live_data/events/{event_ticker}` endpoint serves each event's CF Benchmarks
+real-time index (the exact number the market settles on) as 1-minute candlesticks,
+so the signal has no basis mismatch against an external exchange price. The yfinance
+spot feed remains only as an automatic fallback.
 
 The bot is dry-run by default and has two independent gates that must both be opened
 before it can place a real order (see [Live trading](#live-trading-two-gates)).
@@ -29,8 +37,10 @@ Every `POLL_INTERVAL_SECONDS` (default 10 s) the bot:
 `STRATEGY_MODE` selects one of two strategies:
 
 - **`fee_aware_model`** (default) — momentum + orderbook skew:
-  - Short-term BTC momentum from yfinance 1-minute bars (`MOMENTUM_LOOKBACK_BARS`,
-    cached for 60 s).
+  - Short-term momentum over `MOMENTUM_LOOKBACK_BARS` 1-minute bars of the event's
+    own settlement index (CF Benchmarks, via `/live_data`, cached ~8 s per event);
+    falls back per coin to yfinance spot bars (cached 60 s) when the index feed is
+    unavailable.
   - Orderbook skew: relative YES vs NO bid liquidity over the top levels of the book.
   - The composite signal shifts a model probability off the market mid. A trade is
     only taken when the mispricing is at least `MIN_EDGE_PCT`, the YES price is outside
@@ -129,8 +139,9 @@ the bot prints a prominent warning banner at startup when running live on prod.
 
 ```
 .
-├── bot.py                      # Main loop: market discovery, position management, entries
+├── bot.py                      # Main loop: per-series market discovery, position management, entries
 ├── strategy.py                 # Signal generation (momentum + orderbook skew, fee-aware EV filter)
+├── index_feed.py               # Settlement-index momentum (CF Benchmarks via /live_data)
 ├── risk_manager.py             # Trade gating, position tracking, PnL, CSV trade log
 ├── kalshi_client.py            # Kalshi SDK wrapper (auth, CreateOrderV2 orders, positions, orderbooks)
 ├── kalshi_money.py             # Fixed-point dollar/_fp field parsing helpers (API v2 shapes)

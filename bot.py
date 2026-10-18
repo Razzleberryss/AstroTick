@@ -31,7 +31,8 @@ import colorlog
 import config
 from kalshi_client import KalshiClient
 from risk_manager import RiskManager, compute_pnl_cents
-from strategy import generate_signal, decide_trade, Signal as _Signal, get_btc_momentum, get_orderbook_skew
+from strategy import generate_signal, decide_trade, Signal as _Signal, get_spot_momentum, get_orderbook_skew
+from index_feed import get_index_momentum, spot_symbol_for_series
 from agent_decision_engine import AgentAction
 import cli_executor
 from orderbook_utils import extract_raw_arrays as _extract_raw_arrays
@@ -185,12 +186,12 @@ def _shutdown_fetch_executor() -> None:
 _running = True
 _halt_trading = False
 
-# ── Time-delay strategy state ─────────────────────────────────────────────────────────────────────
-# Tracks the window ID of the last trade placed in reddit_time_delay mode so that
-# window-change detection works across bot cycles.
-_last_trade_window_id: "str | None" = None
-# Number of entries placed in the current 15-minute window (reset when window changes).
-_trades_in_current_window: int = 0
+# ── Time-delay strategy state (per series) ───────────────────────────────────────────────────────
+# Tracks, per series ticker, the window ID of the last trade placed in
+# reddit_time_delay mode so that window-change detection works across cycles.
+_last_trade_window_id: dict = {}
+# Entries placed in the current 15-minute window, per series (reset on rollover).
+_trades_in_current_window: dict = {}
 
 def _handle_signal(sig, frame):
     global _running
@@ -316,26 +317,37 @@ def _market_for_stale_position(client: KalshiClient, ticker: str):
 
 def manage_positions(client: KalshiClient, market: dict, risk: RiskManager, current_signal=None):
     """
+    Back-compat single-market wrapper around manage_all_positions: evaluates
+    every tracked position, treating *market* as the only already-fetched one.
+    """
+    ticker = market["ticker"]
+    yield from manage_all_positions(client, {ticker: market}, risk, {ticker: current_signal})
+
+
+def manage_all_positions(client: KalshiClient, markets_by_ticker: dict, risk: RiskManager, signals: dict = None):
+    """
     Check every position opened by this bot for stop-loss, take-profit, signal
     reversal, expiry, or settlement. Only positions recorded via
     risk.record_open_position() are managed here, so pre-existing positions
     from other bots on the same account are never touched.
 
-    The active market's position is evaluated against the already-fetched
-    *market* dict; positions left over from earlier windows get their market
-    data fetched on demand, and settled markets are reconciled at the
-    settlement value so their PnL reaches the daily-loss accounting instead of
-    silently bypassing it. Yields a dict for every position (or part) exited.
+    Positions in *markets_by_ticker* (this cycle's active markets, one per
+    configured series) are evaluated against the already-fetched data;
+    positions left over from earlier windows get their market data fetched on
+    demand, and settled markets are reconciled at the settlement value so
+    their PnL reaches the daily-loss accounting instead of silently bypassing
+    it. Yields a dict for every position (or part) exited.
     """
-    active_ticker = market["ticker"]
+    signals = signals or {}
 
     for ticker, pos in risk.get_open_positions().items():
         if _halt_trading:
             return
 
-        if ticker == active_ticker:
+        if ticker in markets_by_ticker:
             yield from _manage_single_position(
-                client, market, risk, pos, current_signal=current_signal,
+                client, markets_by_ticker[ticker], risk, pos,
+                current_signal=signals.get(ticker),
             )
             continue
 
@@ -684,225 +696,171 @@ def run_once(client: KalshiClient, risk: RiskManager, ws_client=None):
         write_dashboard_state(state)
 
 
-def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, state: dict = None):
-    """Internal implementation of one bot cycle. Updates *state* in-place for the dashboard."""
-    global _last_trade_window_id, _halt_trading
+def _fetch_market_orderbook(client: KalshiClient, ws_client, ticker: str) -> dict:
+    """Orderbook for *ticker*: from the WebSocket stream when fresh, else REST."""
+    if ws_client and ws_client.is_connected():
+        # Subscribe to this market if we haven't already
+        ws_client.subscribe_to_market(ticker)
+        ws_orderbook = ws_client.get_latest_orderbook(ticker)
+        if ws_orderbook:
+            ws_yes, ws_no = _extract_raw_arrays({"orderbook": ws_orderbook})
+            if ws_yes or ws_no:
+                log.debug("Using WebSocket orderbook for %s", ticker)
+                return {"orderbook": ws_orderbook}
+            log.debug("WebSocket orderbook for %s is empty, falling back to REST", ticker)
+    return client.get_orderbook(ticker)
 
-    # 1. Find the active market
-    market = client.get_active_btc_market()
-    if not market:
-        log.warning("No active BTC 15-min market found. Skipping cycle.")
-        return False
 
-    ticker = market["ticker"]
-    if not ticker.startswith(f"{config.BTC_SERIES_TICKER}-"):
-        log.error("Refusing non-BTC-series market: %s", ticker)
-        return False
+def _prepare_market(entry: dict) -> bool:
+    """
+    Merge orderbook-derived quotes into the entry's market dict and validate
+    the book. Returns False when the book is unusable this cycle, in which
+    case only this series is skipped (others still trade).
+    """
+    market = entry["market"]
+    orderbook = entry["orderbook"]
+    ticker = entry["ticker"]
 
-    if state is not None:
-        state["active_market_ticker"] = ticker
-
-    # 2. Fetch supporting data
-    try:
-        # Try to get orderbook from WebSocket if available and connected
-        orderbook = None
-        if ws_client and ws_client.is_connected():
-            # Subscribe to this market if we haven't already
-            ws_client.subscribe_to_market(ticker)
-
-            # Try to get orderbook from WebSocket
-            ws_orderbook = ws_client.get_latest_orderbook(ticker)
-            if ws_orderbook:
-                ws_yes, ws_no = _extract_raw_arrays({"orderbook": ws_orderbook})
-                if ws_yes or ws_no:
-                    # Wrap in same format as REST API response
-                    orderbook = {"orderbook": ws_orderbook}
-                    log.debug("Using WebSocket orderbook for %s", ticker)
-                else:
-                    log.debug("WebSocket orderbook for %s is empty, falling back to REST", ticker)
-
-        pool = _get_fetch_executor()
-        # Fall back to REST if WebSocket data not available — overlap orderbook + balance + positions.
-        if orderbook is None:
-            fut_ob = pool.submit(client.get_orderbook, ticker)
-            fut_bal = pool.submit(client.get_balance)
-            fut_pos = pool.submit(client.get_positions)
-            orderbook = fut_ob.result()
-            balance = fut_bal.result()
-            positions = fut_pos.result()
-            if ws_client and ws_client.is_connected():
-                log.debug("WebSocket orderbook not available, using REST for %s", ticker)
-        else:
-            fut_bal = pool.submit(client.get_balance)
-            fut_pos = pool.submit(client.get_positions)
-            balance = fut_bal.result()
-            positions = fut_pos.result()
-    except Exception as exc:
-        log.error("API fetch error: %s", exc)
-        return False
-
-    # 2b. Populate market dict with orderbook-based quotes if enabled
-    if config.USE_ORDERBOOK_PRICES:
-        # Derive quotes directly from the already-fetched orderbook to avoid
-        # an extra network call and potential rate-limit pressure.
-        quotes = _quotes_from_orderbook(orderbook)
-        # Merge quotes into market dict, using new field names (best_yes_bid, etc.)
-        market.update(quotes)
-
-        # Also propagate legacy field aliases so any code reading yes_bid/yes_ask
-        # directly (e.g. time-delay EXIT_POSITION path) gets correct values.
-        for new_field, legacy_field in (
-            ("best_yes_bid", "yes_bid"),
-            ("best_yes_ask", "yes_ask"),
-            ("best_no_bid",  "no_bid"),
-            ("best_no_ask",  "no_ask"),
-        ):
-            if quotes.get(new_field) is not None:
-                market[legacy_field] = quotes[new_field]
-
-        # Log with orderbook-based prices
-        market_ticker = ticker
-        last_cents = market.get("last_price")
-        yes_bid_cents = quotes.get("best_yes_bid")
-        yes_ask_cents = quotes.get("best_yes_ask")
-        no_bid_cents = quotes.get("best_no_bid")
-        no_ask_cents = quotes.get("best_no_ask")
-        mid_cents = quotes.get("mid_price")
-        yes_depth = quotes.get("best_yes_bid_size")
-
-        log.info(
-            "Active market: %s | last=%s yes=%s/%s no=%s/%s mid=%s (from orderbook)",
-            market_ticker,
-            fmt_cents(last_cents),
-            fmt_cents(yes_bid_cents),
-            fmt_cents(yes_ask_cents),
-            fmt_cents(no_bid_cents),
-            fmt_cents(no_ask_cents),
-            fmt_cents(mid_cents),
-        )
-
-        yes_raw, no_raw = _extract_raw_arrays(orderbook)
-        if not yes_raw and not no_raw:
-            log.warning(
-                "Empty orderbook for %s: raw_yes=%s raw_no=%s -- skipping cycle",
-                market_ticker,
-                yes_raw,
-                no_raw,
-            )
-            return False
-
-        # Hard orderbook sanity validation before strategy evaluation.
-        # Kalshi prices are always expressed on the YES side (YES + NO = 100¢),
-        # so we validate the YES bid/ask pair directly.
-        yes_bid = (float(yes_bid_cents) / 100.0) if yes_bid_cents is not None else None
-        yes_ask = (float(yes_ask_cents) / 100.0) if yes_ask_cents is not None else None
-        if (
-            yes_bid is None
-            or yes_ask is None
-            or yes_depth is None
-            or yes_depth <= 0
-            or yes_bid < 0
-            or yes_bid > 1
-            or yes_ask < 0
-            or yes_ask > 1
-            or yes_bid > yes_ask
-        ):
-            log.warning(
-                "Invalid orderbook for %s: yes_bid=%s yes_ask=%s yes_depth=%s raw_yes=%s raw_no=%s -- skipping cycle",
-                market_ticker,
-                yes_bid,
-                yes_ask,
-                yes_depth,
-                yes_raw,
-                no_raw,
-            )
-            return False
-    else:
+    if not config.USE_ORDERBOOK_PRICES:
         # Use old market data fields
         log.info("Active market: %s | last=%sc yes=%s/%s no=%s/%s",
                  ticker, market.get("last_price"),
                  market.get("yes_bid"), market.get("yes_ask"),
                  market.get("no_bid"), market.get("no_ask"))
+        return True
 
-    # Capture current market prices for dashboard state
-    if state is not None:
-        state["yes_bid"] = market.get("best_yes_bid") or market.get("yes_bid")
-        state["yes_ask"] = market.get("best_yes_ask") or market.get("yes_ask")
-        state["no_bid"] = market.get("best_no_bid") or market.get("no_bid")
-        state["no_ask"] = market.get("best_no_ask") or market.get("no_ask")
-        state["yes_bid_size"] = market.get("best_yes_bid_size", 0)
-        state["no_bid_size"] = market.get("best_no_bid_size", 0)
-        state["mid_price"] = market.get("mid_price")
-        _yb, _ya = state["yes_bid"], state["yes_ask"]
-        if _yb is not None and _ya is not None:
-            state["spread"] = _ya - _yb
-        state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
+    # Derive quotes directly from the already-fetched orderbook to avoid an
+    # extra network call and potential rate-limit pressure.
+    quotes = _quotes_from_orderbook(orderbook)
+    market.update(quotes)
 
-    # ── reddit_time_delay strategy path ───────────────────────────────────────
-    if config.STRATEGY_MODE == "reddit_time_delay":
-        return _run_once_time_delay(client, risk, market, ticker, balance, positions, orderbook, state)
+    # Also propagate legacy field aliases so any code reading yes_bid/yes_ask
+    # directly (e.g. time-delay EXIT_POSITION path) gets correct values.
+    for new_field, legacy_field in (
+        ("best_yes_bid", "yes_bid"),
+        ("best_yes_ask", "yes_ask"),
+        ("best_no_bid",  "no_bid"),
+        ("best_no_ask",  "no_ask"),
+    ):
+        if quotes.get(new_field) is not None:
+            market[legacy_field] = quotes[new_field]
 
-    # ── fee_aware_model strategy path (default) ────────────────────────────────
-
-    # 3. Generate signal
-    log.debug(
-        "bot to strategy: best_yes_bid=%s best_yes_ask=%s best_no_bid=%s best_no_ask=%s mid=%s",
-        market.get("best_yes_bid"),
-        market.get("best_yes_ask"),
-        market.get("best_no_bid"),
-        market.get("best_no_ask"),
-        market.get("mid_price"),
+    log.info(
+        "Active market: %s | last=%s yes=%s/%s no=%s/%s mid=%s (from orderbook)",
+        ticker,
+        fmt_cents(market.get("last_price")),
+        fmt_cents(quotes.get("best_yes_bid")),
+        fmt_cents(quotes.get("best_yes_ask")),
+        fmt_cents(quotes.get("best_no_bid")),
+        fmt_cents(quotes.get("best_no_ask")),
+        fmt_cents(quotes.get("mid_price")),
     )
-    sig = generate_signal(market, orderbook)
 
-    # Capture signal components for dashboard (get_btc_momentum/get_orderbook_skew use caches,
-    # so these calls do not trigger additional API requests).
-    # The 0.6/0.4 weights mirror generate_signal() in strategy.py — kept here so the
-    # dashboard has a pre-computed composite without modifying the strategy API.
-    if state is not None:
-        _momentum = get_btc_momentum()
-        _skew = get_orderbook_skew(orderbook)
-        if _momentum is not None:
-            state["signal_momentum"] = round(_momentum, 4)
-            state["signal_skew"] = round(_skew, 4)
-            state["signal_composite"] = round((0.6 * _momentum) + (0.4 * _skew), 4)
-        if sig is not None:
-            state["signal_confidence"] = round(sig.confidence, 4)
-        _pos = risk.get_open_positions().get(ticker)
-        state["position_size"] = _pos["quantity"] if _pos else 0
-    
-    # 4. Manage existing positions first
-    exit_error = False
-    try:
-        for closed in manage_positions(client, market, risk, current_signal=sig) or []:
-            _record_exit(risk, closed)
-    except Exception as exc:
-        log.error("Error while managing positions: %s", exc, exc_info=True)
-        exit_error = True
-
-    if _halt_trading:
+    yes_raw, no_raw = _extract_raw_arrays(orderbook)
+    if not yes_raw and not no_raw:
+        log.warning(
+            "Empty orderbook for %s: raw_yes=%s raw_no=%s -- skipping series this cycle",
+            ticker, yes_raw, no_raw,
+        )
         return False
 
-    # If position management failed, skip new entries to avoid trading with
-    # unrecorded/un-exited positions.
-    if exit_error:
+    # Hard orderbook sanity validation before strategy evaluation.
+    # Kalshi prices are always expressed on the YES side (YES + NO = 100¢),
+    # so we validate the YES bid/ask pair directly.
+    yes_bid_cents = quotes.get("best_yes_bid")
+    yes_ask_cents = quotes.get("best_yes_ask")
+    yes_depth = quotes.get("best_yes_bid_size")
+    yes_bid = (float(yes_bid_cents) / 100.0) if yes_bid_cents is not None else None
+    yes_ask = (float(yes_ask_cents) / 100.0) if yes_ask_cents is not None else None
+    if (
+        yes_bid is None
+        or yes_ask is None
+        or yes_depth is None
+        or yes_depth <= 0
+        or yes_bid < 0
+        or yes_bid > 1
+        or yes_ask < 0
+        or yes_ask > 1
+        or yes_bid > yes_ask
+    ):
+        log.warning(
+            "Invalid orderbook for %s: yes_bid=%s yes_ask=%s yes_depth=%s -- skipping series this cycle",
+            ticker, yes_bid, yes_ask, yes_depth,
+        )
         return False
+    return True
 
-    # 5. Risk check for NEW trade
-    # sig.size == 0 means decide_trade_fee_aware blocked the entry (fee/band
-    # filters) but still returned a directional Signal for reversal-exit
-    # purposes; skip entry.
-    if sig is None or sig.size == 0:
-        return False
-        
+
+def _momentum_for_market(client: KalshiClient, series: str, market: dict):
+    """
+    Momentum for a market's underlying: primarily from the event's own
+    settlement index (CF Benchmarks via /live_data), falling back to the
+    per-coin spot feed when that is unavailable.
+    """
+    momentum = get_index_momentum(client, market.get("event_ticker") or "")
+    if momentum is not None:
+        return momentum
+    return get_spot_momentum(spot_symbol_for_series(series))
+
+
+def _capture_dashboard_state(state: dict, entries: list, risk: RiskManager) -> None:
+    """Fill dashboard state: one row per tradable series, plus legacy
+    single-market fields mirroring the first series for older dashboards."""
+    if state is None:
+        return
+
+    rows = []
+    for entry in entries:
+        market = entry["market"]
+        sig = entry.get("signal")
+        momentum = entry.get("momentum")
+        skew = get_orderbook_skew(entry["orderbook"]) if momentum is not None else None
+        pos = risk.get_open_positions().get(entry["ticker"])
+        row = {
+            "series": entry["series"],
+            "ticker": entry["ticker"],
+            "yes_bid": market.get("best_yes_bid") or market.get("yes_bid"),
+            "yes_ask": market.get("best_yes_ask") or market.get("yes_ask"),
+            "no_bid": market.get("best_no_bid") or market.get("no_bid"),
+            "no_ask": market.get("best_no_ask") or market.get("no_ask"),
+            "mid_price": market.get("mid_price"),
+            "signal_momentum": round(momentum, 4) if momentum is not None else None,
+            "signal_skew": round(skew, 4) if skew is not None else None,
+            "signal_composite": (
+                round((0.6 * momentum) + (0.4 * skew), 4)
+                if momentum is not None and skew is not None else None
+            ),
+            "signal_confidence": round(sig.confidence, 4) if sig is not None else None,
+            "position_size": pos["quantity"] if pos else 0,
+        }
+        yb, ya = row["yes_bid"], row["yes_ask"]
+        row["spread"] = (ya - yb) if (yb is not None and ya is not None) else None
+        rows.append(row)
+
+    state["markets"] = rows
+    state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
+    if rows:
+        first = rows[0]
+        state["active_market_ticker"] = first["ticker"]
+        for key in (
+            "yes_bid", "yes_ask", "no_bid", "no_ask", "mid_price", "spread",
+            "signal_momentum", "signal_skew", "signal_composite",
+            "signal_confidence", "position_size",
+        ):
+            state[key] = first[key]
+
+
+def _try_enter(client: KalshiClient, risk: RiskManager, ticker: str, sig, balance, positions, state) -> bool:
+    """Risk-check, size, and place one entry order. Returns True on a fill."""
+    global _halt_trading
+
     approved, reason = risk.approve_trade(sig, balance, positions, ticker)
     if not approved:
         # Don't log "Already have position" as an error, it's normal if we didn't exit
         if "Already have" not in reason:
-            log.info("New trade rejected by risk manager: %s", reason)
+            log.info("New trade rejected by risk manager (%s): %s", ticker, reason)
         return False
 
-    # 6. Size the trade
     # decide_trade_fee_aware already computed an edge-based size (sig.size); cap
     # it by the dollar budget so existing risk limits are always respected.
     budget_contracts = risk.calculate_contracts(sig.price_cents)
@@ -917,7 +875,6 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         contracts * sig.price_cents / 100, sig.reason
     )
 
-    # 7. Execute via CLI + decision engine
     outcome, envelope = _cli_buy(
         client, ticker, sig.side, contracts, sig.price_cents, dry_run=config.DRY_RUN,
     )
@@ -928,7 +885,7 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         return False
     order_id = envelope.get("result", {}).get("order_id")
 
-    # 8. Track only what actually filled (orders are IOC: the response is final;
+    # Track only what actually filled (orders are IOC: the response is final;
     # recording the requested size would create phantom positions on no-fill).
     filled, fill_price = _order_fill_info(envelope, contracts, sig.price_cents)
     if filled < 0.01:
@@ -945,60 +902,181 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         _pos = risk.get_open_positions().get(ticker)
         state["position_size"] = _pos["quantity"] if _pos else 0
 
-    # Clear datetime cache at end of cycle
     return True
 
 
-def _run_once_time_delay(
-    client: KalshiClient,
-    risk: RiskManager,
-    market: dict,
-    ticker: str,
-    balance: float,
-    positions: list,
-    orderbook: dict,
-    state: dict = None,
-) -> bool:
-    """
-    One bot cycle for the ``reddit_time_delay`` strategy mode.
+def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, state: dict = None):
+    """Internal implementation of one bot cycle. Updates *state* in-place for the dashboard."""
+    # 1. Discover the active market for every configured series
+    entries = []
+    for series in config.SERIES_TICKERS:
+        try:
+            market = client.get_active_market(series)
+        except Exception as exc:
+            log.error("Market discovery failed for series %s: %s", series, exc)
+            continue
+        if not market:
+            continue  # get_active_market already logged the reason
+        ticker = market.get("ticker", "")
+        if not ticker.startswith(f"{series}-"):
+            log.error("Refusing market %s outside series %s", ticker, series)
+            continue
+        entries.append({"series": series, "ticker": ticker, "market": market})
 
-    Flow:
-      1. Run manage_positions for safety exits (stop-loss, take-profit, expiry).
-      2. Compute current window context (minutes_to_expiry, window_id).
-      3. Call decide_trade to get an action.
-      4. Act on EXIT_POSITION (price-triggered stop-loss from strategy).
-      5. Act on ENTER_YES / ENTER_NO (pass through risk manager first).
-    """
-    global _last_trade_window_id, _trades_in_current_window, _halt_trading
+    if not entries:
+        log.warning(
+            "No active market found for any configured series %s. Skipping cycle.",
+            config.SERIES_TICKERS,
+        )
+        return False
 
-    # 1. Safety exits first (stop-loss, take-profit, expiry — always active)
+    if state is not None:
+        state["active_market_ticker"] = entries[0]["ticker"]
+
+    # 2. Fetch account data and per-series orderbooks (balance and positions
+    #    overlap with the orderbook fetches on the shared pool).
+    try:
+        pool = _get_fetch_executor()
+        fut_bal = pool.submit(client.get_balance)
+        fut_pos = pool.submit(client.get_positions)
+        for entry in entries:
+            entry["orderbook"] = _fetch_market_orderbook(client, ws_client, entry["ticker"])
+        balance = fut_bal.result()
+        positions = fut_pos.result()
+    except Exception as exc:
+        log.error("API fetch error: %s", exc)
+        return False
+
+    # 3. Merge quotes and validate each book; an unusable book skips only
+    #    that series, never the whole cycle.
+    tradable = [entry for entry in entries if _prepare_market(entry)]
+    markets_by_ticker = {entry["ticker"]: entry["market"] for entry in entries}
+
+    # ── reddit_time_delay strategy path ───────────────────────────────────────
+    if config.STRATEGY_MODE == "reddit_time_delay":
+        _capture_dashboard_state(state, tradable, risk)
+        return _run_cycle_time_delay(
+            client, risk, tradable, markets_by_ticker, balance, positions, state,
+        )
+
+    # ── fee_aware_model strategy path (default) ────────────────────────────────
+
+    # 4. Per-series signals: momentum comes from each event's own settlement
+    #    index (CF Benchmarks), with the per-coin spot feed as fallback.
+    signals = {}
+    for entry in tradable:
+        momentum = _momentum_for_market(client, entry["series"], entry["market"])
+        entry["momentum"] = momentum
+        sig = generate_signal(entry["market"], entry["orderbook"], momentum=momentum)
+        entry["signal"] = sig
+        signals[entry["ticker"]] = sig
+
+    _capture_dashboard_state(state, tradable, risk)
+
+    # 5. Manage every tracked position once per cycle
     exit_error = False
     try:
-        for closed in manage_positions(client, market, risk) or []:
+        for closed in manage_all_positions(client, markets_by_ticker, risk, signals):
+            _record_exit(risk, closed)
+    except Exception as exc:
+        log.error("Error while managing positions: %s", exc, exc_info=True)
+        exit_error = True
+
+    if _halt_trading:
+        return False
+    # If position management failed, skip new entries to avoid trading with
+    # unrecorded/un-exited positions.
+    if exit_error:
+        return False
+
+    # 6. Entries: at most ONE new entry per cycle. The exposure estimate in
+    #    approve_trade uses the positions snapshot from the start of this
+    #    cycle, which cannot see same-cycle fills; the other series simply get
+    #    their turn on the next 10-second poll.
+    for entry in tradable:
+        sig = entry.get("signal")
+        # sig.size == 0 means decide_trade_fee_aware blocked the entry (fee/band
+        # filters) but still returned a directional Signal for reversal exits.
+        if sig is None or sig.size == 0:
+            continue
+        if _try_enter(client, risk, entry["ticker"], sig, balance, positions, state):
+            return True
+        if _halt_trading:
+            return False
+    return False
+
+
+def _run_cycle_time_delay(
+    client: KalshiClient,
+    risk: RiskManager,
+    tradable: list,
+    markets_by_ticker: dict,
+    balance: float,
+    positions: list,
+    state: dict = None,
+) -> bool:
+    """One reddit_time_delay cycle across all tradable series."""
+    # 1. Safety exits first (stop-loss, take-profit, expiry — always active),
+    #    across every tracked position.
+    exit_error = False
+    try:
+        for closed in manage_all_positions(client, markets_by_ticker, risk, None):
             _record_exit(risk, closed)
     except Exception as exc:
         log.error("Error while managing positions (time_delay): %s", exc, exc_info=True)
         exit_error = True
 
-    if exit_error:
-        return False
-    if _halt_trading:
+    if exit_error or _halt_trading:
         return False
 
-    # 2. Compute window context
-    # Use cached datetime from risk manager for consistency and performance
+    # 2. Per-series strategy pass; at most one new entry per cycle (exits are
+    #    always processed for every series).
+    acted = False
+    entry_placed = False
+    for entry in tradable:
+        result = _time_delay_series_cycle(
+            client, risk, entry, balance, positions, state,
+            allow_entry=not entry_placed,
+        )
+        if _halt_trading:
+            return acted or result is not None
+        if result == "entered":
+            entry_placed = True
+        if result is not None:
+            acted = True
+    return acted
+
+
+def _time_delay_series_cycle(
+    client: KalshiClient,
+    risk: RiskManager,
+    entry: dict,
+    balance: float,
+    positions: list,
+    state: dict = None,
+    allow_entry: bool = True,
+):
+    """
+    reddit_time_delay logic for one series. Returns "entered", "exited", or
+    None when no action was taken.
+    """
+    global _halt_trading
+
+    series = entry["series"]
+    ticker = entry["ticker"]
+    market = entry["market"]
+
+    # Window context (cached datetime from risk manager for consistency)
     cached_now = risk._get_current_datetime()
     minutes_to_expiry = _compute_minutes_to_expiry(market, cached_now)
     current_window_id = _compute_window_id(market)
 
-    # Reset per-window entry counter when the market window has rolled over.
-    if current_window_id != _last_trade_window_id:
-        _trades_in_current_window = 0
+    # Reset the per-window entry counter when this series' window rolled over.
+    if current_window_id != _last_trade_window_id.get(series):
+        _trades_in_current_window[series] = 0
 
     # Derive entry prices from ask (realistic cost to open a position)
     # and exit prices from bid (the price we can realistically sell at).
-    # Support both old field names (yes_ask, yes_bid) and new (best_yes_ask, best_yes_bid)
-    # Consolidate market data lookups to avoid redundant dictionary access
     yes_ask_cents = market.get("best_yes_ask") or market.get("yes_ask")
     no_ask_cents = market.get("best_no_ask") or market.get("no_ask")
     yes_bid_cents = market.get("best_yes_bid") or market.get("yes_bid")
@@ -1007,45 +1085,43 @@ def _run_once_time_delay(
         # Never trade on invented quotes: the old 50c fallback could trigger
         # entries/exits at prices unrelated to the actual book.
         log.warning(
-            "time_delay: incomplete quotes for %s (yes %s/%s no %s/%s) — skipping cycle",
+            "time_delay: incomplete quotes for %s (yes %s/%s no %s/%s) — skipping series",
             ticker, yes_bid_cents, yes_ask_cents, no_bid_cents, no_ask_cents,
         )
-        return False
+        return None
     up_price = float(yes_ask_cents) / 100.0   # ask — used for entry trigger
     down_price = float(no_ask_cents) / 100.0  # ask — used for entry trigger
     up_bid = float(yes_bid_cents) / 100.0     # bid — used for stop-loss exit
     down_bid = float(no_bid_cents) / 100.0    # bid — used for stop-loss exit
 
     # Determine whether this bot currently holds a YES or NO position
-    # Cache the lookup to avoid redundant dictionary comprehension
-    bot_positions = risk.get_open_positions()
-    bot_pos = bot_positions.get(ticker)
-    current_position_side: "str | None" = bot_pos["side"].upper() if bot_pos else None
+    bot_pos = risk.get_open_positions().get(ticker)
+    current_position_side = bot_pos["side"].upper() if bot_pos else None
 
     log.info(
         "time_delay | ticker=%s | up_ask=%.2f up_bid=%.2f | down_ask=%.2f down_bid=%.2f"
         " | minutes_left=%d | position=%s | trades_in_window=%d",
         ticker, up_price, up_bid, down_price, down_bid,
-        minutes_to_expiry, current_position_side, _trades_in_current_window,
+        minutes_to_expiry, current_position_side,
+        _trades_in_current_window.get(series, 0),
     )
 
-    # 3. Ask the strategy what to do
     action, size = decide_trade(
         up_price=up_price,
         down_price=down_price,
         minutes_to_expiry=minutes_to_expiry,
         current_position_side=current_position_side,
         current_window_id=current_window_id,
-        last_trade_window_id=_last_trade_window_id,
+        last_trade_window_id=_last_trade_window_id.get(series),
         cfg=config,
-        trades_in_current_window=_trades_in_current_window,
+        trades_in_current_window=_trades_in_current_window.get(series, 0),
         up_bid=up_bid,
         down_bid=down_bid,
     )
 
-    log.debug("time_delay decide_trade → action=%s size=%s", action, size)
+    log.debug("time_delay decide_trade (%s) → action=%s size=%s", ticker, action, size)
 
-    # 4. Handle strategy-triggered EXIT_POSITION
+    # Strategy-triggered EXIT_POSITION
     if action == "EXIT_POSITION" and bot_pos:
         side = bot_pos["side"]
         count = bot_pos["quantity"]
@@ -1057,16 +1133,16 @@ def _run_once_time_delay(
         )
         if outcome.action == AgentAction.HALT_TRADING:
             _halt_trading = True
-            return False
+            return None
         if outcome.action != AgentAction.CONTINUE:
-            return False
+            return None
         filled, fill_price = _order_fill_info(_env, count, exit_price_order)
         if filled < 0.01:
             log.warning(
                 "time_delay: exit order for %s did not fill (IOC); retrying next cycle",
                 ticker,
             )
-            return False
+            return None
         pnl_cents = compute_pnl_cents(side, entry_price, fill_price, filled)
         log_trade(
             "EXIT(time_delay) %s | side=%s | entry=%dc | exit=%dc | filled=%s/%s | pnl=%+dc",
@@ -1085,11 +1161,11 @@ def _run_once_time_delay(
             _pos = risk.get_open_positions().get(ticker)
             state["position_size"] = _pos["quantity"] if _pos else 0
             state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
-        return True
+        return "exited"
 
-    # 5. Handle new entries
-    if action not in ("ENTER_YES", "ENTER_NO"):
-        return False
+    # New entries
+    if action not in ("ENTER_YES", "ENTER_NO") or not allow_entry:
+        return None
 
     side = "yes" if action == "ENTER_YES" else "no"
     entry_price_cents = yes_ask_cents if side == "yes" else no_ask_cents
@@ -1107,14 +1183,14 @@ def _run_once_time_delay(
     approved, reason = risk.approve_trade(sig_stub, balance, positions, ticker)
     if not approved:
         if "Already have" not in reason:
-            log.info("time_delay trade rejected by risk manager: %s", reason)
-        return False
+            log.info("time_delay trade rejected by risk manager (%s): %s", ticker, reason)
+        return None
 
     budget_contracts = risk.calculate_contracts(sig_stub.price_cents)
     contracts = _compute_trade_contracts(sig_stub.size, budget_contracts)
     if contracts < 1:
         log.warning("time_delay: contract count is 0 — price too high for budget. Skipping.")
-        return False
+        return None
 
     log_trade(
         "time_delay: Placing BUY %s %s x%d @ %dc (est. cost $%.2f)",
@@ -1127,35 +1203,35 @@ def _run_once_time_delay(
     )
     if outcome.action == AgentAction.HALT_TRADING:
         _halt_trading = True
-        return False
+        return None
     if outcome.action != AgentAction.CONTINUE:
-        return False
+        return None
     order_id = envelope.get("result", {}).get("order_id")
 
     filled, fill_price = _order_fill_info(envelope, contracts, sig_stub.price_cents)
     if filled < 0.01:
         log.info("time_delay: BUY %s did not fill (IOC) — no position opened", ticker)
-        return False
+        return None
     risk.record_open_position(ticker, side, filled, fill_price)
     risk.log_entry_trade(ticker, side, filled, fill_price)
-    _last_trade_window_id = current_window_id
-    _trades_in_current_window += 1
+    _last_trade_window_id[series] = current_window_id
+    _trades_in_current_window[series] = _trades_in_current_window.get(series, 0) + 1
     log.debug("time_delay order id: %s", order_id)
 
-    # Update dashboard state with final position and PnL
     if state is not None:
         _pos = risk.get_open_positions().get(ticker)
         state["position_size"] = _pos["quantity"] if _pos else 0
         state["realized_pnl_cents"] = risk._daily_realized_pnl_cents
 
-    # Clear datetime cache at end of cycle
-    return True
+    return "entered"
+
 
 def main():
     setup_logging()
     log.info("=" * 60)
-    log.info("      Kalshi 15-minute BTC Trader (with Early Exit)")
+    log.info("      Kalshi 15-minute Crypto Trader (with Early Exit)")
     log.info(" Environment : %s", config.KALSHI_ENV.upper())
+    log.info(" Series      : %s", ", ".join(config.SERIES_TICKERS))
     log.info(" Dry run     : %s", config.DRY_RUN)
     log.info(" Strategy    : %s", config.STRATEGY_MODE)
     log.info(" Stop Loss   : %sc", config.STOP_LOSS_CENTS)

@@ -1,5 +1,5 @@
 """
-dashboard.py – Simple local web dashboard for the Kalshi 15-minute BTC bot.
+dashboard.py – Simple local web dashboard for the Kalshi 15-minute crypto bot.
 
 Reads dashboard_state.json written by the bot each cycle and renders a
 live-refreshing HTML page at http://127.0.0.1:8000.
@@ -28,11 +28,11 @@ _HTML = """<!DOCTYPE html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kalshi BTC Bot Dashboard</title>
+  <title>Kalshi Crypto Bot Dashboard</title>
   <meta http-equiv="refresh" content="5">
   <style>
     body { font-family: monospace; background: #1a1a2e; color: #e0e0e0;
-           padding: 24px; max-width: 640px; }
+           padding: 24px; max-width: 960px; }
     h1    { color: #00d4aa; margin-bottom: 4px; }
     .sub  { color: #666; font-size: 0.85em; margin-bottom: 20px; }
     table { border-collapse: collapse; width: 100%; }
@@ -46,7 +46,7 @@ _HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>&#x1F916; Kalshi BTC Bot Dashboard</h1>
+  <h1>&#x1F916; Kalshi Crypto Bot Dashboard</h1>
   <p class="sub">Auto-refreshes every 5 seconds.</p>
 
   {% if error %}
@@ -56,7 +56,35 @@ _HTML = """<!DOCTYPE html>
   {% else %}
   <table>
     <tr><td class="label">Last updated</td>
-        <td>{{ state.get('timestamp') or 'N/A' }}</td></tr>
+        <td colspan="{{ markets|length if markets else 1 }}">{{ state.get('timestamp') or 'N/A' }}</td></tr>
+    {% if markets %}
+    <tr><td class="label">Active market</td>
+      {% for m in markets %}<td>{{ m.get('ticker') or 'N/A' }}</td>{% endfor %}</tr>
+
+    <tr><td colspan="{{ 1 + markets|length }}" class="sect">&#x2500; Quotes</td></tr>
+    <tr><td class="label">YES bid / ask</td>
+      {% for m in markets %}<td>{{ fmt(m.get('yes_bid')) }}&#162; / {{ fmt(m.get('yes_ask')) }}&#162;</td>{% endfor %}</tr>
+    <tr><td class="label">NO bid / ask</td>
+      {% for m in markets %}<td>{{ fmt(m.get('no_bid')) }}&#162; / {{ fmt(m.get('no_ask')) }}&#162;</td>{% endfor %}</tr>
+    <tr><td class="label">Mid price</td>
+      {% for m in markets %}<td>{{ fmt(m.get('mid_price')) }}&#162;</td>{% endfor %}</tr>
+    <tr><td class="label">Spread</td>
+      {% for m in markets %}<td>{{ fmt(m.get('spread')) }}&#162;</td>{% endfor %}</tr>
+
+    <tr><td colspan="{{ 1 + markets|length }}" class="sect">&#x2500; Signal (settlement-index momentum)</td></tr>
+    <tr><td class="label">Composite</td>
+      {% for m in markets %}<td>{{ fmt4(m.get('signal_composite')) }}</td>{% endfor %}</tr>
+    <tr><td class="label">Momentum</td>
+      {% for m in markets %}<td>{{ fmt4(m.get('signal_momentum')) }}</td>{% endfor %}</tr>
+    <tr><td class="label">Skew</td>
+      {% for m in markets %}<td>{{ fmt4(m.get('signal_skew')) }}</td>{% endfor %}</tr>
+    <tr><td class="label">Confidence</td>
+      {% for m in markets %}<td>{{ fmt4(m.get('signal_confidence')) }}</td>{% endfor %}</tr>
+
+    <tr><td colspan="{{ 1 + markets|length }}" class="sect">&#x2500; Position &amp; P&amp;L</td></tr>
+    <tr><td class="label">Position size</td>
+      {% for m in markets %}<td>{{ m.get('position_size', 0) }}</td>{% endfor %}</tr>
+    {% else %}
     <tr><td class="label">Active market</td>
         <td>{{ state.get('active_market_ticker') or 'N/A' }}</td></tr>
 
@@ -83,8 +111,9 @@ _HTML = """<!DOCTYPE html>
     <tr><td colspan="2" class="sect">&#x2500; Position &amp; P&amp;L</td></tr>
     <tr><td class="label">Position size</td>
         <td>{{ state.get('position_size', 0) }}</td></tr>
+    {% endif %}
     <tr><td class="label">Realized PnL today</td>
-        <td>{{ state.get('realized_pnl_cents', 0) }}&#162;</td></tr>
+        <td colspan="{{ markets|length if markets else 1 }}">{{ state.get('realized_pnl_cents', 0) }}&#162;</td></tr>
   </table>
   {% endif %}
 </body>
@@ -109,9 +138,11 @@ def index():
     def fmt4(v):
         return "N/A" if v is None else f"{v:.4f}"
 
+    markets = (state or {}).get("markets") or None
     return render_template_string(
         _HTML,
         state=state,
+        markets=markets,
         error=error,
         fmt=fmt,
         fmt4=fmt4,

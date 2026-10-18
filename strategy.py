@@ -28,10 +28,10 @@ import config
 
 log = logging.getLogger(__name__)
 
-# Cache for BTC momentum data to avoid redundant yfinance API calls
-# TTL set to 1 minute (60s) since 1-minute bars update frequently;
-# balances freshness against API call overhead in a 15-minute market window
-_btc_momentum_cache: dict = {"data": None, "timestamp": 0, "ttl": 60}
+# Per-symbol cache for spot momentum to avoid redundant yfinance API calls.
+# TTL of 60 s balances freshness against API overhead in a 15-minute window.
+_SPOT_MOMENTUM_TTL_SECONDS = 60
+_spot_momentum_cache: dict = {}  # symbol -> {"data": float, "timestamp": float}
 
 # A market whose YES ask ≈ 1.00 and YES bid ≈ 0.00 (spread ≥ this) is considered
 # a ghost / dead book and is always skipped.
@@ -47,56 +47,51 @@ class Signal:
     size: int = field(default=1)  # edge-scaled contract count from decide_trade
 
 
-def get_btc_momentum() -> Optional[float]:
+def get_spot_momentum(symbol: Optional[str] = None) -> Optional[float]:
     """
-    Fetch recent 1-minute BTC/USD bars and return the momentum score.
-    Returns a float in roughly [-1, 1]:
-      > 0  => bullish (BTC trending up)
-      < 0  => bearish (BTC trending down)
-    Returns None on data error.
+    Fallback momentum feed: recent 1-minute spot bars from yfinance.
 
-    Uses a 60-second cache to avoid redundant yfinance API calls on every bot cycle.
+    Returns a float in roughly [-1, 1] (> 0 bullish, < 0 bearish) or None on
+    data error. The primary feed is the settlement index itself
+    (index_feed.get_index_momentum); this spot feed is used when that is
+    unavailable. Results are cached per symbol for 60 s.
     """
-    global _btc_momentum_cache
+    symbol = symbol or config.BTC_TICKER
 
-    # Check if cached data is still valid
     now = time.time()
-    if (_btc_momentum_cache["data"] is not None and
-        now - _btc_momentum_cache["timestamp"] < _btc_momentum_cache["ttl"]):
-        log.debug("Using cached BTC momentum: %.4f", _btc_momentum_cache["data"])
-        return _btc_momentum_cache["data"]
+    cached = _spot_momentum_cache.get(symbol)
+    if cached is not None and now - cached["timestamp"] < _SPOT_MOMENTUM_TTL_SECONDS:
+        log.debug("Using cached spot momentum for %s: %.4f", symbol, cached["data"])
+        return cached["data"]
 
     try:
-        ticker = yf.Ticker(config.BTC_TICKER)
+        ticker = yf.Ticker(symbol)
         # Use a small intraday lookback by default to keep yfinance downloads cheap
         # in the bot hot path. Allow overriding via config when a larger buffer is
         # explicitly needed for environments with sparse/missing recent 1-minute bars.
         history_period = config.BTC_MOMENTUM_HISTORY_PERIOD
         hist = ticker.history(period=history_period, interval="1m")
         if hist.empty or len(hist) < config.MOMENTUM_LOOKBACK_BARS + 1:
-            log.warning("Not enough BTC price history available")
+            log.warning("Not enough %s price history available", symbol)
             return None
 
         closes = hist["Close"].values
-        recent = closes[-config.MOMENTUM_LOOKBACK_BARS:]
-        baseline = closes[-(config.MOMENTUM_LOOKBACK_BARS + 1)]
-
-        if baseline == 0:
+        from index_feed import momentum_from_closes
+        momentum = momentum_from_closes(list(closes), config.MOMENTUM_LOOKBACK_BARS)
+        if momentum is None:
             return None
 
-        pct_change = (recent[-1] - baseline) / baseline  # e.g. 0.003 = +0.3%
-        # Normalize: clip to [-2%, +2%] range then scale to [-1, 1]
-        momentum = float(np.clip(pct_change / 0.02, -1.0, 1.0))
-
-        # Cache the result
-        _btc_momentum_cache["data"] = momentum
-        _btc_momentum_cache["timestamp"] = now
-
-        log.debug("BTC momentum: %.4f (raw pct_change=%.4f%%)", momentum, pct_change * 100)
+        _spot_momentum_cache[symbol] = {"data": momentum, "timestamp": now}
+        log.debug("Spot momentum for %s: %.4f", symbol, momentum)
         return momentum
     except Exception as exc:
-        log.error("Error fetching BTC price: %s", exc)
+        log.error("Error fetching %s price: %s", symbol, exc)
         return None
+
+
+def get_btc_momentum() -> Optional[float]:
+    """Back-compat wrapper: BTC spot momentum from the fallback feed."""
+    return get_spot_momentum(config.BTC_TICKER)
 
 
 def get_orderbook_skew(orderbook: dict, max_levels: int = 10) -> float:
@@ -459,13 +454,19 @@ def _extract_best_bid_depth(raw_array) -> tuple:
     return None, 0
 
 
-def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
+def generate_signal(
+    market: dict, orderbook: dict, momentum: Optional[float] = None
+) -> Optional[Signal]:
     """
     Main entry point.  Returns a Signal or None if no trade warranted.
 
     Combines:
-      - BTC short-term momentum  (weight 0.6)
-      - Kalshi orderbook skew    (weight 0.4)
+      - underlying-index short-term momentum  (weight 0.6)
+      - Kalshi orderbook skew                 (weight 0.4)
+
+    *momentum* is normally injected by the caller (computed from the event's
+    own settlement index via index_feed, with a per-coin spot fallback); when
+    omitted, the legacy BTC spot feed is used.
 
     The composite score is mapped to a model_p_yes probability and passed
     through decide_trade_fee_aware(), which enforces fee-aware entry filters
@@ -477,7 +478,8 @@ def generate_signal(market: dict, orderbook: dict) -> Optional[Signal]:
     opened.
     Returns None only when momentum data is unavailable (no directional view).
     """
-    momentum = get_btc_momentum()
+    if momentum is None:
+        momentum = get_btc_momentum()
     if momentum is None:
         log.warning("Could not compute momentum — skipping this cycle")
         return None

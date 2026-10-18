@@ -934,13 +934,24 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         state["active_market_ticker"] = entries[0]["ticker"]
 
     # 2. Fetch account data and per-series orderbooks (balance and positions
-    #    overlap with the orderbook fetches on the shared pool).
+    #    overlap with the orderbook fetches on the shared pool). An orderbook
+    #    failure drops only its own series: a transient ETH/SOL fetch error
+    #    must never stop a BTC position's stop-loss from running.
     try:
         pool = _get_fetch_executor()
         fut_bal = pool.submit(client.get_balance)
         fut_pos = pool.submit(client.get_positions)
+        fetched = []
         for entry in entries:
-            entry["orderbook"] = _fetch_market_orderbook(client, ws_client, entry["ticker"])
+            try:
+                entry["orderbook"] = _fetch_market_orderbook(client, ws_client, entry["ticker"])
+                fetched.append(entry)
+            except Exception as exc:
+                log.error(
+                    "Orderbook fetch failed for %s; skipping series this cycle: %s",
+                    entry["ticker"], exc,
+                )
+        entries = fetched
         balance = fut_bal.result()
         positions = fut_pos.result()
     except Exception as exc:
@@ -961,7 +972,22 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
 
     # ── fee_aware_model strategy path (default) ────────────────────────────────
 
-    # 4. Per-series signals: momentum comes from each event's own settlement
+    # 4. Safety exits FIRST (stop-loss, take-profit, expiry, settlement): these
+    #    must not wait behind the per-series momentum fetches below, whose
+    #    timeouts/retries could otherwise delay an exit by many seconds.
+    #    (Signal-reversal exits need the signals and run in the second pass.)
+    exit_error = False
+    try:
+        for closed in manage_all_positions(client, markets_by_ticker, risk, None):
+            _record_exit(risk, closed)
+    except Exception as exc:
+        log.error("Error while managing positions: %s", exc, exc_info=True)
+        exit_error = True
+
+    if _halt_trading:
+        return False
+
+    # 5. Per-series signals: momentum comes from each event's own settlement
     #    index (CF Benchmarks), with the per-coin spot feed as fallback.
     signals = {}
     for entry in tradable:
@@ -973,17 +999,26 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
 
     _capture_dashboard_state(state, tradable, risk)
 
-    # 5. Manage every tracked position once per cycle
-    exit_error = False
+    # 5b. Reversal pass: with signals in hand, evaluate signal-reversal exits
+    #     for positions in this cycle's active markets (positions already
+    #     closed above are gone from tracking, so nothing runs twice; an
+    #     unfilled safety exit simply gets retried here).
     try:
-        for closed in manage_all_positions(client, markets_by_ticker, risk, signals):
-            _record_exit(risk, closed)
+        for entry in tradable:
+            pos = risk.get_open_positions().get(entry["ticker"])
+            sig = signals.get(entry["ticker"])
+            if pos is None or sig is None:
+                continue
+            for closed in _manage_single_position(
+                client, entry["market"], risk, pos, current_signal=sig,
+            ):
+                _record_exit(risk, closed)
+            if _halt_trading:
+                return False
     except Exception as exc:
-        log.error("Error while managing positions: %s", exc, exc_info=True)
+        log.error("Error during reversal-exit pass: %s", exc, exc_info=True)
         exit_error = True
 
-    if _halt_trading:
-        return False
     # If position management failed, skip new entries to avoid trading with
     # unrecorded/un-exited positions.
     if exit_error:

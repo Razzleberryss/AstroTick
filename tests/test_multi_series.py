@@ -17,6 +17,7 @@ os.environ.setdefault(
 )
 
 import config
+import bot
 from bot import _momentum_for_market, manage_all_positions, manage_positions
 from index_feed import spot_symbol_for_series
 from kalshi_client import KalshiClient
@@ -181,6 +182,129 @@ class TestManageAllPositions(unittest.TestCase):
         self.assertEqual(closed[0]["market"], other)
         self.assertEqual(closed[0]["exit_reason"], "settled")
         self.assertEqual(closed[0]["exit_price"], 100)
+
+
+
+
+class _FakeClient:
+    """Drives _run_once_impl: two configured series with canned market data."""
+
+    def __init__(self, markets, orderbooks, fail_orderbooks=()):
+        self._markets = markets          # series -> market dict
+        self._orderbooks = orderbooks    # ticker -> orderbook dict
+        self._fail_orderbooks = set(fail_orderbooks)
+
+    def get_active_market(self, series_ticker=None):
+        import copy
+        m = self._markets.get(series_ticker)
+        return copy.deepcopy(m) if m else None
+
+    def get_orderbook(self, ticker, depth=10):
+        if ticker in self._fail_orderbooks:
+            raise RuntimeError(f"orderbook fetch failed for {ticker}")
+        return self._orderbooks[ticker]
+
+    def get_balance(self):
+        return 100.0
+
+    def get_positions(self):
+        return []
+
+    def get_event_live_data(self, event_ticker, range=None):
+        raise RuntimeError("index feed down")
+
+    def get_market(self, ticker):
+        return {}
+
+
+def _ob(yes_bid_dollars, no_bid_dollars):
+    return {"orderbook_fp": {
+        "yes_dollars": [[f"{yes_bid_dollars:.4f}", "50.00"]],
+        "no_dollars": [[f"{no_bid_dollars:.4f}", "50.00"]],
+    }}
+
+
+class TestCycleIsolation(unittest.TestCase):
+    """Codex P1 regressions: one series' failures must not block another
+    series' safety exits, and safety exits must run before momentum fetches."""
+
+    BTC = "KXBTC15M-26OCT180000-45"
+    ETH = "KXETH15M-26OCT180000-45"
+
+    def setUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+        self._tmp.close()
+        self._patches = [
+            patch.object(config, "TRADE_LOG_FILE", self._tmp.name),
+            patch.object(config, "DRY_RUN", True),
+            patch.object(config, "SERIES_TICKERS", ["KXBTC15M", "KXETH15M"]),
+            patch.object(config, "STOP_LOSS_CENTS", 20),
+            patch.object(config, "TAKE_PROFIT_CENTS", 0),
+            patch.object(config, "USE_ORDERBOOK_PRICES", True),
+            patch.object(config, "STRATEGY_MODE", "fee_aware_model"),
+        ]
+        for p in self._patches:
+            p.start()
+        bot._halt_trading = False
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        os.unlink(self._tmp.name)
+
+    def _markets(self):
+        return {
+            "KXBTC15M": {"ticker": self.BTC, "event_ticker": "KXBTC15M-26OCT180000",
+                         "close_time": _future_iso(10)},
+            "KXETH15M": {"ticker": self.ETH, "event_ticker": "KXETH15M-26OCT180000",
+                         "close_time": _future_iso(10)},
+        }
+
+    def test_orderbook_failure_in_one_series_does_not_block_other_exits(self):
+        # BTC yes bid 30c vs entry 60c -> stop-loss fires; the ETH orderbook
+        # fetch raises every time.
+        client = _FakeClient(
+            self._markets(),
+            {self.BTC: _ob(0.30, 0.69)},
+            fail_orderbooks=[self.ETH],
+        )
+        risk = RiskManager()
+        risk.record_open_position(self.BTC, "yes", 2, 60)
+
+        with patch("bot.get_index_momentum", return_value=0.0), patch(
+            "bot.get_spot_momentum", return_value=0.0
+        ):
+            bot._run_once_impl(client, risk, ws_client=None, state=None)
+
+        self.assertNotIn(self.BTC, risk.get_open_positions())
+
+    def test_safety_exits_run_before_momentum_fetches(self):
+        # The momentum fetch records whether the stop-loss position was still
+        # tracked when it ran; exits must already have happened.
+        client = _FakeClient(
+            self._markets(),
+            {self.BTC: _ob(0.30, 0.69), self.ETH: _ob(0.50, 0.49)},
+        )
+        risk = RiskManager()
+        risk.record_open_position(self.BTC, "yes", 2, 60)
+
+        still_open_at_momentum_time = []
+
+        def _momentum(_client, _event):
+            still_open_at_momentum_time.append(self.BTC in risk.get_open_positions())
+            return 0.0
+
+        with patch("bot.get_index_momentum", side_effect=_momentum), patch(
+            "bot.get_spot_momentum", return_value=0.0
+        ):
+            bot._run_once_impl(client, risk, ws_client=None, state=None)
+
+        self.assertNotIn(self.BTC, risk.get_open_positions())
+        self.assertTrue(still_open_at_momentum_time, "momentum was never fetched")
+        self.assertFalse(
+            any(still_open_at_momentum_time),
+            "stop-loss exit ran after the momentum fetch",
+        )
 
 
 if __name__ == "__main__":

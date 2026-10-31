@@ -59,7 +59,8 @@ The bot is a single-threaded synchronous poll loop (`POLL_INTERVAL_SECONDS`, def
 
 - **Background spot-momentum refresh**: the yfinance fallback no longer blocks after
   the first successful fetch. A daemon thread refreshes while the loop serves the last
-  good value (TTL 180 s).
+  good value (soft TTL / hard max-stale 180 s). Past max-stale the fallback returns
+  `None` so signals skip rather than trading on a multi-window-old direction.
 - **Active-market cache**: `get_active_market` caches per series for ~30 s / until
   close, so multi-series discovery does not re-hit `get_markets` every poll.
 - **Idle account skip**: balance/positions REST is skipped when the bot is flat and

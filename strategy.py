@@ -31,8 +31,12 @@ log = logging.getLogger(__name__)
 
 # Per-symbol cache for spot momentum (yfinance fallback). After the first
 # successful fetch, callers never block: a daemon thread refreshes while the
-# hot path serves the last good value. TTL 180 s ≈ poll×18 at 10 s.
+# hot path serves the last good value. Soft TTL triggers a background refresh;
+# past MAX_STALE the value is no longer usable for trading (failed refreshes
+# leave the success timestamp unchanged, so without this hard cutoff a dead
+# yfinance feed would keep feeding a direction from many windows ago).
 _SPOT_MOMENTUM_TTL_SECONDS = 180.0
+_SPOT_MOMENTUM_MAX_STALE_SECONDS = 180.0
 _spot_momentum_cache: dict = {}  # symbol -> {"data": float, "timestamp": float, "refreshing": bool}
 _spot_momentum_lock = threading.Lock()
 
@@ -103,12 +107,16 @@ def get_spot_momentum(symbol: Optional[str] = None) -> Optional[float]:
     Fallback momentum feed: recent 1-minute spot bars from yfinance.
 
     Returns a float in roughly [-1, 1] (> 0 bullish, < 0 bearish) or None on
-    data error. The primary feed is the settlement index itself
+    data error / expired cache. The primary feed is the settlement index itself
     (index_feed.get_index_momentum); this spot feed is used when that is
     unavailable.
 
     After the first successful fetch, subsequent calls never block on yfinance:
-    stale-but-usable values are returned while a background thread refreshes.
+    values younger than ``_SPOT_MOMENTUM_MAX_STALE_SECONDS`` are returned while a
+    background thread refreshes. Once that age is exceeded (e.g. repeated
+    yfinance failures that never update the success timestamp), returns None so
+    ``_momentum_for_market`` / ``generate_signal`` skip the entry instead of
+    trading on a direction from a prior market window.
     """
     symbol = symbol or config.BTC_TICKER
     now = time.time()
@@ -120,13 +128,18 @@ def get_spot_momentum(symbol: Optional[str] = None) -> Optional[float]:
 
     if data is not None:
         age = now - ts
-        if age < _SPOT_MOMENTUM_TTL_SECONDS:
-            if age >= _SPOT_MOMENTUM_TTL_SECONDS * 0.5:
-                _maybe_start_spot_refresh(symbol)
-            log.debug("Using cached spot momentum for %s: %.4f (age=%.1fs)", symbol, data, age)
-            return data
-        _maybe_start_spot_refresh(symbol)
-        log.debug("Serving stale spot momentum for %s: %.4f (age=%.1fs)", symbol, data, age)
+        if age >= _SPOT_MOMENTUM_MAX_STALE_SECONDS:
+            # Hard expiry: do not feed multi-window-old momentum into signals.
+            _maybe_start_spot_refresh(symbol)
+            log.warning(
+                "Spot momentum for %s expired (age=%.1fs >= %.0fs); "
+                "refusing stale fallback until a fresh fetch succeeds",
+                symbol, age, _SPOT_MOMENTUM_MAX_STALE_SECONDS,
+            )
+            return None
+        if age >= _SPOT_MOMENTUM_TTL_SECONDS * 0.5:
+            _maybe_start_spot_refresh(symbol)
+        log.debug("Using cached spot momentum for %s: %.4f (age=%.1fs)", symbol, data, age)
         return data
 
     # Cold start — must block once so the first fallback cycle has a real signal.

@@ -110,7 +110,7 @@ USE_ORDERBOOK_PRICES: bool = os.getenv("USE_ORDERBOOK_PRICES", "true").lower() =
 
 # USE_WEBSOCKET_ORDERBOOK: When True, use WebSocket streaming for orderbook data
 # instead of REST API polling. Falls back to REST if WebSocket is unavailable.
-USE_WEBSOCKET_ORDERBOOK: bool = os.getenv("USE_WEBSOCKET_ORDERBOOK", "false").lower() == "true"
+USE_WEBSOCKET_ORDERBOOK: bool = os.getenv("USE_WEBSOCKET_ORDERBOOK", "true").lower() == "true"
 
 # Trading threshold parameters - tunable for more/less aggressive trading
 # MIN_EDGE_THRESHOLD: minimum signal confidence required before a signal

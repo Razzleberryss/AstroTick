@@ -17,6 +17,7 @@ you can expand with ML, cross-market arb, etc. later.
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -28,10 +29,12 @@ import config
 
 log = logging.getLogger(__name__)
 
-# Per-symbol cache for spot momentum to avoid redundant yfinance API calls.
-# TTL of 60 s balances freshness against API overhead in a 15-minute window.
-_SPOT_MOMENTUM_TTL_SECONDS = 60
-_spot_momentum_cache: dict = {}  # symbol -> {"data": float, "timestamp": float}
+# Per-symbol cache for spot momentum (yfinance fallback). After the first
+# successful fetch, callers never block: a daemon thread refreshes while the
+# hot path serves the last good value. TTL 180 s ≈ poll×18 at 10 s.
+_SPOT_MOMENTUM_TTL_SECONDS = 180.0
+_spot_momentum_cache: dict = {}  # symbol -> {"data": float, "timestamp": float, "refreshing": bool}
+_spot_momentum_lock = threading.Lock()
 
 # A market whose YES ask ≈ 1.00 and YES bid ≈ 0.00 (spread ≥ this) is considered
 # a ghost / dead book and is always skipped.
@@ -47,6 +50,54 @@ class Signal:
     size: int = field(default=1)  # edge-scaled contract count from decide_trade
 
 
+def _fetch_spot_momentum_sync(symbol: str) -> Optional[float]:
+    """Blocking yfinance fetch + momentum math (keep off the hot path when possible)."""
+    ticker = yf.Ticker(symbol)
+    history_period = config.BTC_MOMENTUM_HISTORY_PERIOD
+    hist = ticker.history(period=history_period, interval="1m")
+    if hist.empty or len(hist) < config.MOMENTUM_LOOKBACK_BARS + 1:
+        log.warning("Not enough %s price history available", symbol)
+        return None
+
+    closes = hist["Close"].values
+    from index_feed import momentum_from_closes
+    return momentum_from_closes(list(closes), config.MOMENTUM_LOOKBACK_BARS)
+
+
+def _store_spot_momentum(symbol: str, momentum: Optional[float]) -> None:
+    with _spot_momentum_lock:
+        entry = _spot_momentum_cache.setdefault(symbol, {})
+        if momentum is not None:
+            entry["data"] = momentum
+            entry["timestamp"] = time.time()
+        entry["refreshing"] = False
+
+
+def _background_refresh_spot(symbol: str) -> None:
+    try:
+        momentum = _fetch_spot_momentum_sync(symbol)
+        _store_spot_momentum(symbol, momentum)
+    except Exception as exc:
+        log.error("Background spot momentum refresh failed for %s: %s", symbol, exc)
+        with _spot_momentum_lock:
+            entry = _spot_momentum_cache.setdefault(symbol, {})
+            entry["refreshing"] = False
+
+
+def _maybe_start_spot_refresh(symbol: str) -> None:
+    with _spot_momentum_lock:
+        entry = _spot_momentum_cache.setdefault(symbol, {})
+        if entry.get("refreshing"):
+            return
+        entry["refreshing"] = True
+    threading.Thread(
+        target=_background_refresh_spot,
+        args=(symbol,),
+        name=f"spot-momentum-{symbol}",
+        daemon=True,
+    ).start()
+
+
 def get_spot_momentum(symbol: Optional[str] = None) -> Optional[float]:
     """
     Fallback momentum feed: recent 1-minute spot bars from yfinance.
@@ -54,38 +105,42 @@ def get_spot_momentum(symbol: Optional[str] = None) -> Optional[float]:
     Returns a float in roughly [-1, 1] (> 0 bullish, < 0 bearish) or None on
     data error. The primary feed is the settlement index itself
     (index_feed.get_index_momentum); this spot feed is used when that is
-    unavailable. Results are cached per symbol for 60 s.
+    unavailable.
+
+    After the first successful fetch, subsequent calls never block on yfinance:
+    stale-but-usable values are returned while a background thread refreshes.
     """
     symbol = symbol or config.BTC_TICKER
-
     now = time.time()
-    cached = _spot_momentum_cache.get(symbol)
-    if cached is not None and now - cached["timestamp"] < _SPOT_MOMENTUM_TTL_SECONDS:
-        log.debug("Using cached spot momentum for %s: %.4f", symbol, cached["data"])
-        return cached["data"]
 
+    with _spot_momentum_lock:
+        cached = _spot_momentum_cache.get(symbol)
+        data = cached.get("data") if cached else None
+        ts = float(cached.get("timestamp") or 0.0) if cached else 0.0
+
+    if data is not None:
+        age = now - ts
+        if age < _SPOT_MOMENTUM_TTL_SECONDS:
+            if age >= _SPOT_MOMENTUM_TTL_SECONDS * 0.5:
+                _maybe_start_spot_refresh(symbol)
+            log.debug("Using cached spot momentum for %s: %.4f (age=%.1fs)", symbol, data, age)
+            return data
+        _maybe_start_spot_refresh(symbol)
+        log.debug("Serving stale spot momentum for %s: %.4f (age=%.1fs)", symbol, data, age)
+        return data
+
+    # Cold start — must block once so the first fallback cycle has a real signal.
     try:
-        ticker = yf.Ticker(symbol)
-        # Use a small intraday lookback by default to keep yfinance downloads cheap
-        # in the bot hot path. Allow overriding via config when a larger buffer is
-        # explicitly needed for environments with sparse/missing recent 1-minute bars.
-        history_period = config.BTC_MOMENTUM_HISTORY_PERIOD
-        hist = ticker.history(period=history_period, interval="1m")
-        if hist.empty or len(hist) < config.MOMENTUM_LOOKBACK_BARS + 1:
-            log.warning("Not enough %s price history available", symbol)
-            return None
-
-        closes = hist["Close"].values
-        from index_feed import momentum_from_closes
-        momentum = momentum_from_closes(list(closes), config.MOMENTUM_LOOKBACK_BARS)
-        if momentum is None:
-            return None
-
-        _spot_momentum_cache[symbol] = {"data": momentum, "timestamp": now}
-        log.debug("Spot momentum for %s: %.4f", symbol, momentum)
+        momentum = _fetch_spot_momentum_sync(symbol)
+        _store_spot_momentum(symbol, momentum)
+        if momentum is not None:
+            log.debug("Spot momentum for %s: %.4f", symbol, momentum)
         return momentum
     except Exception as exc:
         log.error("Error fetching %s price: %s", symbol, exc)
+        with _spot_momentum_lock:
+            entry = _spot_momentum_cache.setdefault(symbol, {})
+            entry["refreshing"] = False
         return None
 
 
@@ -455,7 +510,10 @@ def _extract_best_bid_depth(raw_array) -> tuple:
 
 
 def generate_signal(
-    market: dict, orderbook: dict, momentum: Optional[float] = None
+    market: dict,
+    orderbook: dict,
+    momentum: Optional[float] = None,
+    skew: Optional[float] = None,
 ) -> Optional[Signal]:
     """
     Main entry point.  Returns a Signal or None if no trade warranted.
@@ -467,6 +525,9 @@ def generate_signal(
     *momentum* is normally injected by the caller (computed from the event's
     own settlement index via index_feed, with a per-coin spot fallback); when
     omitted, the legacy BTC spot feed is used.
+
+    *skew* may likewise be injected to avoid parsing the orderbook twice in
+    the same cycle (dashboard + signal).
 
     The composite score is mapped to a model_p_yes probability and passed
     through decide_trade_fee_aware(), which enforces fee-aware entry filters
@@ -484,7 +545,8 @@ def generate_signal(
         log.warning("Could not compute momentum — skipping this cycle")
         return None
 
-    skew = get_orderbook_skew(orderbook)
+    if skew is None:
+        skew = get_orderbook_skew(orderbook)
 
     # Weighted composite score  (-1 = strong NO, +1 = strong YES)
     composite = (0.6 * momentum) + (0.4 * skew)

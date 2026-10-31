@@ -814,7 +814,7 @@ def _capture_dashboard_state(state: dict, entries: list, risk: RiskManager) -> N
         market = entry["market"]
         sig = entry.get("signal")
         momentum = entry.get("momentum")
-        skew = get_orderbook_skew(entry["orderbook"]) if momentum is not None else None
+        skew = entry.get("skew")
         pos = risk.get_open_positions().get(entry["ticker"])
         row = {
             "series": entry["series"],
@@ -937,10 +937,12 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     #    overlap with the orderbook fetches on the shared pool). An orderbook
     #    failure drops only its own series: a transient ETH/SOL fetch error
     #    must never stop a BTC position's stop-loss from running.
+    #    Skip balance/positions when flat and daily caps already block entries.
+    need_account = bool(risk.get_open_positions()) or not risk.new_entries_blocked()
     try:
         pool = _get_fetch_executor()
-        fut_bal = pool.submit(client.get_balance)
-        fut_pos = pool.submit(client.get_positions)
+        fut_bal = pool.submit(client.get_balance) if need_account else None
+        fut_pos = pool.submit(client.get_positions) if need_account else None
         fetched = []
         for entry in entries:
             try:
@@ -952,8 +954,8 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
                     entry["ticker"], exc,
                 )
         entries = fetched
-        balance = fut_bal.result()
-        positions = fut_pos.result()
+        balance = fut_bal.result() if fut_bal is not None else 0.0
+        positions = fut_pos.result() if fut_pos is not None else []
     except Exception as exc:
         log.error("API fetch error: %s", exc)
         return False
@@ -993,7 +995,11 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
     for entry in tradable:
         momentum = _momentum_for_market(client, entry["series"], entry["market"])
         entry["momentum"] = momentum
-        sig = generate_signal(entry["market"], entry["orderbook"], momentum=momentum)
+        skew = get_orderbook_skew(entry["orderbook"]) if momentum is not None else None
+        entry["skew"] = skew
+        sig = generate_signal(
+            entry["market"], entry["orderbook"], momentum=momentum, skew=skew,
+        )
         entry["signal"] = sig
         signals[entry["ticker"]] = sig
 

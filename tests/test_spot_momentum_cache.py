@@ -1,0 +1,34 @@
+"""Spot-momentum fallback cache / background-refresh behavior."""
+
+import time
+import unittest
+from unittest.mock import patch
+
+import strategy
+
+
+class TestSpotMomentumBackgroundCache(unittest.TestCase):
+    def setUp(self):
+        strategy._spot_momentum_cache.clear()
+
+    def tearDown(self):
+        strategy._spot_momentum_cache.clear()
+
+    @patch("strategy._fetch_spot_momentum_sync", return_value=0.42)
+    def test_cold_start_fetches_once(self, mock_fetch):
+        value = strategy.get_spot_momentum("BTC-USD")
+        self.assertEqual(value, 0.42)
+        self.assertEqual(mock_fetch.call_count, 1)
+
+    @patch("strategy._fetch_spot_momentum_sync", return_value=0.5)
+    def test_warm_cache_does_not_block_on_fetch(self, mock_fetch):
+        strategy._store_spot_momentum("ETH-USD", 0.25)
+        # Make the entry look fresh.
+        strategy._spot_momentum_cache["ETH-USD"]["timestamp"] = time.time()
+        value = strategy.get_spot_momentum("ETH-USD")
+        self.assertEqual(value, 0.25)
+        mock_fetch.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,37 @@
+[project]
+name = "astrotick"
+version = "0.1.0"
+description = "Kalshi crypto 15-minute Up/Down trading bot"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "requests>=2.33.0",
+  "python-dotenv>=1.0.0",
+  "yfinance>=0.2.54",
+  "cryptography>=46.0.7",
+  "numpy>=1.26.0",
+  "colorlog>=6.8.0",
+  "websocket-client>=1.6.0",
+  "flask>=3.0.0",
+  "kalshi-python-sync>=3.2.0,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+  "pytest>=8.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+exclude = [".venv", "venv", ".git"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

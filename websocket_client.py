@@ -447,6 +447,13 @@ class KalshiWebSocketClient:
             log.info("Pruning expired market subscription: %s", ticker)
             self.unsubscribe_from_market(ticker)
 
+    @staticmethod
+    def _map_to_sorted_levels(side_map: dict) -> list[list[int]]:
+        """Convert an internal price→size map to REST-style descending levels."""
+        if not side_map:
+            return []
+        return [[price, size] for price, size in sorted(side_map.items(), reverse=True)]
+
     def get_latest_orderbook(self, ticker: str) -> Optional[dict]:
         """
         Get the latest orderbook snapshot for a market.
@@ -475,11 +482,9 @@ class KalshiWebSocketClient:
         with self._lock:
             orderbook = self._orderbooks.get(ticker)
             if orderbook:
-                yes = orderbook.get("yes")
-                no = orderbook.get("no")
                 return {
-                    "yes": list(yes) if yes else [],
-                    "no": list(no) if no else [],
+                    "yes": self._map_to_sorted_levels(orderbook.get("yes") or {}),
+                    "no": self._map_to_sorted_levels(orderbook.get("no") or {}),
                 }
             return None
 
@@ -526,13 +531,31 @@ class KalshiWebSocketClient:
     @classmethod
     def _normalize_levels(cls, levels) -> list[list[int]]:
         """Normalize a side of the book into [[price_cents, size], ...]."""
+        return cls._map_to_sorted_levels(cls._levels_to_map(levels))
+
+    @classmethod
+    def _levels_to_map(cls, levels) -> dict[int, int]:
+        """Normalize a side of the book into {price_cents: size} (internal form)."""
         if not levels:
-            return []
+            return {}
 
         if isinstance(levels, dict):
+            if "bids" not in levels and "levels" not in levels:
+                out: dict[int, int] = {}
+                for price, size in levels.items():
+                    price_cents = price if isinstance(price, int) else cls._normalize_price(price)
+                    if price_cents is None:
+                        continue
+                    try:
+                        size_int = int(size)
+                    except (TypeError, ValueError):
+                        continue
+                    if size_int > 0:
+                        out[price_cents] = size_int
+                return out
             levels = levels.get("bids") or levels.get("levels") or []
 
-        normalized = []
+        out: dict[int, int] = {}
         for level in levels:
             price = None
             size = None
@@ -562,48 +585,46 @@ class KalshiWebSocketClient:
                 continue
 
             if size_int > 0:
-                normalized.append([price_cents, size_int])
+                out[price_cents] = size_int
 
-        if len(normalized) > 1:
-            normalized.sort(key=lambda item: item[0], reverse=True)
-        return normalized
+        return out
 
     @classmethod
     def _normalize_orderbook(cls, orderbook) -> dict:
-        """Normalize orderbook payloads into a consistent yes/no list format."""
+        """Normalize orderbook payloads into yes/no price→size maps."""
         if not isinstance(orderbook, dict):
-            return {"yes": [], "no": []}
+            return {"yes": {}, "no": {}}
 
         yes_levels = (
             orderbook.get("yes")
             or orderbook.get("yes_dollars")
             or orderbook.get("yes_dollars_fp")
-            or []
+            or {}
         )
         no_levels = (
             orderbook.get("no")
             or orderbook.get("no_dollars")
             or orderbook.get("no_dollars_fp")
-            or []
+            or {}
         )
 
         return {
-            "yes": cls._normalize_levels(yes_levels),
-            "no": cls._normalize_levels(no_levels),
+            "yes": cls._levels_to_map(yes_levels),
+            "no": cls._levels_to_map(no_levels),
         }
 
     @classmethod
-    def _apply_side_delta(cls, current_levels, side_delta) -> list[list[int]]:
-        """Apply a delta payload to a single orderbook side."""
-        current_map = {price: size for price, size in cls._normalize_levels(current_levels)}
+    def _apply_side_delta(cls, current_levels, side_delta) -> dict[int, int]:
+        """Apply a delta payload to a single orderbook side; return a price→size map."""
+        current_map = dict(cls._levels_to_map(current_levels))
 
         # Full replacement delta: {"yes": [[55, 10], ...]} or side list payload
         if isinstance(side_delta, (list, tuple)):
-            return cls._normalize_levels(side_delta)
+            return cls._levels_to_map(side_delta)
         if isinstance(side_delta, dict) and (
             side_delta.get("bids") is not None or side_delta.get("levels") is not None
         ):
-            return cls._normalize_levels(side_delta)
+            return cls._levels_to_map(side_delta)
 
         updates = side_delta if isinstance(side_delta, list) else [side_delta]
         for update in updates:
@@ -651,12 +672,20 @@ class KalshiWebSocketClient:
                 else:
                     current_map[price_cents] = new_size
 
-        return [[price, size] for price, size in sorted(current_map.items(), reverse=True)]
+        return current_map
 
     @classmethod
     def _apply_delta(cls, current_orderbook, delta) -> dict:
         """Apply a delta payload without discarding the existing snapshot."""
-        current = cls._normalize_orderbook(current_orderbook)
+        if isinstance(current_orderbook, dict) and isinstance(
+            current_orderbook.get("yes"), dict
+        ) and isinstance(current_orderbook.get("no"), dict):
+            current = {
+                "yes": dict(current_orderbook.get("yes") or {}),
+                "no": dict(current_orderbook.get("no") or {}),
+            }
+        else:
+            current = cls._normalize_orderbook(current_orderbook)
 
         if not isinstance(delta, dict):
             return current
@@ -664,15 +693,18 @@ class KalshiWebSocketClient:
         # Some payloads send a full yes/no replacement inside delta.
         if "yes" in delta or "no" in delta:
             return {
-                "yes": cls._apply_side_delta(current.get("yes", []), delta.get("yes", [])),
-                "no": cls._apply_side_delta(current.get("no", []), delta.get("no", [])),
+                "yes": cls._apply_side_delta(current.get("yes", {}), delta.get("yes", [])),
+                "no": cls._apply_side_delta(current.get("no", {}), delta.get("no", [])),
             }
 
         # Other payloads send a single side/price update.
         side = delta.get("side")
         if side in ("yes", "no"):
-            updated = dict(current)
-            updated[side] = cls._apply_side_delta(current.get(side, []), delta)
+            updated = {
+                "yes": dict(current.get("yes") or {}),
+                "no": dict(current.get("no") or {}),
+            }
+            updated[side] = cls._apply_side_delta(current.get(side, {}), delta)
             return updated
 
         return current

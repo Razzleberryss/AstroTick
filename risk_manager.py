@@ -71,6 +71,15 @@ class RiskManager:
 
     # ── Trade approval ───────────────────────────────────────────────────────────
 
+    def new_entries_blocked(self) -> bool:
+        """True when daily trade/loss caps already block new entries this UTC day."""
+        self._reset_daily_if_needed()
+        if self._daily_trade_count >= config.MAX_DAILY_TRADES:
+            return True
+        if self._daily_realized_pnl_cents <= -config.MAX_DAILY_LOSS_CENTS:
+            return True
+        return False
+
     def approve_trade(
         self,
         signal: Signal,
@@ -89,11 +98,11 @@ class RiskManager:
         if market_ticker in self._open_positions:
             return False, f"Already have a position in {market_ticker}"
 
-        if self._daily_trade_count >= config.MAX_DAILY_TRADES:
-            return False, (
-                f"MAX_DAILY_TRADES reached ({self._daily_trade_count}/{config.MAX_DAILY_TRADES})"
-            )
-        if self._daily_realized_pnl_cents <= -config.MAX_DAILY_LOSS_CENTS:
+        if self.new_entries_blocked():
+            if self._daily_trade_count >= config.MAX_DAILY_TRADES:
+                return False, (
+                    f"MAX_DAILY_TRADES reached ({self._daily_trade_count}/{config.MAX_DAILY_TRADES})"
+                )
             return False, (
                 f"MAX_DAILY_LOSS_CENTS reached ({self._daily_realized_pnl_cents} <= -{config.MAX_DAILY_LOSS_CENTS})"
             )

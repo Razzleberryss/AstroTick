@@ -55,17 +55,31 @@ The bot is a single-threaded synchronous poll loop (`POLL_INTERVAL_SECONDS`, def
   tracked positions in a single pass, and placing at most one new entry per cycle
   (the risk estimate uses the cycle's positions snapshot).
 
+## Implemented recently
+
+- **Background spot-momentum refresh**: the yfinance fallback no longer blocks after
+  the first successful fetch. A daemon thread refreshes while the loop serves the last
+  good value (soft TTL / hard max-stale 180 s). Past max-stale the fallback returns
+  `None` so signals skip rather than trading on a multi-window-old direction.
+- **Active-market cache**: `get_active_market` caches per series for ~30 s / until
+  close, so multi-series discovery does not re-hit `get_markets` every poll.
+- **Idle account skip**: balance/positions REST is skipped when the bot is flat and
+  daily caps already block new entries.
+- **WebSocket default on**: `USE_WEBSOCKET_ORDERBOOK` defaults to `true` (REST still
+  the automatic fallback).
+- **WebSocket dict books**: snapshots are kept as price→size maps; list conversion
+  happens only on read.
+- **Single skew parse per cycle**: signal generation and the dashboard share one
+  orderbook-skew computation per series.
+
 ## Open ideas
 
-- **Background momentum refresh**: when the fallback feed's 60 s cache is cold, the
-  yfinance fetch still blocks the loop for one HTTP round trip. A daemon thread that
-  refreshes it on its own schedule would take it out of the hot path entirely. (The
-  primary index feed is a single fast Kalshi API call and shares the loop's timeout.)
+- Threshold CSV flush / keep the trade-log handle open across cycles.
+- `daily_stats.json` to avoid scanning the CSV on startup.
 
 Speculative items from the earlier documents (async/await refactor, SQLite trade
-history, compiled math, generic "performance monitoring utilities") were dropped:
-profiling has not shown the current loop to need them, and the unused `performance.py`
-instrumentation module was deleted.
+history, compiled math, generic "performance monitoring utilities") remain out of
+scope until profiling shows they are needed.
 
 ## Measuring
 

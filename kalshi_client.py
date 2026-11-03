@@ -13,6 +13,7 @@ blast radius while migrating from a hand-rolled REST client to:
 
 from __future__ import annotations
 
+import datetime
 import logging
 import random
 import time
@@ -145,6 +146,8 @@ class KalshiClient:
     def __init__(self):
         self.base_url = _pick_trade_api_host()
         self.api_key_id = config.KALSHI_API_KEY_ID
+        # series_ticker -> {"market": dict|None, "expires_at": float}
+        self._active_market_cache: dict[str, dict] = {}
 
         # Initialize SDK client with defensive logging.
         try:
@@ -289,8 +292,15 @@ class KalshiClient:
         None.
 
         Filters out provisional markets (is_provisional=True) as they may be removed.
+        Caches per series for up to 30 s (or until close_time) so a 10 s poll
+        loop does not re-hit get_markets every cycle for the same window.
         """
         series = series_ticker or config.SERIES_TICKERS[0]
+        now = time.time()
+        cached = self._active_market_cache.get(series) or {}
+        if cached.get("market") is not None and now < float(cached.get("expires_at") or 0):
+            return cached["market"]
+
         params = {
             "series_ticker": series,
             "status": "open",
@@ -300,18 +310,37 @@ class KalshiClient:
         markets = data.get("markets", []) or []
         if not markets:
             log.warning("No open markets found for series %s", series)
+            self._active_market_cache[series] = {"market": None, "expires_at": 0.0}
             return None
         markets = [m for m in markets if m.get("ticker", "").startswith(f"{series}-")]
         if not markets:
             log.warning("No open markets matched series prefix %s-", series)
+            self._active_market_cache[series] = {"market": None, "expires_at": 0.0}
             return None
         # Filter out provisional markets (API v2: is_provisional may be True/False/missing)
         markets = [m for m in markets if not m.get("is_provisional", False)]
         if not markets:
             log.warning("All BTC markets are provisional; skipping trading")
+            self._active_market_cache[series] = {"market": None, "expires_at": 0.0}
             return None
         markets.sort(key=lambda m: m.get("close_time", ""))
-        return enrich_market_quotes_from_dollar_fields(markets[0])
+        market = enrich_market_quotes_from_dollar_fields(markets[0])
+
+        expires_at = now + 30.0
+        close_time_str = market.get("close_time")
+        if close_time_str:
+            try:
+                close_dt = datetime.datetime.fromisoformat(
+                    str(close_time_str).replace("Z", "+00:00")
+                )
+                expires_at = min(expires_at, close_dt.timestamp() - 5.0)
+            except (TypeError, ValueError, OSError):
+                pass
+        self._active_market_cache[series] = {
+            "market": market,
+            "expires_at": max(now, expires_at),
+        }
+        return market
 
     def get_active_btc_market(self) -> Optional[dict]:
         """Legacy alias: active market of the first configured series."""

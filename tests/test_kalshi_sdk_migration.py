@@ -127,6 +127,15 @@ class TestSdkCallPaths(unittest.TestCase):
             self.sdk = MagicMock()
             p_client.return_value = self.sdk
             self.client = kc.KalshiClient()
+        # Live submits require a close time. Keep this fixture outside the
+        # T-50s cutoff so the migration tests still reach create_order_v2.
+        from datetime import datetime, timedelta, timezone
+        from engine.cutoff import register_close
+
+        register_close(
+            f"{config.BTC_SERIES_TICKER}-TEST",
+            datetime.now(timezone.utc) + timedelta(hours=2),
+        )
 
     def test_cancel_order_calls_sdk_cancel_v2(self):
         self.sdk.cancel_order_v2.return_value = {"ok": True}

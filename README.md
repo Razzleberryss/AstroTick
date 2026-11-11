@@ -17,6 +17,39 @@ spot feed remains only as an automatic fallback.
 The bot is dry-run by default and has two independent gates that must both be opened
 before it can place a real order (see [Live trading](#live-trading-two-gates)).
 
+## Demo paper runner
+
+The supported way to run against Kalshi's 15-minute BTC market (`KXBTC15M`) is
+the demo-first runner. It does not send an order unless you explicitly open the
+live gate. Demo is the default environment. Production requires both
+`KALSHI_ENV=prod` and `KALSHI_ALLOW_PROD=1`, and the process logs that it is
+about to use real money.
+
+```bash
+cp .env.example .env
+# Put the demo API key id in KALSHI_API_KEY_ID and point
+# KALSHI_PRIVATE_KEY_PATH at the demo private key. Do not commit either.
+
+python -m engine.runner --once --paper
+```
+
+What that process does:
+
+1. Refuses to start if the key file is missing. It never prints the key id or the key.
+2. Reads the public demo book, the series `fee_type`, and the event index feed.
+3. Prices YES from the 60-second settlement average (locked samples in the final minute).
+4. Appends one JSON line per decision to `logs/decisions.jsonl` (inputs, fair value, book, action, reason) so Brier and log loss can be computed later.
+5. Leaves both candidate strategies off. Set `ENABLE_EXTREME_FADE=1` or `ENABLE_FAVORITE_MAKER=1` to paper-quote. Neither is treated as a proven edge.
+6. From 50 seconds before close, plus `CUTOFF_CLOCK_SKEW_SECONDS` (default 2), cancels resting orders and refuses new ones. Positions are held to settlement. This is enforced in the order submit path, not in the strategy.
+
+To send those quotes to the **demo** exchange (still not production), fund the crypto shard (`exchange_index` 2) and run:
+
+```bash
+PAPER=0 KALSHI_TRADING_LIVE=1 python -m engine.runner --once
+```
+
+The runner checks that shard's balance first and will not send if the balance is missing or below `MIN_SHARD_BALANCE_DOLLARS`. `python bot.py` is the older IOC loop; it now fails closed on a live order that has no close time, and it is not the path to paper-trade the two candidate strategies.
+
 ---
 
 ## How it works
@@ -132,14 +165,16 @@ Three gates are enforced in code, in both the bot and the CLI:
    immediately. The decision engine writes this file itself on a `HALT_TRADING`
    outcome; remove the file to resume trading.
 
-On top of these, `KALSHI_ENV` selects the demo (paper-money) or prod environment, and
-the bot prints a prominent warning banner at startup when running live on prod.
+On top of these, `KALSHI_ENV` selects the demo or prod environment. The code
+default is **demo**. Prod requires `KALSHI_ENV=prod` and `KALSHI_ALLOW_PROD=1`,
+and the process prints a warning banner before it will talk to the prod host.
 
 ## Project structure
 
 ```
 .
-├── bot.py                      # Main loop: per-series market discovery, position management, entries
+├── engine/                     # Demo-first runner: fair value, cutoff, risk, paper log
+├── bot.py                      # Legacy IOC loop (still gated by the T-50s submit path)
 ├── strategy.py                 # Signal generation (momentum + orderbook skew, fee-aware EV filter)
 ├── index_feed.py               # Settlement-index momentum (CF Benchmarks via /live_data)
 ├── risk_manager.py             # Trade gating, position tracking, PnL, CSV trade log

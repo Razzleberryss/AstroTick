@@ -144,8 +144,20 @@ class KalshiClient:
     """
 
     def __init__(self):
+        env = (config.KALSHI_ENV or "demo").lower()
+        if env == "prod" and not getattr(config, "KALSHI_ALLOW_PROD", False):
+            raise RuntimeError(
+                "Refusing to initialize a production Kalshi client. "
+                "Set KALSHI_ENV=prod and KALSHI_ALLOW_PROD=1 to use real money."
+            )
         self.base_url = _pick_trade_api_host()
         self.api_key_id = config.KALSHI_API_KEY_ID
+        if env == "prod":
+            log.critical(
+                "PRODUCTION Kalshi client enabled. Real-money orders are possible on %s. "
+                "API key material is not logged.",
+                self.base_url,
+            )
         # series_ticker -> {"market": dict|None, "expires_at": float}
         self._active_market_cache: dict[str, dict] = {}
 
@@ -590,6 +602,9 @@ class KalshiClient:
         quantity: "int | float",
         price: int,
         dry_run: bool = True,
+        *,
+        close_time=None,
+        now=None,
     ) -> Optional[dict]:
         """
         Sell (exit) an existing position by placing a limit sell order.
@@ -604,7 +619,15 @@ class KalshiClient:
                 side.upper(), market_id, quantity, price
             )
             return None
-        return self.sell_yes(market_id, quantity, price, dry_run=False) if side == "yes" else self.sell_no(market_id, quantity, price, dry_run=False)
+        if side == "yes":
+            return self._sell(
+                market_id, "yes", quantity, price,
+                dry_run=False, reduce_only=True, close_time=close_time, now=now,
+            )
+        return self._sell(
+            market_id, "no", quantity, price,
+            dry_run=False, reduce_only=True, close_time=close_time, now=now,
+        )
 
     # ── SDK-backed order methods (CreateOrderV2) ──────────────────────────────────────────────
     def _build_order_payload(
@@ -671,6 +694,52 @@ class KalshiClient:
             payload["reduce_only"] = True
         return payload
 
+    def _enforce_cutoff(
+        self,
+        ticker: str,
+        kind: str,
+        *,
+        close_time=None,
+        now=None,
+    ) -> None:
+        """Block creates, amends, and decreases inside the T-50s window.
+
+        This is the lowest SDK submit path. Cancels are not blocked.
+        A missing close time fails closed so no caller can skip the rule.
+        """
+        from engine.cutoff import assert_submission_allowed
+
+        assert_submission_allowed(ticker, kind, close_time=close_time, now=now)
+
+    def submit_v2(self, payload: dict, *, close_time=None, now=None) -> dict:
+        """Submit an already-built V2 payload. The cutoff is checked first."""
+        ticker = str(payload.get("ticker") or "")
+        self._enforce_cutoff(ticker, "create", close_time=close_time, now=now)
+        book_side = str(payload.get("side") or "")
+        order_side = "yes" if book_side == "bid" else "no"
+        return self._submit_order(payload, order_side=order_side)
+
+    def decrease_order(
+        self,
+        order_id: str,
+        ticker: str,
+        reduce_to: str,
+        *,
+        close_time=None,
+        now=None,
+        exchange_index: int | None = None,
+    ) -> dict:
+        """Shrink a resting order. Blocked inside the cutoff (cancel instead)."""
+        self._enforce_cutoff(ticker, "decrease", close_time=close_time, now=now)
+        raw = self._sdk.decrease_order_v2(
+            order_id,
+            reduce_to=str(reduce_to),
+            market_ticker=ticker,
+            exchange_index=exchange_index,
+            _request_timeout=config.REQUEST_TIMEOUT_SECONDS,
+        )
+        return _to_dict(raw)
+
     def _submit_order(self, payload: dict, *, order_side: str) -> dict:
         """
         Submit a CreateOrderV2 request and normalize the response to the
@@ -679,7 +748,13 @@ class KalshiClient:
           fill_count / remaining_count      - integers
           average_fill_price_cents          - denominated in *order_side* prices
           status                            - executed | partially_filled | unfilled
+
+        The cutoff is enforced here as well as in ``place_order`` so a
+        payload handed straight to the SDK still cannot trade inside T-50s.
         """
+        ticker = str(payload.get("ticker") or "")
+        if ticker:
+            self._enforce_cutoff(ticker, "create")
         log.info("Placing order via SDK (CreateOrderV2): %s", payload)
         raw = self._sdk.create_order_v2(
             **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS
@@ -726,6 +801,8 @@ class KalshiClient:
         reduce_only: bool = False,
         post_only: bool = False,
         client_order_id: str | None = None,
+        close_time=None,
+        now=None,
     ) -> Optional[dict]:
         """Primary order entry used by in-process envelopes and CLI."""
         self._ensure_btc_market(ticker)
@@ -741,6 +818,7 @@ class KalshiClient:
                 post_only,
             )
             return None
+        self._enforce_cutoff(ticker, "create", close_time=close_time, now=now)
 
         payload = self._build_order_payload(
             ticker=ticker,
@@ -797,6 +875,8 @@ class KalshiClient:
         reduce_only: bool,
         post_only: bool = False,
         client_order_id: str | None = None,
+        close_time=None,
+        now=None,
     ) -> Optional[dict]:
         self._ensure_btc_market(ticker)
         if dry_run:
@@ -810,6 +890,7 @@ class KalshiClient:
                 post_only,
             )
             return None
+        self._enforce_cutoff(ticker, "create", close_time=close_time, now=now)
 
         payload = self._build_order_payload(
             ticker=ticker,

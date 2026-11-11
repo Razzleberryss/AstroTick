@@ -19,14 +19,30 @@ if os.getenv("ASTROTICK_SKIP_DOTENV", "0") != "1":
 # =============================================================================
 KALSHI_API_KEY_ID: str = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PATH: str = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
-KALSHI_ENV: str = os.getenv("KALSHI_ENV", "prod").lower()  # 'demo' or 'prod'
+# Demo is the default. Production requires this env var AND KALSHI_ALLOW_PROD=1.
+KALSHI_ENV: str = os.getenv("KALSHI_ENV", "demo").lower()  # 'demo' or 'prod'
+KALSHI_ALLOW_PROD: bool = os.getenv("KALSHI_ALLOW_PROD", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
-# Base URLs (also exposed as KALSHI_BASE_URL for kalshi_client.py)
-# Using api.elections.kalshi.com (v2 production endpoint) per Kalshi API changelog
-if KALSHI_ENV == "prod":
+# Base URLs. KALSHI_BASE_URL overrides the host (demo or prod).
+# Prod default stays on the elections host that the client tests pin.
+# Demo default is the recommended external-api demo host; demo-api.kalshi.co
+# remains a fallback inside the paper runner's public reader.
+_explicit_base = os.getenv("KALSHI_BASE_URL", "").strip()
+if _explicit_base:
+    BASE_URL = _explicit_base
+elif KALSHI_ENV == "prod":
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 else:
-    BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+    BASE_URL = "https://external-api.demo.kalshi.co/trade-api/v2"
+
+if os.getenv("KALSHI_WS_URL", "").strip():
+    WS_URL = os.getenv("KALSHI_WS_URL", "").strip()
+elif KALSHI_ENV == "prod":
+    WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+else:
+    WS_URL = "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2"
 
 KALSHI_BASE_URL = BASE_URL  # alias used in kalshi_client.py
 
@@ -216,6 +232,10 @@ def validate() -> None:
         )
     if KALSHI_ENV not in ("prod", "demo"):
         errors.append(f"KALSHI_ENV must be 'prod' or 'demo', got '{KALSHI_ENV}'")
+    if KALSHI_ENV == "prod" and not KALSHI_ALLOW_PROD:
+        errors.append(
+            "KALSHI_ENV=prod requires KALSHI_ALLOW_PROD=1 (real-money acknowledgement)"
+        )
     if MAX_TRADE_DOLLARS <= 0:
         errors.append("MAX_TRADE_DOLLARS must be > 0")
     if MAX_OPEN_POSITIONS < 1:

@@ -37,6 +37,8 @@ DECISION_POLICY: dict[str, tuple[bool, bool, bool]] = {
     "PRICE_OUTSIDE_CONFIG_RANGE": (False, False, True),
     "EXCEEDS_MAX_TRADE_DOLLARS": (False, False, True),
     "NO_POSITION": (False, False, True),
+    # Expected safety block near expiry. Do not halt the process.
+    "CUTOFF_BLOCKED": (False, False, False),
     "SERIES_RESOLUTION_FAILED": (False, False, True),
     # An exception escaped an in-process envelope builder: escalate to a human
     # without halting (ordinary API failures are already caught inside the

@@ -13,5 +13,8 @@ lint:
 run:
 	python bot.py
 
+paper:
+	python -m engine.runner --once --paper
+
 dashboard:
 	python dashboard.py

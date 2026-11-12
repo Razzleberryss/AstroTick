@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import config
+from engine.cutoff import CutoffBlocked
 from kalshi_agent_envelope import failure_envelope, success_envelope
 
 if TYPE_CHECKING:
@@ -30,13 +31,14 @@ def _stop_file() -> Path:
 
 
 def buy_envelope(
-    client: "KalshiClient",
+    client: KalshiClient,
     ticker: str,
     side: str,
     count: int,
     price_cents: int,
     *,
     dry_run: bool,
+    close_time: str | None = None,
 ) -> dict:
     """Mirror openclaw_kalshi.cmd_buy validation and API calls; return envelope dict."""
     if _stop_file().exists():
@@ -97,7 +99,14 @@ def buy_envelope(
         return success_envelope("BUY_DRY_RUN", audit)
 
     try:
-        api_result = client.place_order(ticker, side, count, price_cents, dry_run=False)
+        order_kwargs = {"dry_run": False}
+        if close_time is not None:
+            order_kwargs["close_time"] = close_time
+        api_result = client.place_order(
+            ticker, side, count, price_cents, **order_kwargs,
+        )
+    except CutoffBlocked as exc:
+        return failure_envelope("CUTOFF_BLOCKED", str(exc))
     except Exception as exc:
         log.error("place_order failed: %s", exc, exc_info=True)
         return failure_envelope(
@@ -116,13 +125,14 @@ def buy_envelope(
 
 
 def sell_envelope(
-    client: "KalshiClient",
+    client: KalshiClient,
     ticker: str,
     side: str,
     count: int,
     price_cents: int,
     *,
     dry_run: bool,
+    close_time: str | None = None,
 ) -> dict:
     """Mirror openclaw_kalshi.cmd_sell validation and API calls; return envelope dict."""
     if _stop_file().exists():
@@ -218,9 +228,14 @@ def sell_envelope(
         })
 
     try:
+        sell_kwargs = {"dry_run": False}
+        if close_time is not None:
+            sell_kwargs["close_time"] = close_time
         api_result = client.sell_position(
-            ticker, side, sell_count, price_cents, dry_run=False,
+            ticker, side, sell_count, price_cents, **sell_kwargs,
         )
+    except CutoffBlocked as exc:
+        return failure_envelope("CUTOFF_BLOCKED", str(exc))
     except Exception as exc:
         log.error("sell_position failed: %s", exc, exc_info=True)
         return failure_envelope(

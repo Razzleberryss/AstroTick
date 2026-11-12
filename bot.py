@@ -203,30 +203,37 @@ signal.signal(signal.SIGTERM, _handle_signal)
 
 # ── CLI execution wrappers ────────────────────────────────────────────────────────────────────
 
-def _cli_buy(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
+def _cli_buy(client: KalshiClient, ticker, side, count, price_cents, dry_run=False, close_time=None):
     """Execute a buy via an in-process order envelope + decision engine.
 
     (The old alternative — spawning openclaw_kalshi.py per order — was removed:
     it resolved tickers against its own default series, so every bot order was
     rejected with INVALID_TICKER. openclaw_kalshi.py remains as a manual CLI.)
+    ``close_time`` is forwarded on live orders so the T-50s cutoff can run.
     """
     from kalshi_inprocess_orders import buy_envelope
 
     def _fn():
+        extra = {}
+        if close_time is not None:
+            extra["close_time"] = close_time
         return buy_envelope(
-            client, ticker, side, count, price_cents, dry_run=dry_run,
+            client, ticker, side, count, price_cents, dry_run=dry_run, **extra,
         )
 
     return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
 
 
-def _cli_sell(client: KalshiClient, ticker, side, count, price_cents, dry_run=False):
+def _cli_sell(client: KalshiClient, ticker, side, count, price_cents, dry_run=False, close_time=None):
     """Execute a sell via an in-process order envelope + decision engine."""
     from kalshi_inprocess_orders import sell_envelope
 
     def _fn():
+        extra = {}
+        if close_time is not None:
+            extra["close_time"] = close_time
         return sell_envelope(
-            client, ticker, side, count, price_cents, dry_run=dry_run,
+            client, ticker, side, count, price_cents, dry_run=dry_run, **extra,
         )
 
     return cli_executor.execute_with_decision_engine([], envelope_fn=_fn)
@@ -443,6 +450,7 @@ def _manage_single_position(
         exit_price = max(1, current_price - 1)  # aggressive limit sell
         outcome, _env = _cli_sell(
             client, ticker, side, count, exit_price, dry_run=config.DRY_RUN,
+            close_time=market.get("close_time"),
         )
         if outcome.action == AgentAction.HALT_TRADING:
             _halt_trading = True
@@ -850,7 +858,7 @@ def _capture_dashboard_state(state: dict, entries: list, risk: RiskManager) -> N
             state[key] = first[key]
 
 
-def _try_enter(client: KalshiClient, risk: RiskManager, ticker: str, sig, balance, positions, state) -> bool:
+def _try_enter(client: KalshiClient, risk: RiskManager, ticker: str, sig, balance, positions, state, close_time=None) -> bool:
     """Risk-check, size, and place one entry order. Returns True on a fill."""
     global _halt_trading
 
@@ -877,6 +885,7 @@ def _try_enter(client: KalshiClient, risk: RiskManager, ticker: str, sig, balanc
 
     outcome, envelope = _cli_buy(
         client, ticker, sig.side, contracts, sig.price_cents, dry_run=config.DRY_RUN,
+        close_time=close_time,
     )
     if outcome.action == AgentAction.HALT_TRADING:
         _halt_trading = True
@@ -1040,7 +1049,10 @@ def _run_once_impl(client: KalshiClient, risk: RiskManager, ws_client=None, stat
         # filters) but still returned a directional Signal for reversal exits.
         if sig is None or sig.size == 0:
             continue
-        if _try_enter(client, risk, entry["ticker"], sig, balance, positions, state):
+        if _try_enter(
+            client, risk, entry["ticker"], sig, balance, positions, state,
+            close_time=entry["market"].get("close_time"),
+        ):
             return True
         if _halt_trading:
             return False
@@ -1171,6 +1183,7 @@ def _time_delay_series_cycle(
         exit_price_order = max(1, current_price - 1)
         outcome, _env = _cli_sell(
             client, ticker, side, count, exit_price_order, dry_run=config.DRY_RUN,
+            close_time=market.get("close_time"),
         )
         if outcome.action == AgentAction.HALT_TRADING:
             _halt_trading = True
@@ -1241,6 +1254,7 @@ def _time_delay_series_cycle(
 
     outcome, envelope = _cli_buy(
         client, ticker, side, contracts, sig_stub.price_cents, dry_run=config.DRY_RUN,
+        close_time=market.get("close_time"),
     )
     if outcome.action == AgentAction.HALT_TRADING:
         _halt_trading = True

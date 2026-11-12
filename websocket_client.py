@@ -72,11 +72,12 @@ class KalshiWebSocketClient:
         self.api_key_id = config.KALSHI_API_KEY_ID
         self._private_key = self._load_private_key(config.KALSHI_PRIVATE_KEY_PATH)
 
-        # Determine WebSocket URL based on environment
-        if config.KALSHI_ENV == "prod":
-            self.ws_url = "wss://api.elections.kalshi.com/trade-api/ws/v2"
-        else:
-            self.ws_url = "wss://demo-api.kalshi.co/trade-api/ws/v2"
+        # WS host follows config (demo by default). Override with KALSHI_WS_URL.
+        self.ws_url = getattr(
+            config,
+            "WS_URL",
+            "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
+        )
 
         self.ws = None
         self.ws_thread = None

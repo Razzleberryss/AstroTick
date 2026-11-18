@@ -56,10 +56,10 @@ The runner checks that shard's balance first and will not send if the balance is
 
 ```bash
 python -m backtest.run --data DIR --start 2026-07-01 --end 2026-11-11 \
-  --strategy extreme_fade --fill-model conservative
+  --strategy extreme_fade --fill-model conservative --chunk 7
 ```
 
-`--strategy` is `extreme_fade`, `favorite_maker`, or `all`. `--fill-model` is `conservative` (default) or `optimistic`. Close dates on or after `--oos-start` (default 2026-07-01) are the out-of-sample split. Summaries land in `backtest_out/summary.json` and `summary.md`. The fade study's +5.4c figure was a taker execution; this replay posts the live maker quotes, so that number is a reference, not a target the maker fill will reproduce.
+`--strategy` is `extreme_fade`, `favorite_maker`, or `all`. `--fill-model` is `conservative` (default) or `optimistic`. Close dates on or after `--oos-start` (default 2026-07-01) are the out-of-sample split. `--chunk DAYS` reads spot and trade prints one window at a time so the full Binance file and the print file do not have to sit in memory together; the windows aggregate to the same counts and PnL as one load. The replay uses the live cutoff: 50s plus the default 2s clock-skew margin (`--clock-skew`, cannot be negative, and the cutoff cannot go below 50). Summaries land in `backtest_out/summary.json` and `summary.md`. Edge and hit rate are reported per contract and per market, with a standard error and t-stat on the per-market sample, and markout means include how many fills had a post-fill quote. The fade study's +5.4c figure was a taker execution; this replay posts the live maker quotes, so that number is a reference, not a target the maker fill will reproduce.
 
 ---
 

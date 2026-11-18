@@ -8,6 +8,7 @@ inputs and hands quotes to the gateway.
 from __future__ import annotations
 
 import math
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -20,7 +21,7 @@ from backtest.fill_model import FillModel
 from backtest.settlement import resolves_yes
 from backtest.sim_exchange import SimExchange, SimOrder
 from engine.book import Book
-from engine.cutoff import CutoffPolicy, register_close, reset_registry
+from engine.cutoff import CutoffPolicy, load_policy, register_close, reset_registry
 from engine.fair_value import fair_value_yes
 from engine.orders import OrderGateway, TrackedQuote
 from engine.risk import Exposure, RiskBook, RiskLimits
@@ -110,8 +111,14 @@ class ReplayOutput:
 def _resample_10s(ts: np.ndarray, px: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if len(ts) == 0:
         return ts, px
-    start = math.floor(float(ts[0]))
-    stop = math.floor(float(ts[-1]))
+    # Anchor to absolute 10s boundaries so a date chunk and a full load
+    # resample the same seconds. Start on the first boundary at or after the
+    # first sample: a boundary before that sample is NaN, and one leading
+    # NaN poisons the cumulative variance for the rest of the series.
+    start = math.ceil(float(ts[0]) / _STEP) * _STEP
+    stop = math.floor(float(ts[-1]) / _STEP) * _STEP
+    if start > stop:
+        return np.zeros(0), np.zeros(0)
     grid = np.arange(start, stop + _STEP, _STEP, dtype=np.float64)
     idx = np.searchsorted(ts, grid, side="right") - 1
     safe = np.clip(idx, 0, len(ts) - 1)
@@ -199,17 +206,20 @@ def _quotes(orders: list[SimOrder]) -> list[TrackedQuote]:
     ]
 
 
+def _slice_times(rows: list, open_ts: float, cutoff_ts: float, stamp) -> list[float]:
+    """Timestamps in ``(open_ts, cutoff_ts]`` via bisect. ``rows`` are sorted by ``stamp``."""
+    if not rows:
+        return []
+    start = bisect_right(rows, open_ts, key=stamp)
+    stop = bisect_right(rows, cutoff_ts, key=stamp)
+    return [float(stamp(row)) for row in rows[start:stop]]
+
+
 def _decision_times(dataset: Dataset, ticker: str, open_ts: float, cutoff_ts: float) -> list[float]:
     times = {cutoff_ts}
-    for candle in dataset.candles.get(ticker) or []:
-        if open_ts < candle.end_ts <= cutoff_ts:
-            times.add(candle.end_ts)
-    for snap in dataset.books.get(ticker) or []:
-        if open_ts < snap.ts <= cutoff_ts:
-            times.add(snap.ts)
-    for snap in dataset.ladders.get(ticker) or []:
-        if open_ts < snap.ts <= cutoff_ts:
-            times.add(snap.ts)
+    times.update(_slice_times(dataset.candles.get(ticker) or [], open_ts, cutoff_ts, lambda row: row.end_ts))
+    times.update(_slice_times(dataset.books.get(ticker) or [], open_ts, cutoff_ts, lambda row: row.ts))
+    times.update(_slice_times(dataset.ladders.get(ticker) or [], open_ts, cutoff_ts, lambda row: row.ts))
     return sorted(times)
 
 
@@ -224,7 +234,9 @@ def replay(
     policy: CutoffPolicy | None = None,
     decision_log=None,
 ) -> ReplayOutput:
-    policy = policy or CutoffPolicy(cutoff_seconds=50, clock_skew_margin_seconds=0)
+    # Same floor as the live engine: cutoff cannot drop below 50s, and the
+    # clock-skew margin defaults to 2s and cannot be negative.
+    policy = policy or load_policy()
     block = policy.block_when_remaining_at_most
     grid, grid_px = _resample_10s(dataset.spot_ts, dataset.spot_px)
     # Forward-fill NaN gaps with the previous causal value so a single miss
@@ -406,14 +418,17 @@ def replay(
                     }
                 )
             next_t = times[index + 1] if index + 1 < len(times) else cutoff_ts
-            for print_ in dataset.trades.get(market.ticker) or []:
-                if not (t < print_.ts < next_t and print_.ts < cutoff_ts):
-                    continue
+            columns = dataset.trades.get(market.ticker)
+            if columns is None:
+                stamps = prices = qtys = ()
+            else:
+                stamps, prices, qtys = columns.between(t, min(next_t, cutoff_ts))
+            for print_ts, print_price, print_qty in zip(stamps, prices, qtys, strict=False):
                 made = exchange.match_trade(
                     market.ticker,
-                    _dt(print_.ts),
-                    Decimal(str(print_.yes_price)),
-                    Decimal(str(print_.qty)),
+                    _dt(float(print_ts)),
+                    Decimal(str(float(print_price))),
+                    Decimal(str(float(print_qty))),
                     cutoff=_dt(cutoff_ts),
                 )
                 for fill in made:
@@ -428,7 +443,7 @@ def replay(
                         "type": "fill",
                         "ticker": market.ticker,
                         "ts": fill.ts.isoformat(),
-                        "ts_unix": print_.ts,
+                        "ts_unix": float(print_ts),
                         "close_ts": market.close_ts,
                         "split": split,
                         "strategy": fill.strategy or strategy,
@@ -446,8 +461,8 @@ def replay(
                         "fair_value_yes": fill.fair_value_yes,
                         "reason": fill.reason,
                     }
-                    row["markout_10s"] = _markout(dataset, market.ticker, print_.ts, fill)
-                    row["markout_60s"] = _markout(dataset, market.ticker, print_.ts, fill, horizon=60)
+                    row["markout_10s"] = _markout(dataset, market.ticker, float(print_ts), fill)
+                    row["markout_60s"] = _markout(dataset, market.ticker, float(print_ts), fill, horizon=60)
                     fills.append(row)
                     max_contracts = max(max_contracts, float(held))
                     max_notional = max(max_notional, float(held_notional))
@@ -473,6 +488,47 @@ def replay(
         scores_train=scores_train,
         scores_oos=scores_oos,
         assumptions=assumptions,
+    )
+
+
+def merge_outputs(parts: list[ReplayOutput]) -> ReplayOutput:
+    """Combine date-chunk replays. Counts sum; exposure is the max across chunks."""
+    if not parts:
+        return ReplayOutput(
+            fills=[],
+            decisions_path=None,
+            n_markets=0,
+            n_decisions=0,
+            n_orders=0,
+            order_times=[],
+            n_cancels_at_cutoff=0,
+            max_contracts=0.0,
+            max_notional=0.0,
+            scores_train=ScoreBoard(),
+            scores_oos=ScoreBoard(),
+            assumptions=[],
+        )
+    train, oos = ScoreBoard(), ScoreBoard()
+    for part in parts:
+        train.headline.extend(part.scores_train.headline)
+        oos.headline.extend(part.scores_oos.headline)
+        for name, pairs in part.scores_train.buckets.items():
+            train.buckets.setdefault(name, []).extend(pairs)
+        for name, pairs in part.scores_oos.buckets.items():
+            oos.buckets.setdefault(name, []).extend(pairs)
+    return ReplayOutput(
+        fills=[row for part in parts for row in part.fills],
+        decisions_path=parts[-1].decisions_path,
+        n_markets=sum(part.n_markets for part in parts),
+        n_decisions=sum(part.n_decisions for part in parts),
+        n_orders=sum(part.n_orders for part in parts),
+        order_times=[stamp for part in parts for stamp in part.order_times],
+        n_cancels_at_cutoff=sum(part.n_cancels_at_cutoff for part in parts),
+        max_contracts=max(part.max_contracts for part in parts),
+        max_notional=max(part.max_notional for part in parts),
+        scores_train=train,
+        scores_oos=oos,
+        assumptions=parts[0].assumptions,
     )
 
 

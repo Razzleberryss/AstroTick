@@ -8,13 +8,15 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
-from backtest.adapters import load_dataset
+from backtest.adapters import MarketAdapter, load_dataset
 from backtest.fill_model import FillModel
-from backtest.replay import parse_date, replay
+from backtest.replay import merge_outputs, parse_date, replay
 from backtest.report import summarize, write_reports
+from engine.cutoff import CutoffPolicy
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,18 +46,38 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override the maker adverse-selection haircut. Conservative default is 3",
     )
+    parser.add_argument(
+        "--chunk",
+        type=float,
+        default=None,
+        help="Replay this many days at a time and aggregate. Spot and prints are loaded per chunk.",
+    )
+    parser.add_argument(
+        "--clock-skew",
+        type=float,
+        default=None,
+        help="Seconds added to the 50s cutoff. Default is the live engine's 2s margin. Cannot be negative.",
+    )
     args = parser.parse_args(argv)
     root = Path(args.data)
     if not root.is_dir():
         print(f"data directory not found: {root}", file=sys.stderr)
         return 2
+    if args.chunk is not None and args.chunk <= 0:
+        print("--chunk must be a positive number of days", file=sys.stderr)
+        return 2
+    policy = None
+    if args.clock_skew is not None:
+        try:
+            policy = CutoffPolicy(clock_skew_margin_seconds=args.clock_skew)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
     haircut = None if args.haircut_cents is None else Decimal(str(args.haircut_cents)) / Decimal("100")
     model = FillModel.from_name(args.fill_model, haircut=haircut)
-    try:
-        dataset = load_dataset(root)
-    except FileNotFoundError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+    start_ts = parse_date(args.start)
+    end_ts = parse_date(args.end, end=True)
+    oos_start = parse_date(args.oos_start) or parse_date("2026-07-01")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     decisions_path = out_dir / "decisions.jsonl"
@@ -64,16 +86,55 @@ def main(argv: list[str] | None = None) -> int:
     def _write(row: dict) -> None:
         handle.write(json.dumps(row, sort_keys=True, default=str) + "\n")
 
-    try:
-        result = replay(
+    def _one(window_start: float | None, window_end: float | None):
+        try:
+            dataset = load_dataset(root, start_ts=window_start, end_ts=window_end)
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return exc
+        if not dataset.markets:
+            return None
+        return replay(
             dataset,
             strategy=args.strategy,
             fill_model=model,
-            start_ts=parse_date(args.start),
-            end_ts=parse_date(args.end, end=True),
-            oos_start_ts=parse_date(args.oos_start) or parse_date("2026-07-01"),
+            start_ts=window_start,
+            end_ts=window_end,
+            oos_start_ts=oos_start,
+            policy=policy,
             decision_log=_write,
         )
+
+    try:
+        if args.chunk is None:
+            result = _one(start_ts, end_ts)
+            if isinstance(result, FileNotFoundError):
+                return 2
+            if result is None:
+                print("no markets in the requested window", file=sys.stderr)
+                return 2
+        else:
+            window_start, window_end = _chunk_bounds(root, start_ts, end_ts)
+            if window_start is None or window_end is None or window_start >= window_end:
+                print("could not determine a chunk window from --start/--end or markets.csv", file=sys.stderr)
+                return 2
+            parts = []
+            cursor = window_start
+            span = float(args.chunk) * 86400.0
+            while cursor < window_end:
+                nxt = min(window_end, cursor + span)
+                if nxt <= cursor:
+                    break
+                part = _one(cursor, nxt)
+                if isinstance(part, FileNotFoundError):
+                    return 2
+                if part is not None:
+                    parts.append(part)
+                cursor = nxt
+            result = merge_outputs(parts)
+            if not parts:
+                print("no markets in the requested window", file=sys.stderr)
+                return 2
     finally:
         handle.close()
     result.decisions_path = str(decisions_path)
@@ -86,6 +147,21 @@ def main(argv: list[str] | None = None) -> int:
         f"oos_edge_c={oos['edge_cents']} wrote {out_dir}"
     )
     return 0
+
+
+def _chunk_bounds(root: Path, start_ts: float | None, end_ts: float | None) -> tuple[float | None, float | None]:
+    """Fill a missing bound from market close times so chunks cover every market once."""
+    if start_ts is not None and end_ts is not None:
+        return start_ts, end_ts
+    closes = [market.close_ts for market in MarketAdapter().load(root)]
+    if not closes:
+        return start_ts, end_ts
+    if start_ts is None:
+        first = datetime.fromtimestamp(min(closes), UTC)
+        start_ts = datetime(first.year, first.month, first.day, tzinfo=UTC).timestamp()
+    if end_ts is None:
+        end_ts = max(closes) + 1.0
+    return start_ts, end_ts
 
 
 if __name__ == "__main__":

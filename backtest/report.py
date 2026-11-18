@@ -11,12 +11,6 @@ from backtest.fill_model import HAIRCUT_SENSITIVITY
 from backtest.replay import ReplayOutput, price_bucket
 
 
-def _mean(values: list[float]) -> float | None:
-    if not values:
-        return None
-    return sum(values) / len(values)
-
-
 def _brier(pairs: list[tuple[float, int]]) -> float | None:
     if not pairs:
         return None
@@ -33,9 +27,56 @@ def _log_loss(pairs: list[tuple[float, int]]) -> float | None:
     return -total / len(pairs)
 
 
+def _sample_stats(values: list[float]) -> dict:
+    """Mean, standard error, and t-stat. One value is one independent observation."""
+    n = len(values)
+    if n == 0:
+        return {"n": 0, "mean": None, "se": None, "t": None}
+    mean = sum(values) / n
+    if n < 2:
+        return {"n": n, "mean": mean, "se": None, "t": None}
+    var = sum((value - mean) ** 2 for value in values) / (n - 1)
+    se = math.sqrt(var / n)
+    return {"n": n, "mean": mean, "se": se, "t": None if se == 0 else mean / se}
+
+
+def _markets(fills: list[dict]) -> list[dict]:
+    """Collapse partial fills so a market is one bet, not one row per print."""
+    grouped: dict[str, dict] = {}
+    for row in fills:
+        slot = grouped.setdefault(
+            row["ticker"],
+            {"ticker": row["ticker"], "qty": 0.0, "pnl_net": 0.0, "pnl_raw": 0.0, "price_qty": 0.0},
+        )
+        qty = float(row["qty"])
+        slot["qty"] += qty
+        slot["pnl_net"] += float(row["pnl_net"])
+        slot["pnl_raw"] += float(row["pnl_raw"])
+        slot["price_qty"] += float(row["price"]) * qty
+    markets = []
+    for slot in grouped.values():
+        if slot["qty"] <= 0:
+            continue
+        slot["price"] = slot["price_qty"] / slot["qty"]
+        slot["edge_cents"] = 100.0 * slot["pnl_net"] / slot["qty"]
+        slot["won"] = slot["pnl_net"] > 0
+        markets.append(slot)
+    return markets
+
+
+def _weighted_mean(values: list[float], weights: list[float]) -> float | None:
+    total = sum(weights)
+    if total <= 0 or not values:
+        return None
+    return sum(value * weight for value, weight in zip(values, weights, strict=True)) / total
+
+
 def _block(fills: list[dict], scores_headline, scores_buckets) -> dict:
+    markets = _markets(fills)
+    qty = [float(row["qty"]) for row in fills]
     pnl = [float(row["pnl_net"]) for row in fills]
     raw = [float(row["pnl_raw"]) for row in fills]
+    contracts = sum(qty)
     cumulative = 0.0
     peak = 0.0
     max_dd = 0.0
@@ -43,28 +84,49 @@ def _block(fills: list[dict], scores_headline, scores_buckets) -> dict:
         cumulative += value
         peak = max(peak, cumulative)
         max_dd = max(max_dd, peak - cumulative)
-    wins = sum(1 for row in fills if float(row["pnl_net"]) > 0)
-    by_price: dict[str, list[float]] = defaultdict(list)
-    for row in fills:
-        by_price[price_bucket(float(row["price"]))].append(float(row["pnl_net"]))
-    mark_10 = [float(row["markout_10s"]) for row in fills if row.get("markout_10s") is not None]
-    mark_60 = [float(row["markout_60s"]) for row in fills if row.get("markout_60s") is not None]
+    market_edges = [slot["edge_cents"] for slot in markets]
+    market_hits = [1.0 if slot["won"] else 0.0 for slot in markets]
+    edge_stats = _sample_stats(market_edges)
+    hit_stats = _sample_stats(market_hits)
+    won_qty = sum(
+        q for q, flag in zip(qty, (float(row["pnl_net"]) > 0 for row in fills), strict=True) if flag
+    )
+    by_price: dict[str, list[dict]] = defaultdict(list)
+    for slot in markets:
+        by_price[price_bucket(slot["price"])].append(slot)
+    mark_10 = [(float(row["markout_10s"]), float(row["qty"])) for row in fills if row.get("markout_10s") is not None]
+    mark_60 = [(float(row["markout_60s"]), float(row["qty"])) for row in fills if row.get("markout_60s") is not None]
     return {
-        "n": len(fills),
-        "hit_rate": None if not fills else wins / len(fills),
+        "n": len(markets),
+        "n_fills": len(fills),
+        "n_contracts": contracts,
+        "hit_rate": hit_stats["mean"],
+        "hit_rate_se": hit_stats["se"],
+        "hit_rate_t": hit_stats["t"],
+        "hit_rate_per_contract": None if contracts <= 0 else won_qty / contracts,
         "pnl_net": sum(pnl),
         "pnl_raw": sum(raw),
-        "edge_cents": None if not pnl else 100 * (sum(pnl) / len(pnl)),
-        "edge_cents_before_haircut": None if not raw else 100 * (sum(raw) / len(raw)),
+        "edge_cents": None if contracts <= 0 else 100.0 * sum(pnl) / contracts,
+        "edge_cents_per_market": edge_stats["mean"],
+        "edge_se": edge_stats["se"],
+        "edge_t": edge_stats["t"],
+        "edge_cents_before_haircut": None if contracts <= 0 else 100.0 * sum(raw) / contracts,
         "max_drawdown": max_dd,
-        "mean_markout_10s": _mean(mark_10),
-        "mean_markout_60s": _mean(mark_60),
+        "mean_markout_10s": _weighted_mean([v for v, _q in mark_10], [q for _v, q in mark_10]),
+        "markout_10s_n": len(mark_10),
+        "mean_markout_60s": _weighted_mean([v for v, _q in mark_60], [q for _v, q in mark_60]),
+        "markout_60s_n": len(mark_60),
         "brier": _brier(scores_headline),
         "log_loss": _log_loss(scores_headline),
         "brier_n": len(scores_headline),
         "by_price": {
-            name: {"n": len(values), "edge_cents": 100 * sum(values) / len(values)}
-            for name, values in sorted(by_price.items())
+            name: {
+                "n": len(slots),
+                "n_contracts": sum(slot["qty"] for slot in slots),
+                "edge_cents": 100.0 * sum(slot["pnl_net"] for slot in slots) / sum(slot["qty"] for slot in slots),
+                **{k: _sample_stats([slot["edge_cents"] for slot in slots])[k] for k in ("se", "t")},
+            }
+            for name, slots in sorted(by_price.items())
         },
         "by_tau": {
             name: {
@@ -82,18 +144,23 @@ def _sensitivity(fills: list[dict]) -> list[dict]:
     rows = []
     for haircut in HAIRCUT_SENSITIVITY:
         if not fills:
-            rows.append({"haircut_cents": float(haircut * 100), "n": 0, "edge_cents": None})
+            rows.append({"haircut_cents": float(haircut * 100), "n": 0, "edge_cents": None, "se": None, "t": None})
             continue
-        pnls = []
+        adjusted = []
         for row in fills:
-            qty = float(row["qty"])
-            pnls.append(float(row["pnl_raw"]) - qty * float(haircut))
+            adjusted.append({**row, "pnl_net": float(row["pnl_raw"]) - float(row["qty"]) * float(haircut)})
+        markets = _markets(adjusted)
+        stats = _sample_stats([slot["edge_cents"] for slot in markets])
+        contracts = sum(float(row["qty"]) for row in adjusted)
         rows.append(
             {
                 "haircut_cents": float(haircut * 100),
-                "n": len(pnls),
-                "edge_cents": 100 * sum(pnls) / len(pnls),
-                "pnl_net": sum(pnls),
+                "n": stats["n"],
+                "n_contracts": contracts,
+                "edge_cents": None if contracts <= 0 else 100.0 * sum(float(row["pnl_net"]) for row in adjusted) / contracts,
+                "se": stats["se"],
+                "t": stats["t"],
+                "pnl_net": sum(float(row["pnl_net"]) for row in adjusted),
             }
         )
     return rows
@@ -183,12 +250,12 @@ def to_markdown(summary: dict) -> str:
         "",
         "## Maker haircut sensitivity (OOS, cents per contract)",
         "",
-        "| haircut c | n | edge c |",
-        "| --- | --- | --- |",
+        "| haircut c | markets | edge c/contract | se | t |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for row in summary["haircut_sensitivity_oos"]:
         lines.append(
-            f"| {_fmt(row['haircut_cents'])} | {row['n']} | {_fmt(row['edge_cents'])} |"
+            f"| {_fmt(row['haircut_cents'])} | {row['n']} | {_fmt(row['edge_cents'])} | {_fmt(row.get('se'))} | {_fmt(row.get('t'))} |"
         )
     lines.extend(["", "## Assumptions", ""])
     for item in summary["assumptions"]:
@@ -205,22 +272,30 @@ def to_markdown(summary: dict) -> str:
 
 def _table(block: dict) -> str:
     lines = [
-        f"- Fills: {block['n']}",
-        f"- Hit rate: {_fmt(block['hit_rate'])}",
-        f"- Edge after fees and haircut: {_fmt(block['edge_cents'])} c/contract",
-        f"- Edge before haircut: {_fmt(block['edge_cents_before_haircut'])} c/contract",
+        f"- Markets with a fill: {block['n']} ({block['n_fills']} fill rows, { _fmt(block['n_contracts']) } contracts)",
+        f"- Hit rate per market: {_fmt(block['hit_rate'])} (se {_fmt(block['hit_rate_se'])}, t {_fmt(block['hit_rate_t'])})",
+        f"- Hit rate per contract: {_fmt(block['hit_rate_per_contract'])}",
+        f"- Edge per contract after fees and haircut: {_fmt(block['edge_cents'])} c",
+        f"- Edge per market: {_fmt(block['edge_cents_per_market'])} c (se {_fmt(block['edge_se'])}, t {_fmt(block['edge_t'])})",
+        f"- Edge per contract before haircut: {_fmt(block['edge_cents_before_haircut'])} c",
         f"- PnL net: {_fmt(block['pnl_net'])}",
         f"- Max drawdown: {_fmt(block['max_drawdown'])}",
-        f"- Markout +10s / +60s (cents): {_fmt(block['mean_markout_10s'])} / {_fmt(block['mean_markout_60s'])}",
+        (
+            f"- Markout +10s / +60s (cents, per contract): "
+            f"{_fmt(block['mean_markout_10s'])} (n={block['markout_10s_n']}) / "
+            f"{_fmt(block['mean_markout_60s'])} (n={block['markout_60s_n']})"
+        ),
         f"- Brier / log loss (near 5 min, n={block['brier_n']}): {_fmt(block['brier'])} / {_fmt(block['log_loss'])}",
         "",
         "By entry price:",
         "",
-        "| bucket | n | edge c |",
-        "| --- | --- | --- |",
+        "| bucket | markets | edge c/contract | se | t |",
+        "| --- | --- | --- | --- | --- |",
     ]
     for name, row in block["by_price"].items():
-        lines.append(f"| {name} | {row['n']} | {_fmt(row['edge_cents'])} |")
+        lines.append(
+            f"| {name} | {row['n']} | {_fmt(row['edge_cents'])} | {_fmt(row.get('se'))} | {_fmt(row.get('t'))} |"
+        )
     lines.extend(["", "Fair value by time to close:", "", "| bucket | n | brier | log loss |", "| --- | --- | --- | --- |"])
     for name, row in block["by_tau"].items():
         lines.append(f"| {name} | {row['n']} | {_fmt(row['brier'])} | {_fmt(row['log_loss'])} |")

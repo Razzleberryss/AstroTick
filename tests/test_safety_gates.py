@@ -46,6 +46,18 @@ class TestProductionHostGate(unittest.TestCase):
                 kc.KalshiClient()
         self.assertIn("KALSHI_ALLOW_PROD", str(caught.exception))
 
+    def test_hostname_is_parsed_not_searched_as_a_substring(self):
+        from kalshi_client import is_production_host
+
+        self.assertTrue(is_production_host("https://api.elections.kalshi.com/trade-api/v2"))
+        self.assertTrue(is_production_host("https://external-api.kalshi.com/trade-api/v2"))
+        self.assertFalse(is_production_host("https://external-api.demo.kalshi.co/trade-api/v2"))
+        self.assertFalse(is_production_host("https://demo-api.kalshi.co/trade-api/v2"))
+        self.assertFalse(is_production_host("https://evil.example/kalshi.com"))
+        self.assertFalse(is_production_host("https://kalshi.com.evil.example/trade-api/v2"))
+        self.assertFalse(is_production_host("https://notkalshi.com/trade-api/v2"))
+        self.assertFalse(is_production_host("https://user:pass@evil.example/trade-api/v2?host=kalshi.com"))
+
     def test_explicit_prod_env_still_selects_the_elections_host(self):
         from kalshi_client import _pick_trade_api_host
 

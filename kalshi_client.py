@@ -18,9 +18,10 @@ import logging
 import random
 import time
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import config
 from kalshi_money import (
@@ -49,26 +50,38 @@ class _NoopSdk:
 log = logging.getLogger(__name__)
 
 
-_PROD_HOST_MARKERS = (
-    "api.elections.kalshi.com",
-    "external-api.kalshi.com",
-    "external-api-ws.kalshi.com",
+_PROD_HOSTS = frozenset(
+    {
+        "api.elections.kalshi.com",
+        "external-api.kalshi.com",
+        "external-api-ws.kalshi.com",
+    }
 )
 
 
-def is_production_host(url: str | None) -> bool:
-    """True for Kalshi production hosts, including a prod URL stuffed into KALSHI_BASE_URL.
+def _hostname(url: str) -> str:
+    """Hostname only. A path, query, or userinfo that mentions kalshi.com does not count."""
+    text = url.strip()
+    if "://" not in text:
+        text = "https://" + text
+    return (urlparse(text).hostname or "").lower().rstrip(".")
 
-    Demo hosts contain the substring ``demo`` and are never production.
+
+def is_production_host(url: str | None) -> bool:
+    """True when the URL's hostname is a Kalshi production host.
+
+    Demo hosts are ``*.kalshi.co`` or a hostname whose labels include ``demo``.
+    The check is on the parsed hostname, not a substring of the whole URL, so
+    ``evil.com/kalshi.com`` and ``kalshi.com.evil.example`` are not production.
     """
     if not url:
         return False
-    host = str(url).lower()
-    if "demo" in host:
+    host = _hostname(str(url))
+    if not host or "demo" in host.split("."):
         return False
-    if any(marker in host for marker in _PROD_HOST_MARKERS):
+    if host in _PROD_HOSTS:
         return True
-    return "kalshi.com" in host
+    return host == "kalshi.com" or host.endswith(".kalshi.com")
 
 
 def assert_host_allowed(url: str) -> None:

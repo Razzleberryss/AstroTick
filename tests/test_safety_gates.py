@@ -57,6 +57,8 @@ class TestProductionHostGate(unittest.TestCase):
         self.assertFalse(is_production_host("https://kalshi.com.evil.example/trade-api/v2"))
         self.assertFalse(is_production_host("https://notkalshi.com/trade-api/v2"))
         self.assertFalse(is_production_host("https://user:pass@evil.example/trade-api/v2?host=kalshi.com"))
+        # Userinfo "demo" must not hide a production hostname.
+        self.assertTrue(is_production_host("https://demo@api.elections.kalshi.com/trade-api/v2"))
 
     def test_explicit_prod_env_still_selects_the_elections_host(self):
         from kalshi_client import _pick_trade_api_host

@@ -194,6 +194,58 @@ class TestSettlementTie(unittest.TestCase):
         self.assertEqual(locked.probability_yes, 1.0)
 
 
+class TestSpotAvailability(unittest.TestCase):
+    def test_binance_close_is_timestamped_when_the_bar_ends(self):
+        from backtest.adapters import SpotAdapter
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp)
+            (path / "spot.csv").write_text("ts,c\n100,50\n101,80\n", encoding="utf-8")
+            stamps, prices = SpotAdapter().load(path)
+        self.assertEqual(list(stamps), [101.0, 102.0])
+        self.assertEqual(asof_price(stamps, prices, 100.5, tolerance=5), None)
+        self.assertEqual(asof_price(stamps, prices, 101.0, tolerance=5), 50.0)
+        self.assertEqual(asof_price(stamps, prices, 102.0, tolerance=5), 80.0)
+
+
+class TestMarkoutFreshness(unittest.TestCase):
+    def test_markout_ignores_a_quote_from_before_the_fill(self):
+        from backtest.adapters import BookSnap, Dataset, MarketRow
+        from backtest.replay import _markout
+        from backtest.sim_exchange import SimFill
+
+        dataset = Dataset(
+            markets=[
+                MarketRow("KXBTC15M-T", 0, 1000, 100.0, 100.0, "yes"),
+            ],
+            books={
+                "KXBTC15M-T": [
+                    BookSnap(ts=100.0, yes_bid=0.40, yes_ask=0.41, yes_bid_sz=1, yes_ask_sz=1),
+                    BookSnap(ts=135.0, yes_bid=0.50, yes_ask=0.51, yes_bid_sz=1, yes_ask_sz=1),
+                ]
+            },
+        )
+        fill = SimFill(
+            order_id="s",
+            ticker="KXBTC15M-T",
+            ts=datetime.fromtimestamp(130, UTC),
+            contract_side="yes",
+            price=Decimal("0.40"),
+            qty=Decimal("1"),
+            liquidity="maker",
+            strategy="favorite_maker",
+            fair_value_yes=0.5,
+            reason="test",
+        )
+        # +10s looks at t=140. The t=100 quote is before the fill, so it is
+        # not a markout. The t=135 quote is inside (130, 140].
+        self.assertAlmostEqual(_markout(dataset, "KXBTC15M-T", 130.0, fill, horizon=10), 10.5)
+        # +5s looks at t=135 exactly, which is included.
+        self.assertAlmostEqual(_markout(dataset, "KXBTC15M-T", 130.0, fill, horizon=5), 10.5)
+        # +4s looks at t=134. Only the pre-fill quote exists, so no markout.
+        self.assertIsNone(_markout(dataset, "KXBTC15M-T", 130.0, fill, horizon=4))
+
+
 class TestNoLookahead(unittest.TestCase):
     def test_asof_ignores_future_prints(self):
         ts = np.array([10.0, 20.0, 30.0])

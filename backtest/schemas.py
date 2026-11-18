@@ -44,8 +44,9 @@ CANDLE_COLUMNS = (
 # Trades written by fade/fetch_trades.py. ``p`` is the YES price in dollars.
 TRADE_COLUMNS = ("ticker", "ts", "p", "q", "side", "blk")
 
-# Binance BTCUSDT 1s klines from fade/fetch_binance.py. ``ts`` is unix seconds
-# of the kline open. ``c`` is the close used as the spot proxy.
+# Binance BTCUSDT 1s klines from fade/fetch_binance.py. ``ts`` is the kline
+# open, in unix seconds. ``c`` is that bar's close, which is not known until
+# the bar ends, so the loader stores it at ``ts + 1``.
 SPOT_COLUMNS = ("ts", "o", "h", "l", "c", "vol", "n")
 
 # book_YYYY-MM-DD.csv from the recorder.

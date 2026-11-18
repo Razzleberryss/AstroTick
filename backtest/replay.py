@@ -149,19 +149,35 @@ def _locked(dataset: Dataset, close_ts: float, now_ts: float, basis: float) -> l
     return locked
 
 
-def _book(dataset: Dataset, ticker: str, t: float) -> Book:
+def _quotes_at(dataset: Dataset, ticker: str, t: float) -> list[tuple[float, Book]]:
+    """Every quote whose timestamp is <= t, newest last. Nothing after t."""
+    found: list[tuple[float, Book]] = []
     ladder = dataset.ladder_asof(ticker, t)
     if ladder is not None and ladder.yes_bids and ladder.no_bids:
-        return Book(Decimal(str(ladder.yes_bids[0][0])), Decimal(str(ladder.no_bids[0][0])))
+        found.append(
+            (ladder.ts, Book(Decimal(str(ladder.yes_bids[0][0])), Decimal(str(ladder.no_bids[0][0]))))
+        )
     snap = dataset.book_asof(ticker, t)
     if snap is not None and snap.yes_bid is not None and snap.no_bid is not None:
-        return Book(Decimal(str(snap.yes_bid)), Decimal(str(snap.no_bid)))
-    if snap is not None and snap.yes_bid is not None and snap.yes_ask is not None:
-        return Book(Decimal(str(snap.yes_bid)), Decimal("1") - Decimal(str(snap.yes_ask)))
+        found.append((snap.ts, Book(Decimal(str(snap.yes_bid)), Decimal(str(snap.no_bid)))))
+    elif snap is not None and snap.yes_bid is not None and snap.yes_ask is not None:
+        found.append(
+            (snap.ts, Book(Decimal(str(snap.yes_bid)), Decimal("1") - Decimal(str(snap.yes_ask))))
+        )
     candle = dataset.candle_asof(ticker, t)
     if candle is not None and candle.bid is not None and candle.ask is not None:
-        return Book(Decimal(str(candle.bid)), Decimal("1") - Decimal(str(candle.ask)))
-    return Book(None, None)
+        found.append(
+            (candle.end_ts, Book(Decimal(str(candle.bid)), Decimal("1") - Decimal(str(candle.ask))))
+        )
+    found.sort(key=lambda item: item[0])
+    return found
+
+
+def _book(dataset: Dataset, ticker: str, t: float) -> Book:
+    quotes = _quotes_at(dataset, ticker, t)
+    if not quotes:
+        return Book(None, None)
+    return quotes[-1][1]
 
 
 def _quotes(orders: list[SimOrder]) -> list[TrackedQuote]:
@@ -250,6 +266,7 @@ def replay(
     assumptions = [
         "maker fills only on a strict trade-through in conservative mode; queue is not advanced",
         "adverse-selection haircut is subtracted from maker settlement PnL, not observed in the prints",
+        "Binance close is stored at the kline open plus 1s, when that close is known",
         "Binance (or any 1s proxy) is scaled by strike / open-minute average; it is not BRTI",
         "settlement uses expiration_value >= floor_strike (tie -> YES), not the proxy average",
         "no book and no candle means the strategy sees an empty book and does not quote",
@@ -460,10 +477,20 @@ def replay(
 
 
 def _markout(dataset: Dataset, ticker: str, fill_ts: float, fill, *, horizon: float = 10.0) -> float | None:
-    """Side mid at fill_ts+horizon minus the fill price, in cents. Data <= that time only."""
-    book = _book(dataset, ticker, fill_ts + horizon)
-    if book.yes_bid is None or book.yes_ask is None:
+    """Side mid after the fill, at or before fill+horizon, minus the fill price, in cents.
+
+    A quote from before the fill is not a post-fill markout. If nothing was
+    observed in ``(fill_ts, fill_ts + horizon]``, the markout is missing.
+    """
+    horizon_t = fill_ts + horizon
+    fresh = [
+        (obs_ts, book)
+        for obs_ts, book in _quotes_at(dataset, ticker, horizon_t)
+        if fill_ts < obs_ts <= horizon_t and book.yes_bid is not None and book.yes_ask is not None
+    ]
+    if not fresh:
         return None
+    _obs_ts, book = fresh[-1]
     mid = (book.yes_bid + book.yes_ask) / 2
     side_mid = mid if fill.contract_side == "yes" else Decimal("1") - mid
     return float((side_mid - fill.price) * 100)

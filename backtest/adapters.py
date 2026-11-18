@@ -122,6 +122,7 @@ class BookSnap:
     yes_ask: float | None
     yes_bid_sz: float | None
     yes_ask_sz: float | None
+    no_bid: float | None = None
 
 
 @dataclass
@@ -279,7 +280,8 @@ class SpotAdapter:
                 px = _f(raw.get("c", raw.get("close")))
                 if ts is None or px is None or px <= 0:
                     continue
-                stamps.append(float(ts))
+                # ``ts`` is the kline open. The close is known one second later.
+                stamps.append(float(ts) + 1.0)
                 prices.append(float(px))
         if not stamps:
             return np.zeros(0), np.zeros(0)
@@ -315,6 +317,7 @@ class BookAdapter:
                         yes_ask=_f(raw.get("yes_ask")),
                         yes_bid_sz=_f(raw.get("yes_bid_sz_top")),
                         yes_ask_sz=_f(raw.get("yes_ask_sz_top")),
+                        no_bid=_f(raw.get("no_bid")),
                     )
                 )
         for rows in grouped.values():

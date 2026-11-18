@@ -49,17 +49,49 @@ class _NoopSdk:
 log = logging.getLogger(__name__)
 
 
+_PROD_HOST_MARKERS = (
+    "api.elections.kalshi.com",
+    "external-api.kalshi.com",
+    "external-api-ws.kalshi.com",
+)
+
+
+def is_production_host(url: str | None) -> bool:
+    """True for Kalshi production hosts, including a prod URL stuffed into KALSHI_BASE_URL.
+
+    Demo hosts contain the substring ``demo`` and are never production.
+    """
+    if not url:
+        return False
+    host = str(url).lower()
+    if "demo" in host:
+        return False
+    if any(marker in host for marker in _PROD_HOST_MARKERS):
+        return True
+    return "kalshi.com" in host
+
+
+def assert_host_allowed(url: str) -> None:
+    """Refuse any production host unless KALSHI_ALLOW_PROD=1, whatever KALSHI_ENV says."""
+    if is_production_host(url) and not getattr(config, "KALSHI_ALLOW_PROD", False):
+        raise RuntimeError(
+            f"Refusing production host {url}. "
+            "Set KALSHI_ALLOW_PROD=1 to use real money. "
+            "KALSHI_ENV alone does not authorize a production host."
+        )
+
+
 def _pick_trade_api_host() -> str:
     """
-    Choose Trade API host based on config.KALSHI_ENV.
+    Choose Trade API host.
 
-    - prod -> https://api.elections.kalshi.com/trade-api/v2
-    - demo -> prefer the repo's existing demo host (config.BASE_URL) if it looks valid.
+    Empty or missing KALSHI_ENV is demo, never prod. An explicit prod env
+    selects the elections host. Otherwise the configured BASE_URL is used,
+    and KalshiClient.__init__ still rejects that URL when it is a production host.
     """
-    env = (config.KALSHI_ENV or "prod").lower()
+    env = (getattr(config, "KALSHI_ENV", None) or "demo").strip().lower()
     if env == "prod":
         return "https://api.elections.kalshi.com/trade-api/v2"
-    # Demo: keep centralized + easy to edit; prefer existing repo config if present
     demo_default = "https://demo-api.kalshi.co/trade-api/v2"
     base = getattr(config, "BASE_URL", None) or getattr(config, "KALSHI_BASE_URL", None)
     if isinstance(base, str) and base.startswith("https://") and "/trade-api/v2" in base:
@@ -144,18 +176,21 @@ class KalshiClient:
     """
 
     def __init__(self):
-        env = (config.KALSHI_ENV or "demo").lower()
-        if env == "prod" and not getattr(config, "KALSHI_ALLOW_PROD", False):
-            raise RuntimeError(
-                "Refusing to initialize a production Kalshi client. "
-                "Set KALSHI_ENV=prod and KALSHI_ALLOW_PROD=1 to use real money."
-            )
+        env = (config.KALSHI_ENV or "demo").strip().lower()
         self.base_url = _pick_trade_api_host()
+        # Gate the host we will actually call, not the KALSHI_ENV label.
+        # KALSHI_BASE_URL can point at production while KALSHI_ENV says demo.
+        assert_host_allowed(self.base_url)
         self.api_key_id = config.KALSHI_API_KEY_ID
-        if env == "prod":
+        if is_production_host(self.base_url):
             log.critical(
                 "PRODUCTION Kalshi client enabled. Real-money orders are possible on %s. "
                 "API key material is not logged.",
+                self.base_url,
+            )
+        elif env == "prod":
+            log.critical(
+                "KALSHI_ENV=prod but the resolved host is %s.",
                 self.base_url,
             )
         # series_ticker -> {"market": dict|None, "expires_at": float}
@@ -752,9 +787,14 @@ class KalshiClient:
         The cutoff is enforced here as well as in ``place_order`` so a
         payload handed straight to the SDK still cannot trade inside T-50s.
         """
-        ticker = str(payload.get("ticker") or "")
-        if ticker:
-            self._enforce_cutoff(ticker, "create")
+        ticker = str(payload.get("ticker") or "").strip()
+        if not ticker:
+            from engine.cutoff import CutoffBlocked
+
+            raise CutoffBlocked(
+                "refusing create with an empty ticker (fail closed; cutoff cannot be skipped)"
+            )
+        self._enforce_cutoff(ticker, "create")
         log.info("Placing order via SDK (CreateOrderV2): %s", payload)
         raw = self._sdk.create_order_v2(
             **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS

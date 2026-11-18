@@ -1282,6 +1282,14 @@ def _time_delay_series_cycle(
 
 
 def main():
+    if os.environ.get("LEGACY_BOT") != "1":
+        print(
+            "bot.py is the legacy IOC loop and will not start. "
+            "Use `python -m engine.runner --paper` or `make run`. "
+            "Set LEGACY_BOT=1 to run this loop anyway.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     setup_logging()
     log.info("=" * 60)
     log.info("      Kalshi 15-minute Crypto Trader (with Early Exit)")

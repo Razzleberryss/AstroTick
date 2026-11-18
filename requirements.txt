@@ -16,6 +16,8 @@ cryptography>=46.0.7
 
 # Numeric utilities (signal calculation)
 numpy>=1.26.0
+# Parquet inputs for backtest/ (candles, trades, Binance 1s dumps)
+pyarrow>=15
 
 # Logging with colors
 colorlog>=6.8.0

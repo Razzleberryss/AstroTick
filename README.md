@@ -48,7 +48,18 @@ To send those quotes to the **demo** exchange (still not production), fund the c
 PAPER=0 KALSHI_TRADING_LIVE=1 python -m engine.runner --once
 ```
 
-The runner checks that shard's balance first and will not send if the balance is missing or below `MIN_SHARD_BALANCE_DOLLARS`. `python bot.py` is the older IOC loop; it now fails closed on a live order that has no close time, and it is not the path to paper-trade the two candidate strategies.
+The runner checks that shard's balance first and will not send if the balance is missing or below `MIN_SHARD_BALANCE_DOLLARS`. `python bot.py` is the older IOC loop. It will not start unless `LEGACY_BOT=1`. `make run` starts the paper engine runner.
+
+## Backtest
+
+`backtest/` replays historical markets through the same strategy, fair-value, risk, and order gateway. It does not send orders or read keys. Schemas and the fill assumptions are in `backtest/schemas.py` and `backtest/FILL_MODEL.md`.
+
+```bash
+python -m backtest.run --data DIR --start 2026-07-01 --end 2026-11-11 \
+  --strategy extreme_fade --fill-model conservative
+```
+
+`--strategy` is `extreme_fade`, `favorite_maker`, or `all`. `--fill-model` is `conservative` (default) or `optimistic`. Close dates on or after `--oos-start` (default 2026-07-01) are the out-of-sample split. Summaries land in `backtest_out/summary.json` and `summary.md`. The fade study's +5.4c figure was a taker execution; this replay posts the live maker quotes, so that number is a reference, not a target the maker fill will reproduce.
 
 ---
 

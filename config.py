@@ -19,8 +19,11 @@ if os.getenv("ASTROTICK_SKIP_DOTENV", "0") != "1":
 # =============================================================================
 KALSHI_API_KEY_ID: str = os.getenv("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PATH: str = os.getenv("KALSHI_PRIVATE_KEY_PATH", "./kalshi_private_key.pem")
-# Demo is the default. Production requires this env var AND KALSHI_ALLOW_PROD=1.
-KALSHI_ENV: str = os.getenv("KALSHI_ENV", "demo").lower()  # 'demo' or 'prod'
+# Demo is the default. An empty or missing KALSHI_ENV is demo, never prod.
+# Production also requires KALSHI_ALLOW_PROD=1, and the client gates the
+# resolved host rather than this label alone.
+_raw_env = os.getenv("KALSHI_ENV", "demo")
+KALSHI_ENV: str = ((_raw_env or "").strip().lower() or "demo")
 KALSHI_ALLOW_PROD: bool = os.getenv("KALSHI_ALLOW_PROD", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }

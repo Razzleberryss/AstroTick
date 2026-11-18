@@ -11,7 +11,7 @@ lint:
 	ruff check .
 
 run:
-	python bot.py
+	python -m engine.runner --paper
 
 paper:
 	python -m engine.runner --once --paper

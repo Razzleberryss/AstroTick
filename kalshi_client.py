@@ -18,9 +18,10 @@ import logging
 import random
 import time
 import uuid
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import config
 from kalshi_money import (
@@ -49,17 +50,61 @@ class _NoopSdk:
 log = logging.getLogger(__name__)
 
 
+_PROD_HOSTS = frozenset(
+    {
+        "api.elections.kalshi.com",
+        "external-api.kalshi.com",
+        "external-api-ws.kalshi.com",
+    }
+)
+
+
+def _hostname(url: str) -> str:
+    """Hostname only. A path, query, or userinfo that mentions kalshi.com does not count."""
+    text = url.strip()
+    if "://" not in text:
+        text = "https://" + text
+    return (urlparse(text).hostname or "").lower().rstrip(".")
+
+
+def is_production_host(url: str | None) -> bool:
+    """True when the URL's hostname is a Kalshi production host.
+
+    Demo hosts are ``*.kalshi.co`` or a hostname whose labels include ``demo``.
+    The check is on the parsed hostname, not a substring of the whole URL, so
+    ``evil.com/kalshi.com`` and ``kalshi.com.evil.example`` are not production.
+    """
+    if not url:
+        return False
+    host = _hostname(str(url))
+    if not host or "demo" in host.split("."):
+        return False
+    if host in _PROD_HOSTS:
+        return True
+    return host == "kalshi.com" or host.endswith(".kalshi.com")
+
+
+def assert_host_allowed(url: str) -> None:
+    """Refuse any production host unless KALSHI_ALLOW_PROD=1, whatever KALSHI_ENV says."""
+    if is_production_host(url) and not getattr(config, "KALSHI_ALLOW_PROD", False):
+        raise RuntimeError(
+            f"Refusing production host {url}. "
+            "Set KALSHI_ALLOW_PROD=1 to use real money. "
+            "KALSHI_ENV alone does not authorize a production host."
+        )
+
+
 def _pick_trade_api_host() -> str:
     """
-    Choose Trade API host based on config.KALSHI_ENV.
+    Choose Trade API host.
 
-    - prod -> https://api.elections.kalshi.com/trade-api/v2
-    - demo -> prefer the repo's existing demo host (config.BASE_URL) if it looks valid.
+    Empty or missing KALSHI_ENV is demo, never prod. An explicit prod env
+    selects the elections host. Otherwise the configured BASE_URL is used,
+    and KalshiClient.__init__ still rejects that URL when it is a production host.
     """
-    env = (config.KALSHI_ENV or "prod").lower()
+    env = (getattr(config, "KALSHI_ENV", None) or "demo").strip().lower()
     if env == "prod":
         return "https://api.elections.kalshi.com/trade-api/v2"
-    # Demo: keep centralized + easy to edit; prefer existing repo config if present
     demo_default = "https://demo-api.kalshi.co/trade-api/v2"
     base = getattr(config, "BASE_URL", None) or getattr(config, "KALSHI_BASE_URL", None)
     if isinstance(base, str) and base.startswith("https://") and "/trade-api/v2" in base:
@@ -144,18 +189,21 @@ class KalshiClient:
     """
 
     def __init__(self):
-        env = (config.KALSHI_ENV or "demo").lower()
-        if env == "prod" and not getattr(config, "KALSHI_ALLOW_PROD", False):
-            raise RuntimeError(
-                "Refusing to initialize a production Kalshi client. "
-                "Set KALSHI_ENV=prod and KALSHI_ALLOW_PROD=1 to use real money."
-            )
+        env = (config.KALSHI_ENV or "demo").strip().lower()
         self.base_url = _pick_trade_api_host()
+        # Gate the host we will actually call, not the KALSHI_ENV label.
+        # KALSHI_BASE_URL can point at production while KALSHI_ENV says demo.
+        assert_host_allowed(self.base_url)
         self.api_key_id = config.KALSHI_API_KEY_ID
-        if env == "prod":
+        if is_production_host(self.base_url):
             log.critical(
                 "PRODUCTION Kalshi client enabled. Real-money orders are possible on %s. "
                 "API key material is not logged.",
+                self.base_url,
+            )
+        elif env == "prod":
+            log.critical(
+                "KALSHI_ENV=prod but the resolved host is %s.",
                 self.base_url,
             )
         # series_ticker -> {"market": dict|None, "expires_at": float}
@@ -752,9 +800,14 @@ class KalshiClient:
         The cutoff is enforced here as well as in ``place_order`` so a
         payload handed straight to the SDK still cannot trade inside T-50s.
         """
-        ticker = str(payload.get("ticker") or "")
-        if ticker:
-            self._enforce_cutoff(ticker, "create")
+        ticker = str(payload.get("ticker") or "").strip()
+        if not ticker:
+            from engine.cutoff import CutoffBlocked
+
+            raise CutoffBlocked(
+                "refusing create with an empty ticker (fail closed; cutoff cannot be skipped)"
+            )
+        self._enforce_cutoff(ticker, "create")
         log.info("Placing order via SDK (CreateOrderV2): %s", payload)
         raw = self._sdk.create_order_v2(
             **payload, _request_timeout=config.REQUEST_TIMEOUT_SECONDS

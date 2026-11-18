@@ -78,6 +78,9 @@ class KalshiWebSocketClient:
             "WS_URL",
             "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
         )
+        from kalshi_client import assert_host_allowed
+
+        assert_host_allowed(self.ws_url)
 
         self.ws = None
         self.ws_thread = None
